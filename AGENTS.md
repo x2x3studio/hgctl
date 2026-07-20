@@ -20,7 +20,13 @@ memory server, search engine, or local Dream implementation.
 - Never scan source Git history during import. Never bulk-copy raw session
   transcript stores or tool output.
 - Basic Memory is an external recall dependency. Do not recreate its index,
-  embeddings, or MCP server.
+  embeddings, or MCP server. Reindex its disposable cache only after `shared`
+  actually advances.
+- Wake Dream with a best-effort repository dispatch after a queue push; the
+  scheduled workflow is the recovery path, not a second publisher.
+- Maintain Codex hook trust only through the official app-server. A failed
+  install attempt is visible but cannot strand imports or Claude capture;
+  background repair is persisted and low-frequency.
 - Auto-update must be atomic, checksum-verified, and unable to break the
   currently running binary.
 
@@ -37,9 +43,10 @@ purge command says otherwise.
 ## Protocol
 
 The companion Hourglass repository owns the branch and event contract in
-`protocol/v1.md`. Keep the Go event encoder compatible with that version. New
-fields may be added; changing required fields, IDs, branch ownership, or cursor
-semantics requires a new protocol version.
+`protocol/v1.md`. V1 is closed: only `turn`, `observation`, and `import_batch`
+are valid, and neither envelope nor payload extensions are accepted. Changing
+fields, IDs, branch ownership, or cursor semantics requires a new protocol
+version.
 
 ## Verification
 
@@ -52,6 +59,7 @@ Every behavior change needs focused tests. At minimum cover:
 - machine identity persistence across hostname changes;
 - Git queue idempotence and failed-push recovery;
 - hook config merge/uninstall without damaging unrelated entries;
+- Codex hook discovery and trust through the official app-server only;
 - scheduler label/path stability;
 - update checksum and atomic symlink replacement;
 - fail-open behavior when optional commands are absent.

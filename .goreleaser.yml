@@ -1,0 +1,32 @@
+version: 2
+
+project_name: hgctl
+
+builds:
+  - id: hgctl
+    main: ./cmd/hgctl
+    binary: hgctl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/x2x3studio/hgctl/internal/hgctl.Version={{ .Version }}
+
+archives:
+  - id: binaries
+    formats:
+      - binary
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github-native

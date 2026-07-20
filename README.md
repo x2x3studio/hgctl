@@ -14,8 +14,8 @@ endpoint integration; GitHub Actions owns Dream; Basic Memory owns local recall.
 - maintain hidden control and queue worktrees plus `~/hourglass-vault` for
   `shared`;
 - install fail-open Claude Code and Codex lifecycle hooks;
-- register `~/hourglass-vault` as the Basic Memory project `hourglass` and add
-  its MCP server to both clients;
+- register `~/hourglass-vault` as the Basic Memory project `hourglass` and
+  expose recall through the read-only `hgctl recall` command;
 - capture bounded turns and explicit observations in an atomic local outbox;
 - commit and push only `queue/<machine-id>` and fast-forward only `shared`;
 - initialize existing durable memory through deterministic import batches;
@@ -34,6 +34,7 @@ historical transcript stores, or write canonical memory.
   identity.json
   state.json
   outbox/
+  delivered/            # one local receipt per pushed event
   repo/                 # hidden main/control checkout
   queue/                # hidden queue/<machine-id> worktree
 
@@ -55,13 +56,12 @@ systemd timer with the same logical name.
 
 ```text
 hgctl install [--repo <git-url>] [--import <path>]
-hgctl init [--repo <git-url>] [--import <path>]
-hgctl hook --client <claude|codex> --event <session-start|user-prompt|stop|compact>
+hgctl hook --client <claude|codex> --event <session-start|user-prompt|stop>
 hgctl observe --client <claude|codex>
 hgctl import <path> [--source <name>]
 hgctl sync [--update]
 hgctl context <repo-path> --client <claude|codex>
-hgctl recall <query> --client <claude|codex>
+hgctl recall <query>
 hgctl update
 hgctl doctor
 hgctl uninstall
@@ -74,14 +74,70 @@ periodic sync path; it never blocks Claude Code or Codex.
 
 ## First run
 
-`init` has two phases:
+Prerequisites are Git, an authenticated GitHub CLI for this private instance,
+and Basic Memory. On macOS and Ubuntu, install the recall helper in its own
+uv-managed environment:
+
+```sh
+# macOS
+brew install git gh uv
+uv tool install basic-memory
+
+# Ubuntu
+sudo apt-get update
+sudo apt-get install -y git gh curl
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv tool install basic-memory
+```
+
+Run `gh auth login` once if GitHub CLI is not already authenticated. Basic
+Memory's isolated Python environment is replaceable local index machinery;
+`hgctl` itself is one static Go binary and never invokes a project venv.
+
+Download the release asset matching the machine and verify the published
+checksum:
+
+```sh
+case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) exit 1 ;; esac
+case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=amd64 ;; *) exit 1 ;; esac
+asset="hgctl_${os}_${arch}"
+gh release download --repo x2x3studio/hgctl --pattern "$asset" --pattern checksums.txt
+if command -v sha256sum >/dev/null; then
+  grep "  ${asset}$" checksums.txt | sha256sum -c -
+else
+  grep "  ${asset}$" checksums.txt | shasum -a 256 -c -
+fi
+chmod 755 "$asset"
+./"$asset" install --repo git@github.com:x2x3studio/hourglass.git
+```
+
+On the first machine only, bootstrap the current checkout of the old vault:
+
+```sh
+./"$asset" install \
+  --repo git@github.com:x2x3studio/hourglass.git \
+  --import /path/to/old-vault
+```
+
+Every later machine uses the first command without `--import`. Open
+`~/hourglass-vault` in Obsidian as a view and leave Obsidian Git sync disabled.
+`hgctl` asks Codex's official app-server to discover and trust only the three
+exact user hooks it just installed; it never computes a trust hash or edits
+Codex TOML itself. Installation reports failure if Codex cannot prove the hooks
+are enabled and trusted, but only after the scheduler, imports, and initial Git
+sync have completed safely. Background sync retries that exact trust operation
+at most once every six hours; `hgctl doctor` repeats discovery read-only.
+
+`install` has two phases:
 
 1. **Read initialization:** clone the control branch, create the shared and
-   queue worktrees, fast-forward `shared`, configure Basic Memory, and install
-   client adapters.
-2. **Backfill:** discover existing durable agent memory and optionally import
-   an existing vault's current checkout. Imported Markdown enters the same
-   machine queue as every later event; it never writes `shared` directly.
+   queue worktrees, fast-forward `shared`, configure Basic Memory, start the
+   recovery scheduler, and then install the client adapters.
+2. **Backfill:** after the recovery path is active, discover existing durable
+   agent memory and optionally import an existing vault's current checkout.
+   Imported Markdown enters the same machine queue as every later event; it
+   never writes `shared` directly.
 
 Imports are deterministic, bounded, resumable, and do not inspect source Git
 history. A second machine initializes its own sources but does not replay the
@@ -102,26 +158,47 @@ Both clients receive `SessionStart`, `UserPromptSubmit`, and `Stop` hooks:
   queue event.
 
 Claude Code and current Codex releases share the same hook event format. Codex
-requires one trust review for newly installed user hooks; this is the only
-manual first-install step. Thereafter hook execution and updates are automatic.
+trust is maintained through `initialize` → `hooks/list` → `config/batchWrite` →
+`hooks/list`; ambiguous, duplicate, modified, or missing hooks fail closed.
+Ubuntu setup also verifies systemd user lingering; if the account cannot enable
+it directly, the installer fails with one exact `sudo loginctl enable-linger`
+command instead of pretending background sync will survive logout.
 
 ## Recall
 
 `recall` delegates to `basic-memory tool search-notes` against the local
-`hourglass` project. The Basic Memory MCP server gives both agents richer recall
-tools. Its SQLite and embedding data remain disposable local implementation
-details and never enter Git.
+`hourglass` project. The MVP deliberately does not register Basic Memory's full
+MCP server because that surface also exposes write, edit, and delete tools;
+those would violate Dream's single-writer boundary. The MVP explicitly disables
+semantic indexing and uses Basic Memory's SQLite FTS cache only; that cache is
+disposable local implementation detail and never enters Git.
+After `shared` advances, the background sync runs Basic Memory's incremental
+reindex before the next recall; Session hooks never wait for a full scan.
 
 ## Updates
 
 Release artifacts are built by GitHub Actions for macOS and Linux on amd64 and
-arm64. `update` verifies the release checksum, installs into a new version
-directory, and atomically retargets the stable symlink. Private-repository
-downloads use `GH_TOKEN`/`GITHUB_TOKEN` when present and otherwise the existing
-authenticated `gh` CLI.
+arm64. `update` uses the required authenticated `gh` CLI, verifies the release
+checksum, installs into a new version directory, and atomically retargets the
+stable symlink.
 
 The scheduler checks frequently during the MVP. A missing release or temporary
 GitHub failure is a NOOP and does not affect sync.
+
+Queue delivery also sends a best-effort GitHub repository dispatch so Dream can
+run from the trusted default branch without executing workflow files from a
+queue branch. The scheduled Dream run is the recovery path when a machine has
+Git access but no authenticated `gh` command.
+
+## One-time migration from the archived prototype
+
+Remove the archived `kbctl` hook and scheduler with its own uninstall command
+before installing `hgctl`. If that binary is already gone, remove only entries
+whose command names `kbctl` and the legacy `com.chinaboard.kb.sync` LaunchAgent;
+do not delete the old vault until its current checkout has been imported. The
+new installer never claims or deletes an unrelated hook, Basic Memory project,
+binary, or scheduler entry. Once import reaches the queue, the old vault is no
+longer part of the live system.
 
 ## Supported systems
 
@@ -143,3 +220,7 @@ go vet ./...
 ```
 
 The companion repository is `x2x3studio/hourglass`.
+
+Repository operators provide dedicated self-hosted runner labels:
+`hgctl-ci` for tests and `hgctl-release` for tagged publishing. Keeping release
+jobs off a generic runner pool preserves the same trust boundary used by Dream.
