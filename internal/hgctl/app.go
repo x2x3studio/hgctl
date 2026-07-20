@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -109,15 +108,8 @@ func (a *App) install(ctx context.Context, repo, importPath string) error {
 		return err
 	}
 	var installErrs []error
-	if err := a.setupHookFiles(); err != nil {
+	if err := a.setupClientHooks(ctx); err != nil {
 		installErrs = append(installErrs, err)
-	}
-	codexHooks := filepath.Join(a.Paths.Home, ".codex", "hooks.json")
-	stable := filepath.Join(a.Paths.Bin, "hgctl")
-	if hooksConfigured(codexHooks, stable, "codex") {
-		if err := a.attemptCodexTrust(ctx); err != nil {
-			installErrs = append(installErrs, fmt.Errorf("Codex hook trust: %w", err))
-		}
 	}
 	if err := a.importDurableAgentMemory(); err != nil {
 		installErrs = append(installErrs, err)

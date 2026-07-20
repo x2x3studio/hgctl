@@ -66,6 +66,31 @@ func TestCodexHookTrustToleratesUnrelatedWarningsAndFields(t *testing.T) {
 	}
 }
 
+func TestCodexHookTrustToleratesKnownCloudConfigTimeout(t *testing.T) {
+	app := testApp(t)
+	installFakeCodex(t, app, "cloud-config-timeout")
+	if err := app.trustCodexHooks(testContext(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCodexHookTrustRejectsOtherDiscoveryErrors(t *testing.T) {
+	for _, mode := range []string{
+		"hook-discovery-error",
+		"cloud-config-timeout-hook-path",
+		"cloud-config-timeout-drift",
+		"mixed-discovery-errors",
+	} {
+		t.Run(mode, func(t *testing.T) {
+			app := testApp(t)
+			installFakeCodex(t, app, mode)
+			if err := app.trustCodexHooks(testContext(t)); err == nil {
+				t.Fatal("Codex trust unexpectedly ignored a discovery error")
+			}
+		})
+	}
+}
+
 func TestCodexTrustRetryIsLowFrequencyAndNonBlocking(t *testing.T) {
 	app := testApp(t)
 	trustFile, writeLog := installFakeCodex(t, app, "rpc-error")
@@ -189,10 +214,26 @@ func runCodexAppServerHelper() error {
 			if mode == "warning" {
 				warnings = append(warnings, "ambiguous hook source")
 			}
+			errors := []any{}
+			switch mode {
+			case "cloud-config-timeout":
+				errors = append(errors, map[string]any{"path": home, "message": codexCloudConfigTimeout})
+			case "hook-discovery-error":
+				errors = append(errors, map[string]any{"path": filepath.Join(home, ".codex", "hooks.json"), "message": "invalid hook definition"})
+			case "cloud-config-timeout-hook-path":
+				errors = append(errors, map[string]any{"path": filepath.Join(home, ".codex", "hooks.json"), "message": codexCloudConfigTimeout})
+			case "cloud-config-timeout-drift":
+				errors = append(errors, map[string]any{"path": home, "message": "timed out waiting for cloud config bundle after 16s"})
+			case "mixed-discovery-errors":
+				errors = append(errors,
+					map[string]any{"path": home, "message": codexCloudConfigTimeout},
+					map[string]any{"path": filepath.Join(home, ".codex", "hooks.json"), "message": "invalid hook definition"},
+				)
+			}
 			writeFakeCodexMessage(map[string]any{
 				"id": id,
 				"result": map[string]any{"data": []any{map[string]any{
-					"cwd": home, "errors": []any{}, "hooks": hooks, "warnings": warnings,
+					"cwd": home, "errors": errors, "hooks": hooks, "warnings": warnings,
 				}}},
 			})
 		case "config/batchWrite":

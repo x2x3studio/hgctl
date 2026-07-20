@@ -65,19 +65,48 @@ func (a *App) setupBasicMemory(ctx context.Context) error {
 	return nil
 }
 
+type clientAdapter struct {
+	name       string
+	executable string
+	path       string
+	client     string
+}
+
+func (a *App) clientAdapters() []clientAdapter {
+	return []clientAdapter{
+		{name: "Claude", executable: "claude", path: filepath.Join(a.Paths.Home, ".claude", "settings.json"), client: "claude"},
+		{name: "Codex", executable: "codex", path: filepath.Join(a.Paths.Home, ".codex", "hooks.json"), client: "codex"},
+	}
+}
+
 func (a *App) setupHookFiles() error {
 	stable := filepath.Join(a.Paths.Bin, "hgctl")
 	var errs []error
-	for _, item := range []struct {
-		name, path, client string
-	}{
-		{"Claude", filepath.Join(a.Paths.Home, ".claude", "settings.json"), "claude"},
-		{"Codex", filepath.Join(a.Paths.Home, ".codex", "hooks.json"), "codex"},
-	} {
+	for _, item := range a.clientAdapters() {
+		if !commandExists(item.executable) {
+			continue
+		}
 		if err := configureHookFile(item.path, stable, item.client, true); err != nil {
 			errs = append(errs, fmt.Errorf("%s hooks: %w", item.name, err))
 		} else if !hooksConfigured(item.path, stable, item.client) {
 			errs = append(errs, fmt.Errorf("%s hooks: installed hook set is incomplete or malformed", item.name))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (a *App) setupClientHooks(ctx context.Context) error {
+	var errs []error
+	if err := a.setupHookFiles(); err != nil {
+		errs = append(errs, err)
+	}
+	if commandExists("codex") {
+		codexHooks := filepath.Join(a.Paths.Home, ".codex", "hooks.json")
+		stable := filepath.Join(a.Paths.Bin, "hgctl")
+		if hooksConfigured(codexHooks, stable, "codex") {
+			if err := a.attemptCodexTrust(ctx); err != nil {
+				errs = append(errs, fmt.Errorf("Codex hook trust: %w", err))
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -585,11 +614,17 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 	cleanupErr := withFileLockWait(ctx, a.Paths.SyncLock, func() error {
 		return withFileLockWait(ctx, a.Paths.UpdateLock, func() error {
 			return withFileLockWait(ctx, a.Paths.CodexLock, func() error {
-				for _, item := range []struct{ path, client string }{
-					{filepath.Join(a.Paths.Home, ".claude", "settings.json"), "claude"},
-					{filepath.Join(a.Paths.Home, ".codex", "hooks.json"), "codex"},
-				} {
-					if err := configureHookFile(item.path, stable, item.client, false); err != nil && !errors.Is(err, os.ErrNotExist) {
+				for _, item := range a.clientAdapters() {
+					present, err := managedHooksPresent(item.path, stable, item.client)
+					if errors.Is(err, os.ErrNotExist) || (err == nil && !present) {
+						continue
+					}
+					if err != nil {
+						errs = append(errs, fmt.Errorf("inspect %s hooks: %w", item.client, err))
+						safeToRemoveBinary = false
+						continue
+					}
+					if err := configureHookFile(item.path, stable, item.client, false); err != nil {
 						errs = append(errs, fmt.Errorf("remove %s hooks: %w", item.client, err))
 						safeToRemoveBinary = false
 						continue
@@ -862,12 +897,36 @@ func ignorableSchedulerStopError(err error) bool {
 	return false
 }
 
-func (a *App) doctor(ctx context.Context) error {
-	type check struct {
-		name string
-		ok   bool
-		note string
+type doctorCheck struct {
+	name string
+	ok   bool
+	note string
+}
+
+func (a *App) clientDoctorChecks(ctx context.Context) []doctorCheck {
+	stable := filepath.Join(a.Paths.Bin, "hgctl")
+	var checks []doctorCheck
+	for _, item := range a.clientAdapters() {
+		if !commandExists(item.executable) {
+			continue
+		}
+		ok := hooksConfigured(item.path, stable, item.client)
+		note := "user settings"
+		if item.client == "codex" {
+			note = "user hooks + app-server trust"
+			if ok {
+				if err := a.verifyCodexHooks(ctx); err != nil {
+					ok = false
+					note = boundString(err.Error(), 512)
+				}
+			}
+		}
+		checks = append(checks, doctorCheck{item.name + " hooks", ok, note})
 	}
+	return checks
+}
+
+func (a *App) doctor(ctx context.Context) error {
 	projectOK := false
 	projectID := ""
 	if commandExists("basic-memory") {
@@ -897,15 +956,7 @@ func (a *App) doctor(ctx context.Context) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		quarantineEmpty = false
 	}
-	codexHooksOK := hooksConfigured(filepath.Join(a.Paths.Home, ".codex", "hooks.json"), filepath.Join(a.Paths.Bin, "hgctl"), "codex")
-	codexHooksNote := "user hooks + app-server trust"
-	if codexHooksOK {
-		if err := a.verifyCodexHooks(ctx); err != nil {
-			codexHooksOK = false
-			codexHooksNote = boundString(err.Error(), 512)
-		}
-	}
-	checks := []check{
+	checks := []doctorCheck{
 		{"git", commandExists("git"), "required transport"},
 		{"basic-memory", commandExists("basic-memory"), "required recall helper"},
 		{"memory project", projectOK, a.Paths.Vault},
@@ -914,11 +965,12 @@ func (a *App) doctor(ctx context.Context) error {
 		{"control checkout", isGitWorktree(a.Paths.Control), a.Paths.Control},
 		{"queue worktree", isGitWorktree(a.Paths.Queue), a.Paths.Queue},
 		{"shared worktree", isGitWorktree(a.Paths.Vault), a.Paths.Vault},
-		{"Claude hooks", hooksConfigured(filepath.Join(a.Paths.Home, ".claude", "settings.json"), filepath.Join(a.Paths.Bin, "hgctl"), "claude"), "user settings"},
-		{"Codex hooks", codexHooksOK, codexHooksNote},
-		{"scheduler", a.schedulerLoaded(ctx), LaunchLabel},
-		{"quarantine", quarantineEmpty, a.Paths.Quarantine},
 	}
+	checks = append(checks, a.clientDoctorChecks(ctx)...)
+	checks = append(checks,
+		doctorCheck{"scheduler", a.schedulerLoaded(ctx), LaunchLabel},
+		doctorCheck{"quarantine", quarantineEmpty, a.Paths.Quarantine},
+	)
 	failed := 0
 	for _, item := range checks {
 		status := "ok"

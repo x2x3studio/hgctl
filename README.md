@@ -149,7 +149,12 @@ Prospective hooks capture a bounded user/assistant turn without tool output.
 
 ## Client integration
 
-Both clients receive `SessionStart`, `UserPromptSubmit`, and `Stop` hooks:
+Each installed client receives `SessionStart`, `UserPromptSubmit`, and `Stop`
+hooks:
+
+`hgctl` configures only the clients present on that endpoint. Claude Code,
+Codex Desktop/CLI, or both are valid; an absent optional client never makes
+installation or diagnostics fail.
 
 - `SessionStart` performs a bounded pull and tells the agent that Hourglass is
   available through the Basic Memory project `hourglass`.
@@ -199,6 +204,12 @@ do not delete the old vault until its current checkout has been imported. The
 new installer never claims or deletes an unrelated hook, Basic Memory project,
 binary, or scheduler entry. Once import reaches the queue, the old vault is no
 longer part of the live system.
+
+The prototype also exposed Basic Memory's write-capable MCP server. Remove only
+that old `basic-memory` client entry after confirming that it targets the
+archived project (for Claude Code: `claude mcp remove basic-memory -s user`).
+Keep the old Basic Memory project itself until Dream has published the imported
+queue and the new `hourglass` project can recall it.
 
 ## Supported systems
 

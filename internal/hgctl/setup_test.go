@@ -97,6 +97,164 @@ func TestSessionStartHookLeavesFailOpenHeadroom(t *testing.T) {
 	}
 }
 
+func TestSetupHookFilesConfiguresOnlyInstalledClients(t *testing.T) {
+	tests := []struct {
+		name       string
+		claude     bool
+		codex      bool
+		seedAbsent bool
+	}{
+		{name: "Claude only", claude: true},
+		{name: "Codex only", codex: true, seedAbsent: true},
+		{name: "both", claude: true, codex: true},
+		{name: "neither", seedAbsent: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			app := testApp(t)
+			bin := filepath.Join(app.Paths.Home, "client-bin")
+			if err := os.MkdirAll(bin, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if test.claude {
+				writeFakeExecutable(t, bin, "claude")
+			}
+			if test.codex {
+				writeFakeExecutable(t, bin, "codex")
+			}
+			t.Setenv("PATH", bin)
+
+			stable := filepath.Join(app.Paths.Bin, "hgctl")
+			for _, item := range app.clientAdapters() {
+				installed := (item.client == "claude" && test.claude) || (item.client == "codex" && test.codex)
+				if installed || test.seedAbsent {
+					if err := os.MkdirAll(filepath.Dir(item.path), 0o700); err != nil {
+						t.Fatal(err)
+					}
+					body := []byte("{\"sentinel\":\"" + item.client + "\"}\n")
+					if err := os.WriteFile(item.path, body, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			if err := app.setupHookFiles(); err != nil {
+				t.Fatal(err)
+			}
+			for _, item := range app.clientAdapters() {
+				installed := (item.client == "claude" && test.claude) || (item.client == "codex" && test.codex)
+				if installed {
+					if !hooksConfigured(item.path, stable, item.client) {
+						t.Fatalf("%s hooks were not configured", item.name)
+					}
+					content, err := os.ReadFile(item.path)
+					if err != nil || !bytes.Contains(content, []byte(`"sentinel"`)) {
+						t.Fatalf("%s unrelated config was not preserved: %q err=%v", item.name, content, err)
+					}
+					continue
+				}
+				content, err := os.ReadFile(item.path)
+				if test.seedAbsent {
+					want := "{\"sentinel\":\"" + item.client + "\"}\n"
+					if err != nil || string(content) != want {
+						t.Fatalf("absent %s config changed: %q err=%v", item.name, content, err)
+					}
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("absent %s config was created: %q err=%v", item.name, content, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSetupClientHooksSupportsClaudeOnlyAndCodexOnly(t *testing.T) {
+	t.Run("Claude only", func(t *testing.T) {
+		app := testApp(t)
+		bin := filepath.Join(app.Paths.Home, "client-bin")
+		writeFakeExecutable(t, bin, "claude")
+		t.Setenv("PATH", bin)
+		if err := app.setupClientHooks(testContext(t)); err != nil {
+			t.Fatal(err)
+		}
+		if !hooksConfigured(filepath.Join(app.Paths.Home, ".claude", "settings.json"), filepath.Join(app.Paths.Bin, "hgctl"), "claude") {
+			t.Fatal("Claude hooks were not configured")
+		}
+		if _, err := os.Stat(filepath.Join(app.Paths.Home, ".codex", "hooks.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Codex config was touched on a Claude-only endpoint: %v", err)
+		}
+	})
+
+	t.Run("Codex only", func(t *testing.T) {
+		app := testApp(t)
+		t.Setenv("PATH", t.TempDir())
+		trustFile, _ := installFakeCodex(t, app, "success")
+		if err := app.setupClientHooks(testContext(t)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(trustFile); err != nil {
+			t.Fatalf("Codex hooks were not trusted: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(app.Paths.Home, ".claude", "settings.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Claude config was touched on a Codex-only endpoint: %v", err)
+		}
+	})
+}
+
+func TestClientDoctorChecksSkipAbsentAndRequireInstalledClients(t *testing.T) {
+	t.Run("absent clients", func(t *testing.T) {
+		app := testApp(t)
+		t.Setenv("PATH", t.TempDir())
+		for _, item := range app.clientAdapters() {
+			if err := os.MkdirAll(filepath.Dir(item.path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(item.path, []byte("not json\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if checks := app.clientDoctorChecks(testContext(t)); len(checks) != 0 {
+			t.Fatalf("doctor checked absent clients: %+v", checks)
+		}
+		for _, item := range app.clientAdapters() {
+			content, err := os.ReadFile(item.path)
+			if err != nil || string(content) != "not json\n" {
+				t.Fatalf("doctor modified absent %s config: %q err=%v", item.name, content, err)
+			}
+		}
+	})
+
+	t.Run("Claude strict", func(t *testing.T) {
+		app := testApp(t)
+		bin := filepath.Join(app.Paths.Home, "client-bin")
+		writeFakeExecutable(t, bin, "claude")
+		t.Setenv("PATH", bin)
+		checks := app.clientDoctorChecks(testContext(t))
+		if len(checks) != 1 || checks[0].name != "Claude hooks" || checks[0].ok {
+			t.Fatalf("missing Claude hooks were not unhealthy: %+v", checks)
+		}
+		if err := app.setupHookFiles(); err != nil {
+			t.Fatal(err)
+		}
+		checks = app.clientDoctorChecks(testContext(t))
+		if len(checks) != 1 || !checks[0].ok {
+			t.Fatalf("configured Claude hooks were not healthy: %+v", checks)
+		}
+	})
+
+	t.Run("Codex strict", func(t *testing.T) {
+		app := testApp(t)
+		t.Setenv("PATH", t.TempDir())
+		installFakeCodex(t, app, "success")
+		if err := app.setupClientHooks(testContext(t)); err != nil {
+			t.Fatal(err)
+		}
+		checks := app.clientDoctorChecks(testContext(t))
+		if len(checks) != 1 || checks[0].name != "Codex hooks" || !checks[0].ok {
+			t.Fatalf("trusted Codex hooks were not healthy: %+v", checks)
+		}
+	})
+}
+
 func TestHooksConfiguredRequiresOneExactCompleteSet(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hooks.json")
 	binary := "/Users/test/.local/bin/hgctl"
@@ -417,6 +575,11 @@ exit 20
 func TestUninstallRemovesManagedIntegrationAfterSchedulerStops(t *testing.T) {
 	app := testApp(t)
 	stable := prepareUninstallFixture(t, app, false)
+	// Client removal must not strand hooks that were previously owned by hgctl.
+	t.Setenv("PATH", filepath.Join(app.Paths.Home, "fake-bin"))
+	if commandExists("claude") || commandExists("codex") {
+		t.Fatal("client executables unexpectedly remain in the uninstall fixture")
+	}
 	if err := configureHookFile(filepath.Join(app.Paths.Home, ".claude", "settings.json"), stable, "claude", true); err != nil {
 		t.Fatal(err)
 	}
@@ -712,6 +875,7 @@ func TestInstallContinuesImportAndSyncWhenCodexTrustIsDeferred(t *testing.T) {
 	app := testApp(t)
 	installFakeCodex(t, app, "rpc-error")
 	bin := filepath.Join(app.Paths.Home, "fake-codex-bin")
+	writeFakeExecutable(t, bin, "claude")
 	basicMemory := `#!/bin/sh
 case "$1 $2" in
   "tool list-projects")
@@ -780,6 +944,16 @@ exit 20
 	entries, err := os.ReadDir(app.Paths.Outbox)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("initial sync did not acknowledge import: entries=%d err=%v", len(entries), err)
+	}
+}
+
+func writeFakeExecutable(t *testing.T, dir, name string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -42,15 +42,19 @@ type codexHookMetadata struct {
 
 type codexHooksListResponse struct {
 	Data []struct {
-		CWD    string `json:"cwd"`
-		Errors []struct {
-			Message string `json:"message"`
-			Path    string `json:"path"`
-		} `json:"errors"`
+		CWD      string              `json:"cwd"`
+		Errors   []codexHookError    `json:"errors"`
 		Hooks    []codexHookMetadata `json:"hooks"`
 		Warnings []string            `json:"warnings"`
 	} `json:"data"`
 }
+
+type codexHookError struct {
+	Message string `json:"message"`
+	Path    string `json:"path"`
+}
+
+const codexCloudConfigTimeout = "timed out waiting for cloud config bundle after 15s"
 
 type codexHookSpec struct {
 	event      string
@@ -215,8 +219,10 @@ func (rpc *codexRPC) listHGCTLHooks(id int, cwd, hooksPath string, specs []codex
 		return nil, errors.New("Codex hooks/list did not return the requested cwd exactly once")
 	}
 	entry := response.Data[0]
-	if len(entry.Errors) != 0 {
-		return nil, errors.New("Codex reported hook discovery errors")
+	for _, hookErr := range entry.Errors {
+		if !benignCodexCloudConfigTimeout(hookErr, cwd, hooksPath) {
+			return nil, errors.New("Codex reported hook discovery errors")
+		}
 	}
 
 	selected := make([]codexHookMetadata, 0, len(specs))
@@ -245,6 +251,12 @@ func (rpc *codexRPC) listHGCTLHooks(id int, cwd, hooksPath string, specs []codex
 		return nil, fmt.Errorf("Codex discovered %d of %d hgctl hooks", len(selected), len(specs))
 	}
 	return selected, nil
+}
+
+func benignCodexCloudConfigTimeout(hookErr codexHookError, cwd, hooksPath string) bool {
+	return hookErr.Message == codexCloudConfigTimeout &&
+		filepath.Clean(hookErr.Path) == filepath.Clean(cwd) &&
+		filepath.Clean(hookErr.Path) != filepath.Clean(hooksPath)
 }
 
 func codexHookMatches(hook codexHookMetadata, spec codexHookSpec) bool {
