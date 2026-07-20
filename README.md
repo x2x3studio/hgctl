@@ -163,8 +163,9 @@ installation or diagnostics fail.
   queue event.
 
 Claude Code and current Codex releases share the same hook event format. Codex
-trust is maintained through `initialize` → `hooks/list` → `config/batchWrite` →
-`hooks/list`; ambiguous, duplicate, modified, or missing hooks fail closed.
+trust is maintained through `initialize` -> `hooks/list` ->
+`config/batchWrite` -> `hooks/list`; ambiguous, duplicate, modified, or
+missing hooks fail closed.
 Ubuntu setup also verifies systemd user lingering; if the account cannot enable
 it directly, the installer fails with one exact `sudo loginctl enable-linger`
 command instead of pretending background sync will survive logout.

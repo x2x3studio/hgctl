@@ -3,6 +3,13 @@
 `hgctl` must remain a small transport binary. It serves agents; it is not a
 memory server, search engine, or local Dream implementation.
 
+## Repository language
+
+Keep all source code, comments, tests, documentation, workflows, filenames,
+repository metadata, and commit messages in English. Use ASCII escapes and
+language-neutral code points when a test needs non-ASCII data; never add
+Chinese literals to this repository.
+
 ## Invariants
 
 - Use Go and the standard library. Do not add Python, a virtual environment, a

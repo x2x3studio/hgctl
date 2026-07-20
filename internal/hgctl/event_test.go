@@ -17,7 +17,7 @@ import (
 )
 
 func TestBoundTextKeepsValidUTF8(t *testing.T) {
-	value := strings.Repeat("a", MaxTextBytes-1) + "界"
+	value := strings.Repeat("a", MaxTextBytes-1) + "\u20ac"
 	got := boundText(value)
 	if len(got) > MaxTextBytes {
 		t.Fatalf("bounded text is %d bytes", len(got))
@@ -29,7 +29,7 @@ func TestBoundTextKeepsValidUTF8(t *testing.T) {
 
 func TestStreamTextChunksBoundsMemoryAndRepairsUTF8(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "large.md")
-	content := append(bytes.Repeat([]byte("界"), MaxImportText/3+10), 0xff, 0xfe)
+	content := append(bytes.Repeat([]byte("\u20ac"), MaxImportText/3+10), 0xff, 0xfe)
 	content = append(content, bytes.Repeat([]byte("a"), MaxImportText)...)
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
