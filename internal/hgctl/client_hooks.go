@@ -58,53 +58,106 @@ func (a *App) setupClientHooks(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+const hookConfigWriteAttempts = 4
+
+type hookConfigSnapshot struct {
+	content []byte
+	exists  bool
+}
+
 func configureHookFile(path, binary, client string, install bool) error {
 	writePath, err := configFilePath(path)
 	if err != nil {
 		return err
 	}
-	root := map[string]any{}
-	existed := false
-	if content, err := os.ReadFile(writePath); err == nil {
-		existed = true
+	return configureHookFileWithRetry(writePath, path, binary, client, install, nil)
+}
+
+func configureHookFileWithRetry(writePath, displayPath, binary, client string, install bool, beforeVerify func(int)) error {
+	for attempt := 0; attempt < hookConfigWriteAttempts; attempt++ {
+		snapshot, err := readHookConfigSnapshot(writePath)
+		if err != nil {
+			return err
+		}
+		if !install && !snapshot.exists {
+			return os.ErrNotExist
+		}
+		desired, write, err := mergeHookConfig(snapshot.content, snapshot.exists, displayPath, binary, client, install)
+		if err != nil {
+			return err
+		}
+		if !write {
+			return nil
+		}
+		if beforeVerify != nil {
+			beforeVerify(attempt)
+		}
+		current, err := readHookConfigSnapshot(writePath)
+		if err != nil {
+			return err
+		}
+		if !sameHookConfigSnapshot(snapshot, current) {
+			continue
+		}
+		if err := writeFileAtomic(writePath, desired, 0o600); err != nil {
+			return err
+		}
+		persisted, err := readHookConfigSnapshot(writePath)
+		if err != nil {
+			return err
+		}
+		if persisted.exists && bytes.Equal(persisted.content, desired) {
+			return nil
+		}
+	}
+	return fmt.Errorf("configuration changed concurrently while updating %s", displayPath)
+}
+
+func readHookConfigSnapshot(path string) (hookConfigSnapshot, error) {
+	content, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return hookConfigSnapshot{}, nil
+	}
+	if err != nil {
+		return hookConfigSnapshot{}, err
+	}
+	return hookConfigSnapshot{content: content, exists: true}, nil
+}
+
+func sameHookConfigSnapshot(left, right hookConfigSnapshot) bool {
+	return left.exists == right.exists && bytes.Equal(left.content, right.content)
+}
+
+func mergeHookConfig(content []byte, existed bool, displayPath, binary, client string, install bool) ([]byte, bool, error) {
+	root := map[string]json.RawMessage{}
+	if existed {
 		if err := json.Unmarshal(content, &root); err != nil {
-			return fmt.Errorf("parse %s: %w", path, err)
+			return nil, false, fmt.Errorf("parse %s: %w", displayPath, err)
 		}
 		if root == nil {
-			return fmt.Errorf("parse %s: root must be an object", path)
+			return nil, false, fmt.Errorf("parse %s: root must be an object", displayPath)
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if !install && !existed {
-		return os.ErrNotExist
 	}
 	rawHooks, hasHooks := root["hooks"]
 	if !hasHooks {
 		if !install {
-			return nil
+			return nil, false, nil
 		}
-		hooks := map[string]any{}
-		root["hooks"] = hooks
-		rawHooks = hooks
+		rawHooks = json.RawMessage(`{}`)
 	}
-	hooks, ok := rawHooks.(map[string]any)
-	if !ok {
-		return fmt.Errorf("parse %s: hooks must be an object", path)
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(rawHooks, &hooks); err != nil || hooks == nil {
+		return nil, false, fmt.Errorf("parse %s: hooks must be an object", displayPath)
 	}
-	if hooks == nil {
-		hooks = map[string]any{}
-		root["hooks"] = hooks
-	}
-	for eventName, raw := range hooks {
-		groups, ok := raw.([]any)
-		if !ok {
-			return fmt.Errorf("parse %s: hooks.%s must be an array", path, eventName)
+	for eventName, rawGroups := range hooks {
+		var groups []json.RawMessage
+		if err := json.Unmarshal(rawGroups, &groups); err != nil || groups == nil {
+			return nil, false, fmt.Errorf("parse %s: hooks.%s must be an array", displayPath, eventName)
 		}
-		filtered := make([]any, 0, len(groups))
+		filtered := make([]json.RawMessage, 0, len(groups))
 		for _, rawGroup := range groups {
-			group, ok := rawGroup.(map[string]any)
-			if !ok {
+			var group map[string]json.RawMessage
+			if err := json.Unmarshal(rawGroup, &group); err != nil || group == nil {
 				filtered = append(filtered, rawGroup)
 				continue
 			}
@@ -113,27 +166,44 @@ func configureHookFile(path, binary, client string, install bool) error {
 				filtered = append(filtered, rawGroup)
 				continue
 			}
-			handlers, ok := rawHandlers.([]any)
-			if !ok {
-				return fmt.Errorf("parse %s: hooks.%s group hooks must be an array", path, eventName)
+			var handlers []json.RawMessage
+			if err := json.Unmarshal(rawHandlers, &handlers); err != nil || handlers == nil {
+				return nil, false, fmt.Errorf("parse %s: hooks.%s group hooks must be an array", displayPath, eventName)
 			}
-			kept := make([]any, 0, len(handlers))
+			kept := make([]json.RawMessage, 0, len(handlers))
 			for _, rawHandler := range handlers {
-				handler, ok := rawHandler.(map[string]any)
-				command, _ := handler["command"].(string)
-				if !ok || !managedHookCommand(command, binary, client) {
+				var handler map[string]json.RawMessage
+				if err := json.Unmarshal(rawHandler, &handler); err != nil || handler == nil {
+					kept = append(kept, rawHandler)
+					continue
+				}
+				var command string
+				_ = json.Unmarshal(handler["command"], &command)
+				if !managedHookCommand(command, binary, client) {
 					kept = append(kept, rawHandler)
 				}
 			}
 			if len(kept) > 0 {
-				group["hooks"] = kept
-				filtered = append(filtered, group)
+				encoded, err := json.Marshal(kept)
+				if err != nil {
+					return nil, false, err
+				}
+				group["hooks"] = encoded
+				encoded, err = json.Marshal(group)
+				if err != nil {
+					return nil, false, err
+				}
+				filtered = append(filtered, encoded)
 			}
 		}
 		if len(filtered) == 0 {
 			delete(hooks, eventName)
 		} else {
-			hooks[eventName] = filtered
+			encoded, err := json.Marshal(filtered)
+			if err != nil {
+				return nil, false, err
+			}
+			hooks[eventName] = encoded
 		}
 	}
 	if install {
@@ -144,11 +214,34 @@ func configureHookFile(path, binary, client string, install bool) error {
 			if item.matcher != "" {
 				group["matcher"] = item.matcher
 			}
-			groups, _ := hooks[item.event].([]any)
-			hooks[item.event] = append(groups, group)
+			encodedGroup, err := json.Marshal(group)
+			if err != nil {
+				return nil, false, err
+			}
+			var groups []json.RawMessage
+			if rawGroups, ok := hooks[item.event]; ok {
+				if err := json.Unmarshal(rawGroups, &groups); err != nil {
+					return nil, false, err
+				}
+			}
+			groups = append(groups, encodedGroup)
+			encodedGroups, err := json.Marshal(groups)
+			if err != nil {
+				return nil, false, err
+			}
+			hooks[item.event] = encodedGroups
 		}
 	}
-	return writeJSONAtomic(writePath, root, 0o600)
+	encodedHooks, err := json.Marshal(hooks)
+	if err != nil {
+		return nil, false, err
+	}
+	root["hooks"] = encodedHooks
+	encoded, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return nil, false, err
+	}
+	return append(encoded, '\n'), true, nil
 }
 
 type hookFileSpec struct {

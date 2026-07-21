@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -14,6 +13,22 @@ type doctorCheck struct {
 	name string
 	ok   bool
 	note string
+}
+
+func (a *App) hookDiagnosticDoctorCheck() doctorCheck {
+	var diagnostic hookDiagnostic
+	if err := readJSON(a.hookDiagnosticPath(), &diagnostic); errors.Is(err, os.ErrNotExist) {
+		return doctorCheck{"hook diagnostics", true, "none"}
+	} else if err != nil {
+		return doctorCheck{"hook diagnostics", false, boundString(err.Error(), 512)}
+	}
+	if diagnostic.SchemaVersion != hookDiagnosticSchemaVersion || diagnostic.Client == "" ||
+		diagnostic.Event == "" || diagnostic.Message == "" || diagnostic.OccurredAt.IsZero() {
+		return doctorCheck{"hook diagnostics", false, "invalid persisted hook diagnostic"}
+	}
+	note := fmt.Sprintf("%s/%s at %s: %s", diagnostic.Client, diagnostic.Event,
+		diagnostic.OccurredAt.UTC().Format(time.RFC3339), diagnostic.Message)
+	return doctorCheck{"hook diagnostics", false, boundString(note, 512)}
 }
 
 func (a *App) clientDoctorChecks(ctx context.Context) []doctorCheck {
@@ -41,27 +56,22 @@ func (a *App) clientDoctorChecks(ctx context.Context) []doctorCheck {
 
 func (a *App) doctor(ctx context.Context) error {
 	projectOK := false
-	projectID := ""
-	if commandExists("basic-memory") {
-		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		projects, err := listBasicMemoryProjects(checkCtx)
-		cancel()
-		if err == nil {
-			want := canonicalPath(a.Paths.Vault)
-			for _, project := range projects {
-				if project.Name == ProjectName && project.ExternalID != "" && project.CanonicalPath() == want {
-					projectOK = true
-					projectID = project.ExternalID
-				}
-			}
-		}
-	}
+	projectNote := a.Paths.Vault
 	indexedOK := false
-	if head, err := runCommand(ctx, a.Paths.Vault, "git", "rev-parse", "HEAD"); err == nil {
-		if indexed, readErr := a.loadBasicMemoryIndexReceipt(); readErr == nil {
-			indexedOK = indexed.SharedSHA == strings.TrimSpace(head) && indexed.ProjectExternalID == projectID
+	indexNote := a.Paths.IndexedSHA
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	project, projectErr := a.resolveBasicMemoryProject(checkCtx)
+	if projectErr == nil {
+		projectOK = true
+		if _, err := a.verifyBasicMemoryIndexReceipt(checkCtx, project); err == nil {
+			indexedOK = true
+		} else {
+			indexNote = boundString(err.Error(), 512)
 		}
+	} else {
+		projectNote = boundString(projectErr.Error(), 512)
 	}
+	cancel()
 	quarantineEmpty := true
 	if entries, err := os.ReadDir(a.Paths.Quarantine); err == nil {
 		quarantineEmpty = len(entries) == 0
@@ -71,8 +81,8 @@ func (a *App) doctor(ctx context.Context) error {
 	checks := []doctorCheck{
 		{"git", commandExists("git"), "required transport"},
 		{"basic-memory", commandExists("basic-memory"), "required recall helper"},
-		{"memory project", projectOK, a.Paths.Vault},
-		{"memory index", indexedOK, a.Paths.IndexedSHA},
+		{"memory project", projectOK, projectNote},
+		{"memory index", indexedOK, indexNote},
 		{"stable binary", managedStableSymlink(filepath.Join(a.Paths.Bin, "hgctl"), a.Paths.Versions), filepath.Join(a.Paths.Bin, "hgctl")},
 		{"control checkout", isGitWorktree(a.Paths.Control), a.Paths.Control},
 		{"queue worktree", isGitWorktree(a.Paths.Queue), a.Paths.Queue},
@@ -82,6 +92,7 @@ func (a *App) doctor(ctx context.Context) error {
 	checks = append(checks,
 		doctorCheck{"scheduler", a.schedulerLoaded(ctx), LaunchLabel},
 		doctorCheck{"quarantine", quarantineEmpty, a.Paths.Quarantine},
+		a.hookDiagnosticDoctorCheck(),
 	)
 	failed := 0
 	for _, item := range checks {

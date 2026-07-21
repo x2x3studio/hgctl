@@ -50,7 +50,7 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if state.BasicMemoryProject == nil || state.BasicMemoryProject.ExternalID == "" ||
+	if state.BasicMemoryProject == nil || state.BasicMemoryProject.ExternalID == "" || state.BasicMemoryProject.Path == "" ||
 		canonicalPath(state.BasicMemoryProject.Path) != canonicalPath(a.Paths.Vault) {
 		return errors.New("Basic Memory project identity is not configured")
 	}
@@ -66,6 +66,11 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 	if !commandExists("basic-memory") {
 		return errors.New("basic-memory is not installed")
 	}
+	project, err := a.resolveBasicMemoryProject(ctx)
+	if err != nil {
+		return err
+	}
+	projectID = project.ExternalID
 	status, err := runCommand(ctx, a.Paths.Vault, "git", "status", "--porcelain")
 	if err != nil {
 		return err
@@ -116,6 +121,66 @@ func listBasicMemoryProjects(ctx context.Context) ([]basicMemoryProject, error) 
 		return nil, err
 	}
 	return listing.Projects, nil
+}
+
+func (a *App) resolveBasicMemoryProject(ctx context.Context) (basicMemoryProject, error) {
+	if !commandExists("basic-memory") {
+		return basicMemoryProject{}, errors.New("basic-memory is not installed")
+	}
+	state, err := a.loadState()
+	if err != nil {
+		return basicMemoryProject{}, fmt.Errorf("load Basic Memory identity: %w", err)
+	}
+	if state.BasicMemoryProject == nil || state.BasicMemoryProject.ExternalID == "" ||
+		canonicalPath(state.BasicMemoryProject.Path) != canonicalPath(a.Paths.Vault) {
+		return basicMemoryProject{}, errors.New("Basic Memory project identity is not configured for the shared vault")
+	}
+	projects, err := listBasicMemoryProjects(ctx)
+	if err != nil {
+		return basicMemoryProject{}, fmt.Errorf("list Basic Memory projects: %w", err)
+	}
+	var named []basicMemoryProject
+	for _, project := range projects {
+		if project.Name == ProjectName {
+			named = append(named, project)
+		}
+	}
+	if len(named) != 1 {
+		return basicMemoryProject{}, fmt.Errorf("Basic Memory project %q resolved %d times", ProjectName, len(named))
+	}
+	project := named[0]
+	if (project.LocalPath == "" && project.Path == "") || project.ExternalID != state.BasicMemoryProject.ExternalID ||
+		project.CanonicalPath() != canonicalPath(a.Paths.Vault) {
+		return basicMemoryProject{}, errors.New("Basic Memory project identity or shared path changed")
+	}
+	return project, nil
+}
+
+func (a *App) verifyBasicMemoryIndexReceipt(ctx context.Context, project basicMemoryProject) (string, error) {
+	head, err := runCommand(ctx, a.Paths.Vault, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("read shared revision: %w", err)
+	}
+	head = strings.TrimSpace(head)
+	receipt, err := a.loadBasicMemoryIndexReceipt()
+	if err != nil {
+		return "", fmt.Errorf("load Basic Memory index receipt: %w", err)
+	}
+	if receipt.SharedSHA != head || receipt.ProjectExternalID != project.ExternalID {
+		return "", errors.New("Basic Memory index is not current for the shared revision")
+	}
+	return head, nil
+}
+
+func (a *App) requireBasicMemoryIndexReady(ctx context.Context) (basicMemoryProject, error) {
+	project, err := a.resolveBasicMemoryProject(ctx)
+	if err != nil {
+		return basicMemoryProject{}, err
+	}
+	if _, err := a.verifyBasicMemoryIndexReceipt(ctx, project); err != nil {
+		return basicMemoryProject{}, err
+	}
+	return project, nil
 }
 
 func (a *App) ensureBasicMemoryProject(ctx context.Context, state *State) (basicMemoryProject, bool, error) {

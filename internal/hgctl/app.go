@@ -23,11 +23,13 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	case "install":
 		err = a.runInstall(ctx, args[1:])
 	case "hook":
+		client, eventName := hookDiagnosticScope(args[1:])
 		err = a.runHook(ctx, args[1:])
 		if err != nil {
-			_, _ = fmt.Fprintln(a.Err, "hgctl hook:", err)
+			_ = a.recordHookDiagnostic(client, eventName, err)
 			return 0
 		}
+		a.clearHookDiagnostic(client, eventName)
 	case "observe":
 		err = a.runObserve(args[1:])
 	case "import":
@@ -212,6 +214,15 @@ func (a *App) runRecall(ctx context.Context, args []string) error {
 	query := strings.Join(args, " ")
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	if err := a.syncShared(ctx); err != nil {
+		return fmt.Errorf("refresh shared memory: %w", err)
+	}
+	if err := a.reindexBasicMemory(ctx); err != nil {
+		return fmt.Errorf("refresh recall index: %w", err)
+	}
+	if _, err := a.requireBasicMemoryIndexReady(ctx); err != nil {
+		return fmt.Errorf("recall is not ready: %w", err)
+	}
 	out, err := runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "tool", "search-notes", query, "--project", ProjectName, "--local", "--page-size", "8")
 	if err != nil {
 		return err

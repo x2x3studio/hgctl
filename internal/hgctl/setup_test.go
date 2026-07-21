@@ -812,6 +812,10 @@ func TestBasicMemoryReindexIsReadOnlyAndReceiptBound(t *testing.T) {
 [ "$BASIC_MEMORY_DISABLE_PERMALINKS" = "true" ] || exit 12
 [ "$BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED" = "false" ] || exit 13
 [ "$BASIC_MEMORY_DEFAULT_SEARCH_TYPE" = "text" ] || exit 14
+[ "$1 $2" != "tool list-projects" ] || {
+  printf '{"projects":[{"name":"hourglass","external_id":"%s","local_path":"%s"}]}\n' "$HGCTL_TEST_PROJECT_ID" "$HGCTL_TEST_PROJECT_PATH"
+  exit 0
+}
 [ "$1" = "reindex" ] && [ "$2" = "--search" ] && [ "$3" = "--project" ] && [ "$4" = "hourglass" ] || exit 15
 printf x >> "$HGCTL_TEST_REINDEX_LOG"
 `
@@ -820,6 +824,8 @@ printf x >> "$HGCTL_TEST_REINDEX_LOG"
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HGCTL_TEST_REINDEX_LOG", logPath)
+	t.Setenv("HGCTL_TEST_PROJECT_ID", "project-id")
+	t.Setenv("HGCTL_TEST_PROJECT_PATH", app.Paths.Vault)
 	if err := app.saveState(State{BasicMemoryProject: &BasicMemoryOwnership{
 		ExternalID: "project-id",
 		Path:       app.Paths.Vault,
@@ -846,6 +852,7 @@ printf x >> "$HGCTL_TEST_REINDEX_LOG"
 	if err := app.saveState(state); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("HGCTL_TEST_PROJECT_ID", "replacement-project-id")
 	if err := app.reindexBasicMemory(testContext(t)); err != nil {
 		t.Fatal(err)
 	}
