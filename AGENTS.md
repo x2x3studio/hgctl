@@ -1,90 +1,92 @@
 # AGENTS.md - hgctl engineering contract
 
-`hgctl` must remain a small transport binary. It serves agents; it is not a
-memory server, search engine, or local Dream implementation.
+The Hourglass Project has exactly two repositories. This repository owns all
+Go code and releases two static binaries:
 
-The Hourglass Project consists of exactly two repositories: this endpoint
-binary and the companion `x2x3studio/hourglass` control-plane repository.
-Changes must preserve that ownership boundary rather than treating either
-repository as the whole Project.
+- `hgctl`: endpoint installation, hooks, capture, queue transport, sync,
+  update, Basic Memory project setup, MCP registration, and reindex;
+- `dreamctl`: typed prepare, finalize, apply, and bootstrap operations used
+  only by the companion Hourglass GitHub Actions.
 
-## Repository language
+`x2x3studio/hourglass` owns the agent contract, protocol corpus, Dream prompt,
+workflows, and knowledge branches. It contains no Go source.
 
-Keep all source code, comments, tests, documentation, workflows, filenames,
-repository metadata, and commit messages in English. Use ASCII escapes and
-language-neutral code points when a test needs non-ASCII data; never add
-Chinese literals to this repository.
+## Language
 
-## Invariants
+Keep source, comments, tests, documentation, workflows, filenames, repository
+metadata, and commit messages in English ASCII. Tests may use escaped
+language-neutral code points when needed.
 
-- Use Go and the standard library. Do not add Python, a virtual environment, a
-  package-manager runtime, or a resident application daemon.
-- Support macOS and Ubuntu. Do not assume hostname is stable identity.
-- Use `~/.local/bin/hgctl` as the only command path placed in hooks or a
-  scheduler.
+## Endpoint invariants
+
+- Use Go and the standard library. Do not add Python, a project virtual
+  environment, a server, or a resident application daemon.
+- Support macOS with Homebrew and Ubuntu Linux.
+- Persist one random app-scoped machine UUID. Hostname is mutable metadata.
+- Use `~/.local/bin/hgctl` as the only hook and scheduler command path.
 - Use exactly one macOS LaunchAgent label:
   `com.x2x3studio.hgctl.sync`.
-- Hooks are fail-open, bounded, and safe under concurrent calls.
-- Only `sync` writes Git. It pushes the endpoint queue and fast-forwards the
-  shared worktree; it never commits to `main` or `shared`.
-- Keep local outbox writes atomic. Use an OS-released advisory lock for Git
-  sync so process death cannot leave a logical deadlock.
-- Never scan source Git history during import. Never bulk-copy raw session
-  transcript stores or tool output.
-- Basic Memory is an external recall dependency. Do not recreate its index,
-  embeddings, or MCP server. Reindex its disposable cache only after `shared`
-  actually advances.
-- Recall trusts only Basic Memory's entity paths, then resolves content and
-  blobs from one exact indexed `shared` commit. Never surface cached snippets.
-- Store bounded seven-day recall receipts without queries or prose. Feedback
-  is receipt-bound, first-writer-wins, and may reorder a result by at most two
-  positions through exact card-version aggregates.
-- Wake Dream with a best-effort repository dispatch after a queue push; the
-  scheduled workflow is the recovery path, not a second publisher.
-- Maintain Codex hook trust only through the official app-server. A failed
-  install attempt is visible but cannot strand imports or Claude capture;
-  background repair is persisted and low-frequency.
-- Auto-update must be atomic, checksum-verified, and unable to break the
-  currently running binary.
+- Hooks are fail-open, bounded, atomic, and concurrency safe.
+- Only `sync` writes Git. It appends to `queue/<machine-id>` and
+  fast-forwards the local `shared` worktree. It never commits to `main` or
+  `shared`.
+- Use an OS-released advisory lock for sync. Process death must not leave a
+  logical lock or require manual cleanup.
+- Never scan source Git history or bulk-copy transcript stores and tool output.
+- Auto-update is checksum verified and atomically retargets the stable symlink.
 
-## Configuration safety
+## Recall boundary
 
-Preserve unrelated Claude Code, Codex, Basic Memory, LaunchAgent, and systemd
-configuration. Setup and uninstall identify only entries whose command is the
-stable `hgctl` path. Repeated setup is idempotent.
+Basic Memory MCP exclusively owns search, recall, and read. `hgctl` must not
+implement a second recall command, local search API, surface receipt, feedback
+event, or reranker.
 
-Uninstall removes integration and scheduler files but preserves
-`~/hourglass-vault`, outbox data, and machine identity unless a future explicit
-purge command says otherwise.
+Install creates or adopts the Basic Memory project `hourglass`, reindexes its
+disposable local cache only after `shared` advances, and configures the
+`hourglass-memory` MCP server for every installed Claude Code and Codex
+client. Configuration must be exact, idempotent, and ownership safe.
+Uninstall removes only MCP entries it created.
+
+Agents use Basic Memory read/search tools and never its write/edit/delete
+tools. Durable writes enter only through hooks, `observe`, or `import`, then
+pass through Dream.
 
 ## Protocol
 
-The companion Hourglass repository owns the branch contract and the single
-closed `hourglass.event/v1` wire protocol in `protocol/event.md`. Its event
-kinds are exactly `observation`, `turn`, `import_batch`, and receipt-bound
-`feedback`; neither envelope nor payload extensions are accepted. One queue
-commit may mix any valid kinds while retaining the shared count and byte
-limits. Unsupported event schemas are invalid, not deferred compatibility
-work. Changing fields, IDs, branch ownership, or cursor semantics requires an
-explicit coordinated change across both Project repositories.
+The single closed `hourglass.event/v1` protocol has exactly three kinds:
+`observation`, `turn`, and `import_batch`. The companion authority is
+`hourglass/protocol/event.md`; this repository pins a byte-identical
+conformance corpus. Do not add parallel protocol versions or future-stage
+compatibility branches during the MVP.
+
+## dreamctl boundary
+
+`dreamctl` is model free. It validates Git, queue events, control manifests,
+model output, publication paths, baselines, and exact publisher changes. It
+does not call Claude. The Hourglass workflow downloads the released Linux
+binary and the official Claude Action performs the semantic Dream stage.
+
+Dream semantic output is limited to `memory/**/*.md`, `Home.md`, and
+`Hourglass.canvas`. Durable control state is limited to seen, rejected, and
+cursor shards.
+
+## Configuration safety
+
+Preserve unrelated Claude Code, Codex, Basic Memory, LaunchAgent, systemd, and
+MCP configuration. Repeated setup is idempotent. Uninstall removes managed
+integration but preserves the shared vault, outbox, and machine identity.
 
 ## Verification
 
-Every behavior change needs focused tests. At minimum cover:
+Every behavior change needs focused tests. Before committing, run:
 
-- deterministic IDs and import batching;
-- UTF-8 and size bounds;
-- atomic outbox and concurrent hook calls;
-- prompt/response pairing and retry;
-- machine identity persistence across hostname changes;
-- Git queue idempotence and failed-push recovery;
-- exact shared commit/tree/blob recall and Basic Memory JSON validation;
-- feedback identity, receipt expiry, first-writer-wins, and bounded reranking;
-- mixed-kind queue batching, feedback expiry, and interrupted recovery;
-- hook config merge/uninstall without damaging unrelated entries;
-- Codex hook discovery and trust through the official app-server only;
-- scheduler label/path stability;
-- update checksum and atomic symlink replacement;
-- fail-open behavior when optional commands are absent.
+```sh
+gofmt -w cmd internal
+go test ./...
+go test -race ./internal/...
+go vet ./...
+```
 
-Run `gofmt`, `go test ./...`, and `go vet ./...` before committing.
+Cross-build `hgctl` for Darwin/Linux on amd64/arm64 and `dreamctl` for
+Linux amd64. CI and releases use only
+`[self-hosted, Linux, X64, x2x3studio-paas]`.

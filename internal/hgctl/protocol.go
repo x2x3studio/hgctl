@@ -121,8 +121,6 @@ func decodeEventPayload(kind string, content json.RawMessage) (any, error) {
 		value = &TurnPayload{}
 	case "import_batch":
 		value = &ImportPayload{}
-	case "feedback":
-		value = &FeedbackPayload{}
 	default:
 		return nil, fmt.Errorf("unsupported event kind %q", kind)
 	}
@@ -135,8 +133,6 @@ func decodeEventPayload(kind string, content json.RawMessage) (any, error) {
 	case *TurnPayload:
 		return *typed, nil
 	case *ImportPayload:
-		return *typed, nil
-	case *FeedbackPayload:
 		return *typed, nil
 	default:
 		return nil, errors.New("unsupported event payload type")
@@ -247,7 +243,7 @@ func canonicalEventBytes(event Event) ([]byte, error) {
 	return append(b, '\n'), nil
 }
 
-func decodeCanonicalEvent(content []byte, filename, machineID string, now time.Time) (Event, []byte, error) {
+func decodeCanonicalEvent(content []byte, filename, machineID string) (Event, []byte, error) {
 	if len(content) == 0 || len(content) > MaxEventBytes || !utf8.Valid(content) {
 		return Event{}, nil, errors.New("event is empty, oversized, or not UTF-8")
 	}
@@ -255,10 +251,7 @@ func decodeCanonicalEvent(content []byte, filename, machineID string, now time.T
 	if err := decodeClosedJSON(content, &event); err != nil {
 		return Event{}, nil, fmt.Errorf("parse event: %w", err)
 	}
-	if event.Kind == "feedback" && len(content) > MaxFeedbackEventBytes {
-		return Event{}, nil, fmt.Errorf("feedback event exceeds %d bytes", MaxFeedbackEventBytes)
-	}
-	if err := validateEvent(event, filename, machineID, now); err != nil {
+	if err := validateEvent(event, filename, machineID); err != nil {
 		return Event{}, nil, err
 	}
 	canonical, err := canonicalEventBytes(event)
@@ -271,25 +264,7 @@ func decodeCanonicalEvent(content []byte, filename, machineID string, now time.T
 	return event, canonical, nil
 }
 
-func decodeCanonicalEventForRecovery(content []byte, filename, machineID string, now time.Time) (Event, []byte, bool, error) {
-	event, canonical, err := decodeCanonicalEvent(content, filename, machineID, now)
-	if !errors.Is(err, errFeedbackExpired) {
-		return event, canonical, false, err
-	}
-	var envelope struct {
-		CapturedAt time.Time `json:"captured_at"`
-	}
-	if decodeErr := json.Unmarshal(content, &envelope); decodeErr != nil || envelope.CapturedAt.IsZero() {
-		return Event{}, nil, false, err
-	}
-	event, canonical, decodeErr := decodeCanonicalEvent(content, filename, machineID, envelope.CapturedAt)
-	if decodeErr != nil {
-		return Event{}, nil, false, decodeErr
-	}
-	return event, canonical, true, nil
-}
-
-func validateEvent(event Event, filename, machineID string, now time.Time) error {
+func validateEvent(event Event, filename, machineID string) error {
 	if err := validateEventEnvelope(event, filename, machineID); err != nil {
 		return err
 	}
@@ -309,18 +284,13 @@ func validateEvent(event Event, filename, machineID string, now time.Time) error
 			return errors.New("event payload type does not match its kind")
 		}
 		return validateImportEvent(event, value)
-	case FeedbackPayload:
-		if event.Kind != "feedback" {
-			return errors.New("event payload type does not match its kind")
-		}
-		return validateFeedbackEvent(event, value, now)
 	default:
 		return fmt.Errorf("event kind %q has an unsupported payload type", event.Kind)
 	}
 }
 
 func validateProducerEvent(event Event, filename, machineID string) error {
-	return validateEvent(event, filename, machineID, event.CapturedAt.UTC())
+	return validateEvent(event, filename, machineID)
 }
 
 func validateEventEnvelope(event Event, filename, machineID string) error {

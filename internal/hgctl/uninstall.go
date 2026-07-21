@@ -30,6 +30,10 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 	cleanupErr := withFileLockWait(ctx, a.Paths.SyncLock, func() error {
 		return withFileLockWait(ctx, a.Paths.UpdateLock, func() error {
 			return withFileLockWait(ctx, a.Paths.CodexLock, func() error {
+				if err := a.removeManagedBasicMemoryMCP(ctx); err != nil {
+					errs = append(errs, err)
+					safeToRemoveBinary = false
+				}
 				for _, item := range a.clientAdapters() {
 					present, err := managedHooksPresent(item.path, stable, item.client)
 					if errors.Is(err, os.ErrNotExist) || (err == nil && !present) {

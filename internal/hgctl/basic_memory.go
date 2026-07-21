@@ -1,14 +1,11 @@
 package hgctl
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -175,17 +172,6 @@ func (a *App) verifyBasicMemoryIndexReceipt(ctx context.Context, project basicMe
 	return head, nil
 }
 
-func (a *App) requireBasicMemoryIndexReady(ctx context.Context) (basicMemoryProject, error) {
-	project, err := a.resolveBasicMemoryProject(ctx)
-	if err != nil {
-		return basicMemoryProject{}, err
-	}
-	if _, err := a.verifyBasicMemoryIndexReceipt(ctx, project); err != nil {
-		return basicMemoryProject{}, err
-	}
-	return project, nil
-}
-
 func (a *App) ensureBasicMemoryProject(ctx context.Context, state *State) (basicMemoryProject, bool, error) {
 	projects, err := listBasicMemoryProjects(ctx)
 	if err != nil {
@@ -305,69 +291,4 @@ func basicMemoryOwnershipMatches(ownership BasicMemoryOwnership, projects []basi
 		}
 	}
 	return false
-}
-
-func searchBasicMemoryEntities(ctx context.Context, projectID, query string) ([]string, error) {
-	content, err := runBasicMemoryStdout(ctx, "tool", "search-notes",
-		"--project-id", projectID, "--local", "--entity-type", "entity", "--page-size", "8", "--", query)
-	if err != nil {
-		return nil, err
-	}
-	return decodeBasicMemoryEntityPaths(content)
-}
-
-func decodeBasicMemoryEntityPaths(content []byte) ([]string, error) {
-	decoder := json.NewDecoder(bytes.NewReader(content))
-	var root map[string]json.RawMessage
-	if err := decoder.Decode(&root); err != nil || root == nil {
-		return nil, errors.New("Basic Memory search stdout is not one JSON object")
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return nil, errors.New("Basic Memory search stdout contains trailing data")
-	}
-	rawResults, exists := root["results"]
-	if !exists || bytes.Equal(bytes.TrimSpace(rawResults), []byte("null")) {
-		return nil, errors.New("Basic Memory search results are missing or null")
-	}
-	var rawItems []json.RawMessage
-	if err := json.Unmarshal(rawResults, &rawItems); err != nil || rawItems == nil || len(rawItems) > MaxSurfaceResults {
-		return nil, errors.New("Basic Memory search results are not a bounded array")
-	}
-	paths := make([]string, 0, len(rawItems))
-	for _, rawItem := range rawItems {
-		var item map[string]json.RawMessage
-		if err := json.Unmarshal(rawItem, &item); err != nil || item == nil {
-			return nil, errors.New("Basic Memory search result is not an object")
-		}
-		var resultType, filePath string
-		if err := json.Unmarshal(item["type"], &resultType); err != nil || resultType != "entity" {
-			return nil, errors.New("Basic Memory search returned a non-entity result")
-		}
-		if err := json.Unmarshal(item["file_path"], &filePath); err != nil || filePath == "" {
-			return nil, errors.New("Basic Memory entity has no file_path")
-		}
-		paths = append(paths, filePath)
-	}
-	return paths, nil
-}
-
-func runBasicMemoryStdout(ctx context.Context, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "basic-memory", args...)
-	cmd.Env = append(os.Environ(), basicMemoryReadOnlyEnv...)
-	stdout := boundedCommandOutput{limit: basicMemoryCommandOutputLimit}
-	stderr := boundedCommandOutput{limit: 64 * 1024}
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if stdout.truncated {
-		return nil, &commandRunError{
-			class: "Basic Memory", cause: errors.Join(err, errCommandOutputLimit),
-			output: stderr.String(), outputLimit: basicMemoryCommandOutputLimit,
-		}
-	}
-	if err != nil {
-		return nil, &commandRunError{class: "Basic Memory", cause: err, output: stderr.String()}
-	}
-	return append([]byte(nil), stdout.buffer.Bytes()...), nil
 }

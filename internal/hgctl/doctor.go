@@ -80,7 +80,7 @@ func (a *App) doctor(ctx context.Context) error {
 	}
 	checks := []doctorCheck{
 		{"git", commandExists("git"), "required transport"},
-		{"basic-memory", commandExists("basic-memory"), "required recall helper"},
+		{"basic-memory", commandExists("basic-memory"), "required MCP-backed memory helper"},
 		{"memory project", projectOK, projectNote},
 		{"memory index", indexedOK, indexNote},
 		{"stable binary", managedStableSymlink(filepath.Join(a.Paths.Bin, "hgctl"), a.Paths.Versions), filepath.Join(a.Paths.Bin, "hgctl")},
@@ -89,6 +89,7 @@ func (a *App) doctor(ctx context.Context) error {
 		{"shared worktree", isGitWorktree(a.Paths.Vault), a.Paths.Vault},
 	}
 	checks = append(checks, a.clientDoctorChecks(ctx)...)
+	checks = append(checks, a.basicMemoryMCPDoctorChecks(ctx)...)
 	checks = append(checks,
 		doctorCheck{"scheduler", a.schedulerLoaded(ctx), LaunchLabel},
 		doctorCheck{"quarantine", quarantineEmpty, a.Paths.Quarantine},

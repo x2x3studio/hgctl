@@ -31,13 +31,6 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 			return err
 		}
 	}
-	recovered, err = a.rebuildExpiredUnpublishedQueue(ctx, state, recovered)
-	if err != nil {
-		return err
-	}
-	if err := a.pruneExpiredFeedbackOutbox(a.Now().UTC()); err != nil {
-		return err
-	}
 	batch := recovered
 	if len(batch.EventPaths) == 0 {
 		batch, err = a.copyOutboxToQueue()
@@ -146,6 +139,12 @@ type outboxCandidate struct {
 	canonical []byte
 }
 
+func queuedEventPath(event Event, filename string) string {
+	return filepath.ToSlash(filepath.Join(
+		"events", event.CapturedAt.UTC().Format("2006"), event.CapturedAt.UTC().Format("01"), filename,
+	))
+}
+
 func (a *App) copyOutboxToQueue() (queueBatch, error) {
 	identity, err := a.loadIdentity()
 	if err != nil {
@@ -174,14 +173,8 @@ func (a *App) copyOutboxToQueue() (queueBatch, error) {
 			}
 			continue
 		}
-		event, canonical, err := decodeCanonicalEvent(content, entry.Name(), identity.ID, a.Now().UTC())
+		event, canonical, err := decodeCanonicalEvent(content, entry.Name(), identity.ID)
 		if err != nil {
-			if errors.Is(err, errFeedbackExpired) {
-				if removeErr := os.Remove(sourcePath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-					return queueBatch{}, removeErr
-				}
-				continue
-			}
 			if quarantineErr := a.quarantineOutbox(sourcePath, err); quarantineErr != nil {
 				return queueBatch{}, quarantineErr
 			}
@@ -358,9 +351,7 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 	type recoveryCandidate struct {
 		path       string
 		outboxPath string
-		event      Event
 		canonical  []byte
-		expired    bool
 	}
 	var candidates []recoveryCandidate
 	var staged []string
@@ -390,7 +381,7 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 		if err != nil {
 			return queueBatch{}, fmt.Errorf("staged queue event has no matching outbox entry: %s", rel)
 		}
-		event, canonical, expired, err := decodeCanonicalEventForRecovery(outbox, base, identity.ID, a.Now().UTC())
+		event, canonical, err := decodeCanonicalEvent(outbox, base, identity.ID)
 		if err != nil {
 			return queueBatch{}, fmt.Errorf("staged queue event has an invalid outbox entry: %s", rel)
 		}
@@ -399,9 +390,7 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 		if err != nil || clean != expected || !bytes.Equal(queued, canonical) {
 			return queueBatch{}, fmt.Errorf("staged queue event does not match its outbox entry: %s", rel)
 		}
-		candidates = append(candidates, recoveryCandidate{
-			path: clean, outboxPath: outboxPath, event: event, canonical: canonical, expired: expired,
-		})
+		candidates = append(candidates, recoveryCandidate{path: clean, outboxPath: outboxPath, canonical: canonical})
 		if code == "A " {
 			staged = append(staged, clean)
 		}
@@ -415,15 +404,6 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 	var batch queueBatch
 	total := 0
 	for _, candidate := range candidates {
-		if candidate.expired {
-			if err := os.Remove(filepath.Join(a.Paths.Queue, filepath.FromSlash(candidate.path))); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return queueBatch{}, err
-			}
-			if err := os.Remove(candidate.outboxPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return queueBatch{}, err
-			}
-			continue
-		}
 		batch.OutboxPaths = append(batch.OutboxPaths, candidate.outboxPath)
 		batch.EventPaths = append(batch.EventPaths, candidate.path)
 		total += len(candidate.canonical)

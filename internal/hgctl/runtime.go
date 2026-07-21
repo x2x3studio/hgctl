@@ -48,7 +48,6 @@ type Paths struct {
 	Outbox        string
 	Quarantine    string
 	Pending       string
-	Surfaces      string
 	Vault         string
 	Bin           string
 	Versions      string
@@ -62,7 +61,6 @@ type Paths struct {
 	UpdateLock    string
 	CodexLock     string
 	CodexCheck    string
-	SurfaceLock   string
 }
 
 func DefaultPaths() (Paths, error) {
@@ -90,7 +88,6 @@ func DefaultPaths() (Paths, error) {
 		Outbox:        filepath.Join(data, "outbox"),
 		Quarantine:    filepath.Join(data, "quarantine"),
 		Pending:       filepath.Join(data, "pending"),
-		Surfaces:      filepath.Join(data, "surfaces"),
 		Vault:         vault,
 		Bin:           filepath.Join(home, ".local", "bin"),
 		Versions:      filepath.Join(home, ".local", "lib", "hgctl", "versions"),
@@ -104,7 +101,6 @@ func DefaultPaths() (Paths, error) {
 		UpdateLock:    filepath.Join(data, "update.lock"),
 		CodexLock:     filepath.Join(data, "codex-trust.lock"),
 		CodexCheck:    filepath.Join(data, "codex-trust-check.json"),
-		SurfaceLock:   filepath.Join(data, "surface.lock"),
 	}, nil
 }
 
@@ -134,6 +130,7 @@ type State struct {
 	RepoURL            string                `json:"repo_url"`
 	QueueBranch        string                `json:"queue_branch"`
 	BasicMemoryProject *BasicMemoryOwnership `json:"basic_memory_project,omitempty"`
+	BasicMemoryMCP     map[string]string     `json:"basic_memory_mcp,omitempty"`
 }
 
 type App struct {
@@ -200,7 +197,7 @@ func probeJSONSchema(path string, dst any, version *int, current int) (bool, err
 }
 
 func (a *App) ensureDataDirs() error {
-	for _, path := range []string{a.Paths.Data, a.Paths.Outbox, a.Paths.Quarantine, a.Paths.Pending, a.Paths.Surfaces} {
+	for _, path := range []string{a.Paths.Data, a.Paths.Outbox, a.Paths.Quarantine, a.Paths.Pending} {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return err
 		}

@@ -36,11 +36,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	case "sync":
 		err = a.runSync(ctx, args[1:])
 	case "context":
-		err = a.runContext(ctx, args[1:])
-	case "recall":
-		err = a.runRecall(ctx, args[1:])
-	case "feedback":
-		err = a.runFeedback(ctx, args[1:])
+		err = a.runContext(args[1:])
 	case "update":
 		err = a.update(ctx, true)
 	case "doctor":
@@ -58,7 +54,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 }
 
 func (a *App) usage() {
-	_, _ = fmt.Fprintln(a.Err, "usage: hgctl <install|hook|observe|import|sync|context|recall|feedback|update|doctor|uninstall|version>")
+	_, _ = fmt.Fprintln(a.Err, "usage: hgctl <install|hook|observe|import|sync|context|update|doctor|uninstall|version>")
 }
 
 func (a *App) runInstall(ctx context.Context, args []string) error {
@@ -94,6 +90,7 @@ func (a *App) install(ctx context.Context, repo, importPath string) error {
 				return fmt.Errorf("refusing to replace configured repository %s with %s", previous.RepoURL, state.RepoURL)
 			}
 			state.BasicMemoryProject = previous.BasicMemoryProject
+			state.BasicMemoryMCP = previous.BasicMemoryMCP
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -111,6 +108,9 @@ func (a *App) install(ctx context.Context, repo, importPath string) error {
 		return err
 	}
 	var installErrs []error
+	if err := a.setupBasicMemoryMCP(ctx); err != nil {
+		installErrs = append(installErrs, err)
+	}
 	if err := a.setupClientHooks(ctx); err != nil {
 		installErrs = append(installErrs, err)
 	}
@@ -195,7 +195,7 @@ func (a *App) runImport(args []string) error {
 	return err
 }
 
-func (a *App) runContext(ctx context.Context, args []string) error {
+func (a *App) runContext(args []string) error {
 	client, rest, err := extractOption(args, "--client", "")
 	if err != nil {
 		return err
@@ -203,13 +203,10 @@ func (a *App) runContext(ctx context.Context, args []string) error {
 	if !validEndpointClient(client) {
 		return errors.New("context requires --client claude|codex")
 	}
-	path := "."
-	if len(rest) == 1 {
-		path = rest[0]
-	} else if len(rest) > 1 {
+	if len(rest) > 1 {
 		return errors.New("context accepts at most one path")
 	}
-	text := a.contextText(ctx, path, client)
+	text := a.contextText(client)
 	_, err = fmt.Fprintln(a.Out, text)
 	return err
 }

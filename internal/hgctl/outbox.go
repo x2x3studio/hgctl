@@ -1,7 +1,6 @@
 package hgctl
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -18,7 +17,7 @@ type deliveryReceipt struct {
 }
 
 func (a *App) enqueue(event Event) error {
-	if _, ok := a.deliveryReceiptPath(event.ID); event.Schema != Protocol || event.Kind == "feedback" || !ok {
+	if _, ok := a.deliveryReceiptPath(event.ID); event.Schema != Protocol || !ok {
 		return errors.New("invalid event envelope")
 	}
 	identity, err := a.loadIdentity()
@@ -36,7 +35,7 @@ func (a *App) enqueue(event Event) error {
 	if len(b) > MaxEventBytes {
 		return fmt.Errorf("event is %d bytes; limit is %d", len(b), MaxEventBytes)
 	}
-	_, canonical, err := decodeCanonicalEvent(b, name, identity.ID, event.CapturedAt.UTC())
+	_, canonical, err := decodeCanonicalEvent(b, name, identity.ID)
 	if err != nil {
 		return fmt.Errorf("validate event before enqueue: %w", err)
 	}
@@ -46,48 +45,8 @@ func (a *App) enqueue(event Event) error {
 	path := filepath.Join(a.Paths.Outbox, name)
 	existing, err := os.ReadFile(path)
 	if err == nil {
-		if existingEvent, _, decodeErr := decodeCanonicalEvent(existing, name, identity.ID, event.CapturedAt.UTC()); decodeErr != nil || existingEvent.Kind == "feedback" {
+		if _, _, decodeErr := decodeCanonicalEvent(existing, name, identity.ID); decodeErr != nil {
 			return fmt.Errorf("outbox collision for %s: existing entry is invalid", name)
-		}
-		return nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return writeFileAtomic(path, canonical, 0o600)
-}
-
-func (a *App) enqueueFeedback(event Event) error {
-	if event.Schema != Protocol || event.Kind != "feedback" {
-		return errors.New("invalid feedback event envelope")
-	}
-	identity, err := a.loadIdentity()
-	if err != nil {
-		return err
-	}
-	name := strings.TrimPrefix(event.ID, "sha256:") + ".json"
-	if err := validateProducerEvent(event, name, identity.ID); err != nil {
-		return fmt.Errorf("validate feedback before enqueue: %w", err)
-	}
-	canonical, err := canonicalEventBytes(event)
-	if err != nil {
-		return err
-	}
-	if len(canonical) > MaxFeedbackEventBytes {
-		return fmt.Errorf("feedback event is %d bytes; limit is %d", len(canonical), MaxFeedbackEventBytes)
-	}
-	if a.eventDelivered(event.ID) {
-		return nil
-	}
-	path := filepath.Join(a.Paths.Outbox, name)
-	existing, err := os.ReadFile(path)
-	if err == nil {
-		existingEvent, existingCanonical, decodeErr := decodeCanonicalEvent(existing, name, identity.ID, event.CapturedAt.UTC())
-		if decodeErr != nil || existingEvent.Kind != "feedback" {
-			return fmt.Errorf("outbox collision for %s: existing entry is not feedback", name)
-		}
-		if !bytes.Equal(existingCanonical, canonical) {
-			return fmt.Errorf("outbox collision for %s: first terminal assessment differs", name)
 		}
 		return nil
 	}
@@ -134,36 +93,4 @@ func (a *App) deliveryReceiptPath(id string) (string, bool) {
 		return "", false
 	}
 	return filepath.Join(a.Paths.Delivered, digest[:2], digest), true
-}
-
-func (a *App) pruneExpiredFeedbackOutbox(now time.Time) error {
-	entries, err := os.ReadDir(a.Paths.Outbox)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	identity, err := a.loadIdentity()
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		path := filepath.Join(a.Paths.Outbox, entry.Name())
-		content, err := readOutboxFile(path)
-		if err != nil {
-			continue
-		}
-		_, _, decodeErr := decodeCanonicalEvent(content, entry.Name(), identity.ID, now)
-		if !errors.Is(decodeErr, errFeedbackExpired) {
-			continue
-		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	return nil
 }

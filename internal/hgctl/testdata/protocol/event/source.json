@@ -3,5 +3,5 @@
   "protocol": "hourglass.event/v1",
   "authority": "protocol/event.md",
   "encoding": "exact UTF-8 JSON bytes with LF",
-  "purpose": "Cross-repository event and reranking conformance"
+  "purpose": "Cross-repository event conformance"
 }

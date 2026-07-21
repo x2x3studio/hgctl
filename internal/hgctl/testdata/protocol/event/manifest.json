@@ -2,9 +2,7 @@
   "schema": "hourglass.conformance-manifest/v1",
   "protocol": "hourglass.event/v1",
   "source_file": "source.json",
-  "source_sha256": "3ef2a7294e5e81860fa90f4732a1865b55b5b6dcd38a1752dae7c76d627f6098",
-  "rerank_file": "rerank.json",
-  "rerank_sha256": "e9dddcb3b12c102afb262bbc05b769b3ec4dc41bca46ab5949ab48072cdfc875",
+  "source_sha256": "829b27b9be2e3d242d0aa4a3b26d23075a901d38e4390e5a66d94e84bf70438a",
   "cases": [
     {
       "name": "canonical observation",
@@ -35,28 +33,6 @@
       "expect": "valid",
       "kind": "import_batch",
       "event_id": "sha256:5f4c3064d1cc7776a11025b32aa014ec2d380ec6b5b62016038493eca5cb945f"
-    },
-    {
-      "name": "canonical card feedback",
-      "file": "positive/card-feedback.json",
-      "sha256": "36e02e061c467335b40e8130ac2680e832f9a1407b23fd7cc5fe5f237f7d4f6d",
-      "machine": "00000000-0000-4000-8000-000000000000",
-      "path": "events/2026/07/e307e21d373fdf7eedbf3260fec6165ca0afa71f189c78eedbbc0d64b7be666c.json",
-      "expect": "valid",
-      "kind": "feedback",
-      "outcome": "used",
-      "event_id": "sha256:e307e21d373fdf7eedbf3260fec6165ca0afa71f189c78eedbbc0d64b7be666c"
-    },
-    {
-      "name": "canonical explicit zero hit",
-      "file": "positive/zero-hit.json",
-      "sha256": "127fa65e52ab23befd4ca2e1990a48249571b9727677a6774ab54decef7c532e",
-      "machine": "00000000-0000-4000-8000-000000000000",
-      "path": "events/2026/07/6551021ce79efa50c656ceb9d2b91cbc818ee62348534234c369619c99f97b58.json",
-      "expect": "valid",
-      "kind": "feedback",
-      "outcome": "zero_hit",
-      "event_id": "sha256:6551021ce79efa50c656ceb9d2b91cbc818ee62348534234c369619c99f97b58"
     },
     {
       "name": "real calendar timestamp required",
@@ -165,24 +141,6 @@
       "path": "events/2026/07/216ed82b4fb25119a592db77f2f14b9392a679e398a1db29a77c4ec42b26dd7b.json",
       "expect": "invalid",
       "reason": "only hourglass.event/v1 is accepted"
-    },
-    {
-      "name": "surface semantic id is recomputed",
-      "file": "negative/surface-id-mismatch.json",
-      "sha256": "edd15e70442134138ac5d382a79fd3bd5c58248df37991173bafc4c32066825a",
-      "machine": "00000000-0000-4000-8000-000000000000",
-      "path": "events/2026/07/e307e21d373fdf7eedbf3260fec6165ca0afa71f189c78eedbbc0d64b7be666c.json",
-      "expect": "invalid",
-      "reason": "surface semantic id mismatch"
-    },
-    {
-      "name": "feedback fields are closed",
-      "file": "negative/unknown-feedback-field.json",
-      "sha256": "db1300ffb3c7e53af59d6ab36eea0778a6f384a6cb37469d0a14a5d1f3fa9fd1",
-      "machine": "00000000-0000-4000-8000-000000000000",
-      "path": "events/2026/07/e307e21d373fdf7eedbf3260fec6165ca0afa71f189c78eedbbc0d64b7be666c.json",
-      "expect": "invalid",
-      "reason": "unknown feedback field"
     }
   ]
 }

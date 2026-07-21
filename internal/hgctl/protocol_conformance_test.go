@@ -12,15 +12,13 @@ import (
 	"time"
 )
 
-const conformanceManifestSHA256 = "756028a26dc7b6db5212571b07833411ba7cb4105e1f39aeeebda4fc82cbe7d0"
+const conformanceManifestSHA256 = "ee80adeac83438302f4d75b0f2160dfb1d9733adaa9d9651edbdf3f81a9e5f5b"
 
 type producerCorpusManifest struct {
 	Schema       string               `json:"schema"`
 	Protocol     string               `json:"protocol"`
 	SourceFile   string               `json:"source_file"`
 	SourceSHA256 string               `json:"source_sha256"`
-	RerankFile   string               `json:"rerank_file"`
-	RerankSHA256 string               `json:"rerank_sha256"`
 	Cases        []producerCorpusCase `json:"cases"`
 }
 
@@ -67,11 +65,6 @@ func TestProducerConformsToPinnedHourglassEventCorpus(t *testing.T) {
 		source.Authority != "protocol/event.md" || source.Encoding == "" || source.Purpose == "" {
 		t.Fatalf("invalid conformance source metadata: %#v", source)
 	}
-	rerankContent := readProducerFixture(t, root, manifest.RerankFile)
-	if producerFixtureDigest(rerankContent) != manifest.RerankSHA256 {
-		t.Fatal("rerank corpus does not match its pinned digest")
-	}
-
 	listed := make(map[string]struct{}, len(manifest.Cases))
 	for _, test := range manifest.Cases {
 		test := test
@@ -90,21 +83,15 @@ func TestProducerConformsToPinnedHourglassEventCorpus(t *testing.T) {
 			}
 
 			filename := path.Base(test.Path)
-			event, canonical, err := decodeCanonicalEvent(content, filename, test.Machine, time.Date(2026, 7, 21, 1, 0, 0, 0, time.UTC))
+			event, canonical, err := decodeCanonicalEvent(content, filename, test.Machine)
 			accepted := err == nil && bytes.Equal(canonical, content) && producerQueuePath(event) == test.Path
 			switch test.Expect {
 			case "valid":
 				if !accepted {
-					t.Fatalf("valid consumer fixture is not producer-compatible: %v", err)
+					t.Fatalf("valid producer fixture is not endpoint-compatible: %v", err)
 				}
 				if event.ID != test.EventID || event.Kind != test.Kind {
 					t.Fatalf("decoded event=%s/%s, want %s/%s", event.ID, event.Kind, test.EventID, test.Kind)
-				}
-				if test.Outcome != "" {
-					payload, payloadErr := feedbackPayload(event)
-					if payloadErr != nil || payload.Outcome != test.Outcome {
-						t.Fatalf("decoded feedback outcome=%q, want %q: %v", payload.Outcome, test.Outcome, payloadErr)
-					}
 				}
 			case "invalid":
 				if accepted {
@@ -115,7 +102,7 @@ func TestProducerConformsToPinnedHourglassEventCorpus(t *testing.T) {
 			}
 		})
 	}
-	verifyProducerCorpusInventory(t, root, manifest.RerankFile, listed)
+	verifyProducerCorpusInventory(t, root, listed)
 }
 
 func TestEnqueueRejectsInvalidProducerEventsBeforeOutboxWrite(t *testing.T) {
@@ -210,7 +197,7 @@ func producerQueuePath(event Event) string {
 	return path.Join("events", event.CapturedAt.UTC().Format("2006"), event.CapturedAt.UTC().Format("01"), strings.TrimPrefix(event.ID, "sha256:")+".json")
 }
 
-func verifyProducerCorpusInventory(t *testing.T, root, rerankFile string, listed map[string]struct{}) {
+func verifyProducerCorpusInventory(t *testing.T, root string, listed map[string]struct{}) {
 	t.Helper()
 	expected := make(map[string]struct{}, len(listed)+3)
 	for name := range listed {
@@ -218,7 +205,6 @@ func verifyProducerCorpusInventory(t *testing.T, root, rerankFile string, listed
 	}
 	expected["manifest.json"] = struct{}{}
 	expected["source.json"] = struct{}{}
-	expected[rerankFile] = struct{}{}
 	seen := make(map[string]struct{}, len(expected))
 	err := filepath.WalkDir(root, func(name string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {

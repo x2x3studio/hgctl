@@ -19,8 +19,7 @@ func testApp(t *testing.T) *App {
 		Home: home, Data: data,
 		Control: filepath.Join(data, "repo"), Queue: filepath.Join(data, "queue"),
 		Outbox: filepath.Join(data, "outbox"), Quarantine: filepath.Join(data, "quarantine"), Pending: filepath.Join(data, "pending"),
-		Surfaces: filepath.Join(data, "surfaces"),
-		Vault:    filepath.Join(home, "hourglass-vault"), Bin: filepath.Join(home, ".local", "bin"),
+		Vault: filepath.Join(home, "hourglass-vault"), Bin: filepath.Join(home, ".local", "bin"),
 		Versions: filepath.Join(home, ".local", "lib", "hgctl", "versions"),
 		Identity: filepath.Join(data, "identity.json"), State: filepath.Join(data, "state.json"),
 		Delivered:     filepath.Join(data, "delivered"),
@@ -29,7 +28,6 @@ func testApp(t *testing.T) *App {
 		LifecycleLock: filepath.Join(data, "lifecycle.lock"),
 		SyncLock:      filepath.Join(data, "sync.lock"), UpdateLock: filepath.Join(data, "update.lock"),
 		CodexLock: filepath.Join(data, "codex-trust.lock"), CodexCheck: filepath.Join(data, "codex-trust-check.json"),
-		SurfaceLock: filepath.Join(data, "surface.lock"),
 	}
 	return &App{
 		Paths: paths, In: strings.NewReader(""), Out: &bytes.Buffer{}, Err: &bytes.Buffer{},
