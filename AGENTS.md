@@ -3,6 +3,11 @@
 `hgctl` must remain a small transport binary. It serves agents; it is not a
 memory server, search engine, or local Dream implementation.
 
+The Hourglass Project consists of exactly two repositories: this endpoint
+binary and the companion `x2x3studio/hourglass` control-plane repository.
+Changes must preserve that ownership boundary rather than treating either
+repository as the whole Project.
+
 ## Repository language
 
 Keep all source code, comments, tests, documentation, workflows, filenames,
@@ -29,6 +34,11 @@ Chinese literals to this repository.
 - Basic Memory is an external recall dependency. Do not recreate its index,
   embeddings, or MCP server. Reindex its disposable cache only after `shared`
   actually advances.
+- Recall trusts only Basic Memory's entity paths, then resolves content and
+  blobs from one exact indexed `shared` commit. Never surface cached snippets.
+- Store bounded seven-day recall receipts without queries or prose. Feedback
+  is receipt-bound, first-writer-wins, and may reorder a result by at most two
+  positions through exact card-version aggregates.
 - Wake Dream with a best-effort repository dispatch after a queue push; the
   scheduled workflow is the recovery path, not a second publisher.
 - Maintain Codex hook trust only through the official app-server. A failed
@@ -49,11 +59,12 @@ purge command says otherwise.
 
 ## Protocol
 
-The companion Hourglass repository owns the branch and event contract in
-`protocol/v1.md`. V1 is closed: only `turn`, `observation`, and `import_batch`
-are valid, and neither envelope nor payload extensions are accepted. Changing
-fields, IDs, branch ownership, or cursor semantics requires a new protocol
-version.
+The companion Hourglass repository owns the branch and event contracts in
+`protocol/v1.md` and `protocol/v2.md`. V1 is closed to `turn`, `observation`,
+and `import_batch`; v2 is closed to receipt-bound `feedback`. Neither envelope
+nor payload extensions are accepted. Queue commits are schema-homogeneous and
+pending v1 evidence has priority over v2 feedback. Changing fields, IDs, branch
+ownership, or cursor semantics requires a new protocol version.
 
 ## Verification
 
@@ -65,6 +76,9 @@ Every behavior change needs focused tests. At minimum cover:
 - prompt/response pairing and retry;
 - machine identity persistence across hostname changes;
 - Git queue idempotence and failed-push recovery;
+- exact shared commit/tree/blob recall and Basic Memory JSON validation;
+- feedback identity, receipt expiry, first-writer-wins, and bounded reranking;
+- schema-homogeneous v1/v2 queue batching and interrupted recovery;
 - hook config merge/uninstall without damaging unrelated entries;
 - Codex hook discovery and trust through the official app-server only;
 - scheduler label/path stability;

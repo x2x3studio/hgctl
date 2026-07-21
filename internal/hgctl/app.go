@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 )
 
 func (a *App) Run(ctx context.Context, args []string) int {
@@ -40,6 +39,8 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		err = a.runContext(ctx, args[1:])
 	case "recall":
 		err = a.runRecall(ctx, args[1:])
+	case "feedback":
+		err = a.runFeedback(ctx, args[1:])
 	case "update":
 		err = a.update(ctx, true)
 	case "doctor":
@@ -57,7 +58,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 }
 
 func (a *App) usage() {
-	_, _ = fmt.Fprintln(a.Err, "usage: hgctl <install|hook|observe|import|sync|context|recall|update|doctor|uninstall|version>")
+	_, _ = fmt.Fprintln(a.Err, "usage: hgctl <install|hook|observe|import|sync|context|recall|feedback|update|doctor|uninstall|version>")
 }
 
 func (a *App) runInstall(ctx context.Context, args []string) error {
@@ -153,9 +154,12 @@ func (a *App) runSync(ctx context.Context, args []string) error {
 func (a *App) runObserve(args []string) error {
 	fs := flag.NewFlagSet("observe", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
-	client := fs.String("client", "unknown", "capturing client")
+	client := fs.String("client", "", "capturing client")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if fs.NArg() != 0 || !validEndpointClient(*client) {
+		return errors.New("observe requires --client claude|codex")
 	}
 	b, err := io.ReadAll(io.LimitReader(a.In, MaxTextBytes+1))
 	if err != nil {
@@ -192,9 +196,12 @@ func (a *App) runImport(args []string) error {
 }
 
 func (a *App) runContext(ctx context.Context, args []string) error {
-	client, rest, err := extractOption(args, "--client", "unknown")
+	client, rest, err := extractOption(args, "--client", "")
 	if err != nil {
 		return err
+	}
+	if !validEndpointClient(client) {
+		return errors.New("context requires --client claude|codex")
 	}
 	path := "."
 	if len(rest) == 1 {
@@ -207,35 +214,15 @@ func (a *App) runContext(ctx context.Context, args []string) error {
 	return err
 }
 
-func (a *App) runRecall(ctx context.Context, args []string) error {
-	if len(args) == 0 {
-		return errors.New("recall requires a query")
-	}
-	query := strings.Join(args, " ")
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	if err := a.syncShared(ctx); err != nil {
-		return fmt.Errorf("refresh shared memory: %w", err)
-	}
-	if err := a.reindexBasicMemory(ctx); err != nil {
-		return fmt.Errorf("refresh recall index: %w", err)
-	}
-	if _, err := a.requireBasicMemoryIndexReady(ctx); err != nil {
-		return fmt.Errorf("recall is not ready: %w", err)
-	}
-	out, err := runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "tool", "search-notes", query, "--project", ProjectName, "--local", "--page-size", "8")
-	if err != nil {
-		return err
-	}
-	_, err = io.WriteString(a.Out, out)
-	return err
-}
-
 func envOr(name, fallback string) string {
 	if value := os.Getenv(name); value != "" {
 		return value
 	}
 	return fallback
+}
+
+func validEndpointClient(client string) bool {
+	return client == "claude" || client == "codex"
 }
 
 func extractOption(args []string, name, fallback string) (string, []string, error) {

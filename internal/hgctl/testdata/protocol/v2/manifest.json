@@ -1,0 +1,57 @@
+{
+  "schema": "hourglass.conformance-manifest/v1",
+  "protocol": "hourglass.event/v2",
+  "source_file": "source.json",
+  "source_sha256": "eea1a96eae33227d6661a2b334ac7a0ae272d4ff2b1519b71868a42ba360457b",
+  "rerank_file": "rerank.json",
+  "rerank_sha256": "e9dddcb3b12c102afb262bbc05b769b3ec4dc41bca46ab5949ab48072cdfc875",
+  "cases": [
+    {
+      "name": "canonical card feedback",
+      "file": "positive/card-feedback.json",
+      "sha256": "30a0f12f6710783687603a2731d37e58dcb7c489668b03ad7dc4ab4f979dc747",
+      "machine": "00000000-0000-4000-8000-000000000000",
+      "path": "events/2026/07/e307e21d373fdf7eedbf3260fec6165ca0afa71f189c78eedbbc0d64b7be666c.json",
+      "expect": "valid",
+      "outcome": "used",
+      "event_id": "sha256:e307e21d373fdf7eedbf3260fec6165ca0afa71f189c78eedbbc0d64b7be666c"
+    },
+    {
+      "name": "canonical explicit zero hit",
+      "file": "positive/zero-hit.json",
+      "sha256": "fe6ef92250024c8ece8a76eec98ea4042ab67c5c2c9219ff8e2e414e51f3b8e4",
+      "machine": "00000000-0000-4000-8000-000000000000",
+      "path": "events/2026/07/6551021ce79efa50c656ceb9d2b91cbc818ee62348534234c369619c99f97b58.json",
+      "expect": "valid",
+      "outcome": "zero_hit",
+      "event_id": "sha256:6551021ce79efa50c656ceb9d2b91cbc818ee62348534234c369619c99f97b58"
+    },
+    {
+      "name": "surface semantic id is recomputed",
+      "file": "negative/surface-id-mismatch.json",
+      "sha256": "bc963ae15b7b87077df6f03746ba729edcd768b62b2ab1d1bc22be7dcedd1007",
+      "machine": "00000000-0000-4000-8000-000000000000",
+      "path": "events/2026/07/e307e21d373fdf7eedbf3260fec6165ca0afa71f189c78eedbbc0d64b7be666c.json",
+      "expect": "invalid",
+      "reason": "surface semantic id mismatch"
+    },
+    {
+      "name": "feedback fields are closed",
+      "file": "negative/unknown-feedback-field.json",
+      "sha256": "89b161843a9971f87f812d5873552faf2e536445c15fe96623d6d3552f6afb5e",
+      "machine": "00000000-0000-4000-8000-000000000000",
+      "path": "events/2026/07/e307e21d373fdf7eedbf3260fec6165ca0afa71f189c78eedbbc0d64b7be666c.json",
+      "expect": "invalid",
+      "reason": "unknown feedback field"
+    },
+    {
+      "name": "future protocol is deferred",
+      "file": "deferred/future-schema.json",
+      "sha256": "d763ef8416037ed9d0739143d234d5b0d1402dfb1ff9655bf1eb50585089fec9",
+      "machine": "00000000-0000-4000-8000-000000000000",
+      "path": "events/2026/07/e307e21d373fdf7eedbf3260fec6165ca0afa71f189c78eedbbc0d64b7be666c.json",
+      "expect": "defer",
+      "reason": "future schema must not receive a rejection receipt"
+    }
+  ]
+}

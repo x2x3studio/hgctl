@@ -1,0 +1,10 @@
+{
+  "schema": "hourglass.conformance-source/v1",
+  "protocol": "hourglass.event/v2",
+  "authority": "x2x3studio/hourglass:protocol/v2.md",
+  "origin_repository": "https://github.com/x2x3studio/hourglass",
+  "corpus_role": "cross-repository compatibility vectors",
+  "captured_on": "2026-07-21",
+  "encoding": "Go encoding/json canonical bytes followed by one LF",
+  "purpose": "Freeze receipt-bound feedback bytes and deterministic reranking across Hourglass and hgctl"
+}

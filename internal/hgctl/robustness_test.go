@@ -145,7 +145,7 @@ func TestRecallRequiresLiveProjectAndCurrentIndex(t *testing.T) {
 	script := `#!/bin/sh
 case "$1 $2" in
   "tool list-projects") cat "$HGCTL_TEST_PROJECTS"; exit 0 ;;
-  "tool search-notes") printf x >> "$HGCTL_TEST_SEARCH_LOG"; printf 'remembered result\n'; exit 0 ;;
+  "tool search-notes") printf x >> "$HGCTL_TEST_SEARCH_LOG"; printf '{"results":[],"current_page":1,"page_size":8,"total":0,"has_more":false}\n'; exit 0 ;;
   "reindex --search") exit 0 ;;
 esac
 exit 20
@@ -170,14 +170,14 @@ exit 20
 	}
 
 	app.Out.(*bytes.Buffer).Reset()
-	if err := app.runRecall(testContext(t), []string{"queue", "ownership"}); err != nil {
+	if err := app.runRecall(testContext(t), []string{"queue", "ownership", "--client", "codex"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(app.Out.(*bytes.Buffer).String(), "remembered result") || readSearchLog(t, searchLog) != "x" {
+	if !strings.Contains(app.Out.(*bytes.Buffer).String(), "No verified Hourglass memory matched") || readSearchLog(t, searchLog) != "x" {
 		t.Fatalf("ready recall did not query the exact project: output=%q log=%q", app.Out.(*bytes.Buffer).String(), readSearchLog(t, searchLog))
 	}
 	contextText := app.contextText(testContext(t), filepath.Join(app.Paths.Home, "project"), "codex")
-	if !strings.Contains(contextText, "remembered result") || readSearchLog(t, searchLog) != "xx" {
+	if strings.Contains(contextText, "Possible prior context") || readSearchLog(t, searchLog) != "xx" {
 		t.Fatalf("ready context did not query the exact project: context=%q log=%q", contextText, readSearchLog(t, searchLog))
 	}
 
@@ -185,11 +185,11 @@ exit 20
 		t.Fatal(err)
 	}
 	app.Out.(*bytes.Buffer).Reset()
-	if err := app.runRecall(testContext(t), []string{"stale"}); err != nil {
+	if err := app.runRecall(testContext(t), []string{"stale", "--client", "codex"}); err != nil {
 		t.Fatalf("explicit recall did not repair a stale index: %v", err)
 	}
 	contextText = app.contextText(testContext(t), filepath.Join(app.Paths.Home, "project"), "codex")
-	if !strings.Contains(contextText, "remembered result") || readSearchLog(t, searchLog) != "xxxx" {
+	if strings.Contains(contextText, "Possible prior context") || readSearchLog(t, searchLog) != "xxxx" {
 		t.Fatalf("repaired context did not query Basic Memory: context=%q log=%q", contextText, readSearchLog(t, searchLog))
 	}
 
@@ -212,7 +212,7 @@ exit 20
 		t.Run(test.name, func(t *testing.T) {
 			writeProjects(test.projects)
 			app.Out.(*bytes.Buffer).Reset()
-			if err := app.runRecall(testContext(t), []string{"identity"}); err == nil {
+			if err := app.runRecall(testContext(t), []string{"identity", "--client", "codex"}); err == nil {
 				t.Fatal("recall accepted a mismatched Basic Memory project")
 			}
 			if got := readSearchLog(t, searchLog); got != "xxxx" {

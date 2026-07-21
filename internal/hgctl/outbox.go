@@ -1,6 +1,7 @@
 package hgctl
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -56,6 +57,46 @@ func (a *App) enqueue(event Event) error {
 	return writeFileAtomic(path, canonical, 0o600)
 }
 
+func (a *App) enqueueFeedback(event FeedbackEvent) error {
+	if event.Schema != FeedbackProtocol {
+		return errors.New("invalid feedback event envelope")
+	}
+	identity, err := a.loadIdentity()
+	if err != nil {
+		return err
+	}
+	name := strings.TrimPrefix(event.ID, "sha256:") + ".json"
+	if err := validateFeedbackEvent(event, name, identity.ID, event.CapturedAt); err != nil {
+		return fmt.Errorf("validate feedback before enqueue: %w", err)
+	}
+	canonical, err := canonicalFeedbackEventBytes(event)
+	if err != nil {
+		return err
+	}
+	if len(canonical) > MaxFeedbackEventBytes {
+		return fmt.Errorf("feedback event is %d bytes; limit is %d", len(canonical), MaxFeedbackEventBytes)
+	}
+	if a.eventDelivered(event.ID) {
+		return nil
+	}
+	path := filepath.Join(a.Paths.Outbox, name)
+	existing, err := os.ReadFile(path)
+	if err == nil {
+		_, existingCanonical, decodeErr := decodeCanonicalFeedbackEvent(existing, name, identity.ID, event.CapturedAt)
+		if decodeErr != nil {
+			return fmt.Errorf("outbox collision for %s: existing entry is not feedback/v2", name)
+		}
+		if !bytes.Equal(existingCanonical, canonical) {
+			return fmt.Errorf("outbox collision for %s: first terminal assessment differs", name)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writeFileAtomic(path, canonical, 0o600)
+}
+
 func (a *App) eventDelivered(id string) bool {
 	if receiptPath, ok := a.deliveryReceiptPath(id); ok {
 		var receipt deliveryReceipt
@@ -93,4 +134,36 @@ func (a *App) deliveryReceiptPath(id string) (string, bool) {
 		return "", false
 	}
 	return filepath.Join(a.Paths.Delivered, digest[:2], digest), true
+}
+
+func (a *App) pruneExpiredFeedbackOutbox(now time.Time) error {
+	entries, err := os.ReadDir(a.Paths.Outbox)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	identity, err := a.loadIdentity()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(a.Paths.Outbox, entry.Name())
+		content, err := readOutboxFile(path)
+		if err != nil {
+			continue
+		}
+		_, decodeErr := decodeCanonicalQueuedEvent(content, entry.Name(), identity.ID, now)
+		if !errors.Is(decodeErr, errFeedbackExpired) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }

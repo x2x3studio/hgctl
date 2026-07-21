@@ -6,6 +6,8 @@ local server or semantic daemon.
 
 Hourglass itself lives in a separate repository. `hgctl` owns transport and
 endpoint integration; GitHub Actions owns Dream; Basic Memory owns local recall.
+Together, `x2x3studio/hgctl` and `x2x3studio/hourglass` are the two repositories
+of the Hourglass Project.
 
 ## MVP responsibilities
 
@@ -15,7 +17,7 @@ endpoint integration; GitHub Actions owns Dream; Basic Memory owns local recall.
   `shared`;
 - install fail-open Claude Code and Codex lifecycle hooks;
 - register `~/hourglass-vault` as the Basic Memory project `hourglass` and
-  expose recall through the read-only `hgctl recall` command;
+  expose exact-revision recall and receipt-bound feedback through `hgctl`;
 - capture bounded turns and explicit observations in an atomic local outbox;
 - commit and push only `queue/<machine-id>` and fast-forward only `shared`;
 - request the trusted default-branch bootstrap workflow when a fresh repository
@@ -37,6 +39,7 @@ historical transcript stores, or write canonical memory.
   state.json
   outbox/
   delivered/            # one local receipt per pushed event
+  surfaces/              # bounded seven-day recall receipts; no queries
   repo/                 # hidden main/control checkout
   queue/                # hidden queue/<machine-id> worktree
 
@@ -63,7 +66,9 @@ hgctl observe --client <claude|codex>
 hgctl import <path> [--source <name>]
 hgctl sync [--update]
 hgctl context <repo-path> --client <claude|codex>
-hgctl recall <query>
+hgctl recall <query> --client <claude|codex>
+hgctl feedback <surface-id> --client <claude|codex> \
+  --outcome <used|irrelevant|stale|contradicted> --result <rank>
 hgctl update
 hgctl doctor
 hgctl uninstall
@@ -183,14 +188,31 @@ command instead of pretending background sync will survive logout.
 
 ## Recall
 
-`recall` delegates to `basic-memory tool search-notes` against the local
-`hourglass` project. The MVP deliberately does not register Basic Memory's full
-MCP server because that surface also exposes write, edit, and delete tools;
-those would violate Dream's single-writer boundary. The MVP explicitly disables
-semantic indexing and uses Basic Memory's SQLite FTS cache only; that cache is
-disposable local implementation detail and never enters Git.
-After `shared` advances, the background sync runs Basic Memory's incremental
-reindex before the next recall; Session hooks never wait for a full scan.
+`recall` invokes `basic-memory tool search-notes` in local, entity-only FTS mode
+using the persisted external project ID. Basic Memory supplies only ordered
+candidate paths. `hgctl` rejects unprovable candidates, resolves every displayed
+blob and note body from one exact indexed `shared` commit, skips only `Home.md`
+and `Hourglass.canvas`, and stores a bounded seven-day surface receipt. It never
+stores the query, scores, snippets, or rendered response.
+
+An explicit verified empty lookup automatically queues `zero_hit`; an empty
+SessionStart lookup does not. Agents can attach one terminal outcome to a
+surfaced rank. The event ID deliberately excludes outcome and rank, so the first
+assessment wins and identical retries replay the same bytes. Feedback queue
+commits are v2-only, pending v1 evidence is delivered first, and expired local
+feedback is pruned before sync.
+
+Published feedback aggregates bind an exact memory path and Git blob. A closed,
+canonical shard may conservatively reorder Basic Memory results by adjacent
+swaps, with no card moving more than two positions. A missing shard means no
+signal; any malformed required shard disables all feedback reranking for that
+lookup without hiding the verified results.
+
+The MVP deliberately does not register Basic Memory's full MCP server because
+that surface also exposes write, edit, and delete tools; those would violate
+Dream's single-writer boundary. Semantic indexing stays disabled and Basic
+Memory's SQLite FTS cache remains disposable local state outside Git. After
+`shared` advances, background sync runs an incremental reindex before recall.
 
 ## Updates
 
