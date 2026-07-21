@@ -344,9 +344,6 @@ func validateSemanticChanges(control ControlManifest, baseline baselineState, ch
 	for name := range changed {
 		resultingSemanticPaths[name] = struct{}{}
 	}
-	memoryChanged := false
-	homeChanged := false
-	canvasChanged := false
 	for name, content := range changed {
 		switch {
 		case product.IsMemoryPath(name):
@@ -367,9 +364,7 @@ func validateSemanticChanges(control ControlManifest, baseline baselineState, ch
 			if !citesCurrent {
 				return fmt.Errorf("changed note %s does not cite this Dream batch", name)
 			}
-			memoryChanged = true
 		case name == "Hourglass.canvas":
-			canvasChanged = true
 			if err := product.ValidateCanvasReferences(content, func(name string) bool {
 				_, exists := resultingSemanticPaths[name]
 				return exists
@@ -377,13 +372,10 @@ func validateSemanticChanges(control ControlManifest, baseline baselineState, ch
 				return fmt.Errorf("changed Hourglass.canvas: %w", err)
 			}
 		case name == "Home.md":
-			homeChanged = true
+			// Home is the current agent entry point and may track operational changes.
 		default:
 			return fmt.Errorf("changed semantic path is forbidden: %s", name)
 		}
-	}
-	if homeChanged && !memoryChanged && !canvasChanged {
-		return errors.New("Home.md changed without a sourced memory or topology change")
 	}
 	return nil
 }
