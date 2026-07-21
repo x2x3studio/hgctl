@@ -345,7 +345,7 @@ func validateSemanticChanges(control ControlManifest, baseline baselineState, ch
 		resultingSemanticPaths[name] = struct{}{}
 	}
 	memoryChanged := false
-	navigationChanged := false
+	homeChanged := false
 	for name, content := range changed {
 		switch {
 		case product.IsMemoryPath(name):
@@ -374,15 +374,14 @@ func validateSemanticChanges(control ControlManifest, baseline baselineState, ch
 			}); err != nil {
 				return fmt.Errorf("changed Hourglass.canvas: %w", err)
 			}
-			navigationChanged = true
 		case name == "Home.md":
-			navigationChanged = true
+			homeChanged = true
 		default:
 			return fmt.Errorf("changed semantic path is forbidden: %s", name)
 		}
 	}
-	if navigationChanged && !memoryChanged {
-		return errors.New("navigation changed without a sourced memory change")
+	if homeChanged && !memoryChanged {
+		return errors.New("Home.md changed without a sourced memory change")
 	}
 	return nil
 }
