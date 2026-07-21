@@ -17,7 +17,7 @@ func TestSurfaceAssessmentIsFirstWriterWinsAndRetryStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	surface := testSurfaceV2(t, identity, app.Now().UTC(), "memory/project/card.md")
+	surface := testSurface(t, identity, app.Now().UTC(), "memory/project/card.md")
 	if err := app.saveSurface(testContext(t), surface); err != nil {
 		t.Fatal(err)
 	}
@@ -45,8 +45,9 @@ func TestSurfaceAssessmentIsFirstWriterWinsAndRetryStable(t *testing.T) {
 	if final, err := os.ReadFile(filepath.Join(app.Paths.Outbox, name)); err != nil || !bytes.Equal(before, final) {
 		t.Fatal("conflicting assessment changed first-writer bytes")
 	}
-	decoded, _, err := decodeCanonicalFeedbackEvent(before, name, identity.ID, app.Now().UTC())
-	if err != nil || decoded.Payload.Outcome != "used" || decoded.Payload.Result == nil || *decoded.Payload.Result != 1 {
+	decoded, _, err := decodeCanonicalEvent(before, name, identity.ID, app.Now().UTC())
+	payload, payloadErr := feedbackPayload(decoded)
+	if err != nil || payloadErr != nil || payload.Outcome != "used" || payload.Result == nil || *payload.Result != 1 {
 		t.Fatalf("queued feedback changed: event=%#v err=%v", decoded, err)
 	}
 }
@@ -58,7 +59,7 @@ func TestFeedbackRequiresMatchingClientRankAndLiveReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	issuedAt := app.Now().UTC()
-	surface := testSurfaceV2(t, identity, issuedAt, "memory/project/card.md")
+	surface := testSurface(t, identity, issuedAt, "memory/project/card.md")
 	if err := app.saveSurface(testContext(t), surface); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +84,7 @@ func TestExpiredFeedbackIsPrunedBeforeQueueSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	issuedAt := app.Now().UTC().Add(-SurfaceLifetime)
-	surface := testSurfaceV2(t, identity, issuedAt, "memory/project/card.md")
+	surface := testSurface(t, identity, issuedAt, "memory/project/card.md")
 	rank := 1
 	event, err := newFeedbackEvent(identity, surface, "used", &rank, issuedAt.Add(time.Minute))
 	if err != nil {
@@ -140,7 +141,7 @@ func TestCorruptTransientSurfaceReceiptDoesNotBlockFutureRecall(t *testing.T) {
 	if err := os.WriteFile(corruptPath, []byte("partial"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	surface := testSurfaceV2(t, identity, app.Now().UTC(), "memory/project/new-card.md")
+	surface := testSurface(t, identity, app.Now().UTC(), "memory/project/new-card.md")
 	if err := app.saveSurface(testContext(t), surface); err != nil {
 		t.Fatalf("corrupt transient receipt blocked a new surface: %v", err)
 	}
@@ -158,7 +159,7 @@ func TestTerminalReceiptReconstructsMissingOutboxAfterCrash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	surface := testSurfaceV2(t, identity, app.Now().UTC(), "memory/project/card.md")
+	surface := testSurface(t, identity, app.Now().UTC(), "memory/project/card.md")
 	if err := app.saveSurface(testContext(t), surface); err != nil {
 		t.Fatal(err)
 	}
@@ -191,13 +192,13 @@ func TestConcurrentConflictingAssessmentsHaveOneWinner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	surface := testSurfaceV2(t, identity, app.Now().UTC(), "memory/project/card.md")
+	surface := testSurface(t, identity, app.Now().UTC(), "memory/project/card.md")
 	if err := app.saveSurface(testContext(t), surface); err != nil {
 		t.Fatal(err)
 	}
 	type result struct {
 		outcome string
-		event   FeedbackEvent
+		event   Event
 		err     error
 	}
 	start := make(chan struct{})
@@ -230,7 +231,11 @@ func TestConcurrentConflictingAssessmentsHaveOneWinner(t *testing.T) {
 		t.Fatalf("concurrent assessments produced %d winners", winners)
 	}
 	receipt, _, err := app.loadSurfaceReceipt(surface.ID)
-	if err != nil || receipt.Terminal == nil || receipt.Terminal.Payload.Outcome != winningOutcome {
+	var terminalPayload FeedbackPayload
+	if receipt.Terminal != nil {
+		terminalPayload, _ = feedbackPayload(*receipt.Terminal)
+	}
+	if err != nil || receipt.Terminal == nil || terminalPayload.Outcome != winningOutcome {
 		t.Fatalf("terminal receipt does not match winner: receipt=%#v err=%v", receipt, err)
 	}
 	name := strings.TrimPrefix(receipt.Terminal.ID, "sha256:") + ".json"
@@ -238,19 +243,20 @@ func TestConcurrentConflictingAssessmentsHaveOneWinner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	event, _, err := decodeCanonicalFeedbackEvent(content, name, identity.ID, app.Now().UTC())
-	if err != nil || event.Payload.Outcome != winningOutcome {
+	event, _, err := decodeCanonicalEvent(content, name, identity.ID, app.Now().UTC())
+	payload, payloadErr := feedbackPayload(event)
+	if err != nil || payloadErr != nil || payload.Outcome != winningOutcome {
 		t.Fatalf("outbox does not match concurrent winner: event=%#v err=%v", event, err)
 	}
 }
 
-func TestPreexistingConflictingV2OutboxIsNeverOverwritten(t *testing.T) {
+func TestPreexistingConflictingFeedbackOutboxIsNeverOverwritten(t *testing.T) {
 	app := testApp(t)
 	identity, err := app.loadIdentity()
 	if err != nil {
 		t.Fatal(err)
 	}
-	surface := testSurfaceV2(t, identity, app.Now().UTC(), "memory/project/card.md")
+	surface := testSurface(t, identity, app.Now().UTC(), "memory/project/card.md")
 	rank := 1
 	first, err := newFeedbackEvent(identity, surface, "used", &rank, app.Now().UTC())
 	if err != nil {
@@ -280,7 +286,7 @@ func TestPreexistingConflictingV2OutboxIsNeverOverwritten(t *testing.T) {
 
 func TestAssessmentAdoptsPreexistingOutboxWinnerThroughSyncAndRetry(t *testing.T) {
 	fixture := newGitFixture(t)
-	surface := testSurfaceV2(t, fixture.id, fixture.app.Now().UTC(), "memory/project/card.md")
+	surface := testSurface(t, fixture.id, fixture.app.Now().UTC(), "memory/project/card.md")
 	if err := fixture.app.saveSurface(testContext(t), surface); err != nil {
 		t.Fatal(err)
 	}
@@ -296,13 +302,19 @@ func TestAssessmentAdoptsPreexistingOutboxWinnerThroughSyncAndRetry(t *testing.T
 		t.Fatalf("assessment did not adopt the pre-existing outbox winner: %v", err)
 	}
 	receipt, _, err := fixture.app.loadSurfaceReceipt(surface.ID)
-	if err != nil || receipt.Terminal == nil || receipt.Terminal.Payload.Outcome != "used" {
+	var terminalPayload FeedbackPayload
+	if receipt.Terminal != nil {
+		terminalPayload, _ = feedbackPayload(*receipt.Terminal)
+	}
+	if err != nil || receipt.Terminal == nil || terminalPayload.Outcome != "used" {
 		t.Fatalf("receipt did not align to the pre-existing winner: receipt=%#v err=%v", receipt, err)
 	}
 	if err := fixture.app.sync(testContext(t)); err != nil {
 		t.Fatal(err)
 	}
-	if retry, err := fixture.app.assessSurface(testContext(t), surface.ID, "codex", "used", &rank); err != nil || retry.Payload.Outcome != "used" {
+	retry, err := fixture.app.assessSurface(testContext(t), surface.ID, "codex", "used", &rank)
+	retryPayload, payloadErr := feedbackPayload(retry)
+	if err != nil || payloadErr != nil || retryPayload.Outcome != "used" {
 		t.Fatalf("winning assessment did not retry after delivery: event=%#v err=%v", retry, err)
 	}
 	if _, err := fixture.app.assessSurface(testContext(t), surface.ID, "codex", "irrelevant", &rank); err == nil {
@@ -310,8 +322,9 @@ func TestAssessmentAdoptsPreexistingOutboxWinnerThroughSyncAndRetry(t *testing.T
 	}
 	path := queueEventPath(winner.CapturedAt, winner.ID)
 	remoteContent := runGitTest(t, "", "--git-dir", fixture.remote, "show", "refs/heads/"+fixture.state.QueueBranch+":"+path)
-	remote, _, err := decodeCanonicalFeedbackEvent([]byte(remoteContent), filepath.Base(path), fixture.id.ID, fixture.app.Now().UTC())
-	if err != nil || remote.Payload.Outcome != "used" {
+	remote, _, err := decodeCanonicalEvent([]byte(remoteContent), filepath.Base(path), fixture.id.ID, fixture.app.Now().UTC())
+	remotePayload, payloadErr := feedbackPayload(remote)
+	if err != nil || payloadErr != nil || remotePayload.Outcome != "used" {
 		t.Fatalf("remote queue did not publish the adopted winner: event=%#v err=%v", remote, err)
 	}
 }
@@ -322,7 +335,7 @@ func TestDeliveredWithoutTerminalBytesFailsSafely(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	surface := testSurfaceV2(t, identity, app.Now().UTC(), "memory/project/card.md")
+	surface := testSurface(t, identity, app.Now().UTC(), "memory/project/card.md")
 	if err := app.saveSurface(testContext(t), surface); err != nil {
 		t.Fatal(err)
 	}

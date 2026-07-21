@@ -92,6 +92,57 @@ type ImportPayload struct {
 	Items  []ImportItem `json:"items"`
 }
 
+func (event *Event) UnmarshalJSON(content []byte) error {
+	var wire wireEvent
+	if err := decodeClosedJSON(content, &wire); err != nil {
+		return err
+	}
+	payload, err := decodeEventPayload(wire.Kind, wire.Payload)
+	if err != nil {
+		return err
+	}
+	*event = Event{
+		Schema: wire.Schema, ID: wire.ID, Kind: wire.Kind, CapturedAt: wire.CapturedAt,
+		Machine: wire.Machine, Client: wire.Client, SessionID: wire.SessionID,
+		TurnID: wire.TurnID, Source: wire.Source, Payload: payload,
+	}
+	return nil
+}
+
+func decodeEventPayload(kind string, content json.RawMessage) (any, error) {
+	if len(content) == 0 || bytes.Equal(bytes.TrimSpace(content), []byte("null")) {
+		return nil, errors.New("event payload is required")
+	}
+	var value any
+	switch kind {
+	case "observation":
+		value = &ObservationPayload{}
+	case "turn":
+		value = &TurnPayload{}
+	case "import_batch":
+		value = &ImportPayload{}
+	case "feedback":
+		value = &FeedbackPayload{}
+	default:
+		return nil, fmt.Errorf("unsupported event kind %q", kind)
+	}
+	if err := decodeClosedJSON(content, value); err != nil {
+		return nil, fmt.Errorf("invalid %s payload", kind)
+	}
+	switch typed := value.(type) {
+	case *ObservationPayload:
+		return *typed, nil
+	case *TurnPayload:
+		return *typed, nil
+	case *ImportPayload:
+		return *typed, nil
+	case *FeedbackPayload:
+		return *typed, nil
+	default:
+		return nil, errors.New("unsupported event payload type")
+	}
+}
+
 func newObservation(id Identity, client, text string, now time.Time) (Event, error) {
 	client = boundString(client, 64)
 	payload := ObservationPayload{Text: boundText(text)}
@@ -196,63 +247,50 @@ func canonicalEventBytes(event Event) ([]byte, error) {
 	return append(b, '\n'), nil
 }
 
-func decodeCanonicalOutboxEvent(content []byte, filename, machineID string) (Event, []byte, error) {
-	var wire wireEvent
-	if err := decodeClosedJSON(content, &wire); err != nil {
+func decodeCanonicalEvent(content []byte, filename, machineID string, now time.Time) (Event, []byte, error) {
+	if len(content) == 0 || len(content) > MaxEventBytes || !utf8.Valid(content) {
+		return Event{}, nil, errors.New("event is empty, oversized, or not UTF-8")
+	}
+	var event Event
+	if err := decodeClosedJSON(content, &event); err != nil {
 		return Event{}, nil, fmt.Errorf("parse event: %w", err)
 	}
-	event := Event{
-		Schema: wire.Schema, ID: wire.ID, Kind: wire.Kind, CapturedAt: wire.CapturedAt,
-		Machine: wire.Machine, Client: wire.Client, SessionID: wire.SessionID,
-		TurnID: wire.TurnID, Source: wire.Source, Payload: wire.Payload,
+	if event.Kind == "feedback" && len(content) > MaxFeedbackEventBytes {
+		return Event{}, nil, fmt.Errorf("feedback event exceeds %d bytes", MaxFeedbackEventBytes)
 	}
-	if err := validateEventV1(event, wire.Payload, filename, machineID); err != nil {
+	if err := validateEvent(event, filename, machineID, now); err != nil {
 		return Event{}, nil, err
 	}
-	b, err := json.Marshal(wire)
+	canonical, err := canonicalEventBytes(event)
 	if err != nil {
 		return Event{}, nil, err
 	}
-	canonical := append(b, '\n')
 	if !bytes.Equal(content, canonical) {
 		return Event{}, nil, errors.New("event is not canonical JSON")
 	}
 	return event, canonical, nil
 }
 
-func validateEventV1(event Event, payload json.RawMessage, filename, machineID string) error {
-	if err := validateEventEnvelopeV1(event, filename, machineID); err != nil {
-		return err
+func decodeCanonicalEventForRecovery(content []byte, filename, machineID string, now time.Time) (Event, []byte, bool, error) {
+	event, canonical, err := decodeCanonicalEvent(content, filename, machineID, now)
+	if !errors.Is(err, errFeedbackExpired) {
+		return event, canonical, false, err
 	}
-	if len(payload) == 0 || bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
-		return errors.New("event payload is required")
+	var envelope struct {
+		CapturedAt time.Time `json:"captured_at"`
 	}
-	switch event.Kind {
-	case "observation":
-		var value ObservationPayload
-		if err := decodeCanonicalPayload(payload, &value); err != nil {
-			return errors.New("invalid observation payload")
-		}
-		return validateObservationV1(event, value)
-	case "turn":
-		var value TurnPayload
-		if err := decodeCanonicalPayload(payload, &value); err != nil {
-			return errors.New("invalid turn payload")
-		}
-		return validateTurnV1(event, value)
-	case "import_batch":
-		var value ImportPayload
-		if err := decodeCanonicalPayload(payload, &value); err != nil {
-			return errors.New("invalid import payload")
-		}
-		return validateImportEventV1(event, value)
-	default:
-		return fmt.Errorf("unsupported v1 event kind %q", event.Kind)
+	if decodeErr := json.Unmarshal(content, &envelope); decodeErr != nil || envelope.CapturedAt.IsZero() {
+		return Event{}, nil, false, err
 	}
+	event, canonical, decodeErr := decodeCanonicalEvent(content, filename, machineID, envelope.CapturedAt)
+	if decodeErr != nil {
+		return Event{}, nil, false, decodeErr
+	}
+	return event, canonical, true, nil
 }
 
-func validateProducerEventV1(event Event, filename, machineID string) error {
-	if err := validateEventEnvelopeV1(event, filename, machineID); err != nil {
+func validateEvent(event Event, filename, machineID string, now time.Time) error {
+	if err := validateEventEnvelope(event, filename, machineID); err != nil {
 		return err
 	}
 	switch value := event.Payload.(type) {
@@ -260,23 +298,32 @@ func validateProducerEventV1(event Event, filename, machineID string) error {
 		if event.Kind != "observation" {
 			return errors.New("event payload type does not match its kind")
 		}
-		return validateObservationV1(event, value)
+		return validateObservation(event, value)
 	case TurnPayload:
 		if event.Kind != "turn" {
 			return errors.New("event payload type does not match its kind")
 		}
-		return validateTurnV1(event, value)
+		return validateTurn(event, value)
 	case ImportPayload:
 		if event.Kind != "import_batch" {
 			return errors.New("event payload type does not match its kind")
 		}
-		return validateImportEventV1(event, value)
+		return validateImportEvent(event, value)
+	case FeedbackPayload:
+		if event.Kind != "feedback" {
+			return errors.New("event payload type does not match its kind")
+		}
+		return validateFeedbackEvent(event, value, now)
 	default:
-		return fmt.Errorf("event kind %q has an unsupported producer payload type", event.Kind)
+		return fmt.Errorf("event kind %q has an unsupported payload type", event.Kind)
 	}
 }
 
-func validateEventEnvelopeV1(event Event, filename, machineID string) error {
+func validateProducerEvent(event Event, filename, machineID string) error {
+	return validateEvent(event, filename, machineID, event.CapturedAt.UTC())
+}
+
+func validateEventEnvelope(event Event, filename, machineID string) error {
 	digest, ok := eventDigest(event.ID)
 	if event.Schema != Protocol || !ok || filename != digest+".json" {
 		return errors.New("invalid event schema, id, or filename")
@@ -299,7 +346,7 @@ func validateEventEnvelopeV1(event Event, filename, machineID string) error {
 	return nil
 }
 
-func validateObservationV1(event Event, value ObservationPayload) error {
+func validateObservation(event Event, value ObservationPayload) error {
 	if event.SessionID != "" || event.TurnID != "" {
 		return errors.New("observation cannot carry session or turn identifiers")
 	}
@@ -313,7 +360,7 @@ func validateObservationV1(event Event, value ObservationPayload) error {
 	return nil
 }
 
-func validateTurnV1(event Event, value TurnPayload) error {
+func validateTurn(event Event, value TurnPayload) error {
 	if (value.Prompt == "" && value.Response == "") ||
 		!validOptionalString(value.Prompt, MaxTextBytes) || !validOptionalString(value.Response, MaxTextBytes) ||
 		!validOptionalString(value.CWD, MaxCWD) || !validOptionalString(value.Model, MaxModel) {
@@ -326,7 +373,7 @@ func validateTurnV1(event Event, value TurnPayload) error {
 	return nil
 }
 
-func validateImportEventV1(event Event, value ImportPayload) error {
+func validateImportEvent(event Event, value ImportPayload) error {
 	if event.SessionID != "" || event.TurnID != "" {
 		return errors.New("import batch cannot carry session or turn identifiers")
 	}
@@ -351,20 +398,6 @@ func decodeClosedJSON(content []byte, dst any) error {
 			return errors.New("multiple JSON values")
 		}
 		return err
-	}
-	return nil
-}
-
-func decodeCanonicalPayload(content json.RawMessage, dst any) error {
-	if err := decodeClosedJSON(content, dst); err != nil {
-		return err
-	}
-	canonical, err := json.Marshal(dst)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(content, canonical) {
-		return errors.New("payload is not canonical JSON")
 	}
 	return nil
 }

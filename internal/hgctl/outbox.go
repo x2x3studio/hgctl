@@ -18,7 +18,7 @@ type deliveryReceipt struct {
 }
 
 func (a *App) enqueue(event Event) error {
-	if _, ok := a.deliveryReceiptPath(event.ID); event.Schema != Protocol || !ok {
+	if _, ok := a.deliveryReceiptPath(event.ID); event.Schema != Protocol || event.Kind == "feedback" || !ok {
 		return errors.New("invalid event envelope")
 	}
 	identity, err := a.loadIdentity()
@@ -26,7 +26,7 @@ func (a *App) enqueue(event Event) error {
 		return err
 	}
 	name := strings.TrimPrefix(event.ID, "sha256:") + ".json"
-	if err := validateProducerEventV1(event, name, identity.ID); err != nil {
+	if err := validateProducerEvent(event, name, identity.ID); err != nil {
 		return fmt.Errorf("validate event before enqueue: %w", err)
 	}
 	b, err := canonicalEventBytes(event)
@@ -36,7 +36,7 @@ func (a *App) enqueue(event Event) error {
 	if len(b) > MaxEventBytes {
 		return fmt.Errorf("event is %d bytes; limit is %d", len(b), MaxEventBytes)
 	}
-	_, canonical, err := decodeCanonicalOutboxEvent(b, name, identity.ID)
+	_, canonical, err := decodeCanonicalEvent(b, name, identity.ID, event.CapturedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("validate event before enqueue: %w", err)
 	}
@@ -46,7 +46,7 @@ func (a *App) enqueue(event Event) error {
 	path := filepath.Join(a.Paths.Outbox, name)
 	existing, err := os.ReadFile(path)
 	if err == nil {
-		if _, _, decodeErr := decodeCanonicalOutboxEvent(existing, name, identity.ID); decodeErr != nil {
+		if existingEvent, _, decodeErr := decodeCanonicalEvent(existing, name, identity.ID, event.CapturedAt.UTC()); decodeErr != nil || existingEvent.Kind == "feedback" {
 			return fmt.Errorf("outbox collision for %s: existing entry is invalid", name)
 		}
 		return nil
@@ -57,8 +57,8 @@ func (a *App) enqueue(event Event) error {
 	return writeFileAtomic(path, canonical, 0o600)
 }
 
-func (a *App) enqueueFeedback(event FeedbackEvent) error {
-	if event.Schema != FeedbackProtocol {
+func (a *App) enqueueFeedback(event Event) error {
+	if event.Schema != Protocol || event.Kind != "feedback" {
 		return errors.New("invalid feedback event envelope")
 	}
 	identity, err := a.loadIdentity()
@@ -66,10 +66,10 @@ func (a *App) enqueueFeedback(event FeedbackEvent) error {
 		return err
 	}
 	name := strings.TrimPrefix(event.ID, "sha256:") + ".json"
-	if err := validateFeedbackEvent(event, name, identity.ID, event.CapturedAt); err != nil {
+	if err := validateProducerEvent(event, name, identity.ID); err != nil {
 		return fmt.Errorf("validate feedback before enqueue: %w", err)
 	}
-	canonical, err := canonicalFeedbackEventBytes(event)
+	canonical, err := canonicalEventBytes(event)
 	if err != nil {
 		return err
 	}
@@ -82,9 +82,9 @@ func (a *App) enqueueFeedback(event FeedbackEvent) error {
 	path := filepath.Join(a.Paths.Outbox, name)
 	existing, err := os.ReadFile(path)
 	if err == nil {
-		_, existingCanonical, decodeErr := decodeCanonicalFeedbackEvent(existing, name, identity.ID, event.CapturedAt)
-		if decodeErr != nil {
-			return fmt.Errorf("outbox collision for %s: existing entry is not feedback/v2", name)
+		existingEvent, existingCanonical, decodeErr := decodeCanonicalEvent(existing, name, identity.ID, event.CapturedAt.UTC())
+		if decodeErr != nil || existingEvent.Kind != "feedback" {
+			return fmt.Errorf("outbox collision for %s: existing entry is not feedback", name)
 		}
 		if !bytes.Equal(existingCanonical, canonical) {
 			return fmt.Errorf("outbox collision for %s: first terminal assessment differs", name)
@@ -157,7 +157,7 @@ func (a *App) pruneExpiredFeedbackOutbox(now time.Time) error {
 		if err != nil {
 			continue
 		}
-		_, decodeErr := decodeCanonicalQueuedEvent(content, entry.Name(), identity.ID, now)
+		_, _, decodeErr := decodeCanonicalEvent(content, entry.Name(), identity.ID, now)
 		if !errors.Is(decodeErr, errFeedbackExpired) {
 			continue
 		}

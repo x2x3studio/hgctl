@@ -1,0 +1,3 @@
+self-hosted-runner:
+  labels:
+    - x2x3studio-paas

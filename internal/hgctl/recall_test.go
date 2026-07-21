@@ -98,8 +98,9 @@ func TestExplicitZeroHitQueuesFeedbackButSessionStartDoesNot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	event, _, err := decodeCanonicalFeedbackEvent(content, entries[0].Name(), fixture.id.ID, fixture.app.Now().UTC())
-	if err != nil || event.Payload.Outcome != "zero_hit" || event.Payload.Result != nil || event.Payload.Surface.Origin != "explicit" {
+	event, _, err := decodeCanonicalEvent(content, entries[0].Name(), fixture.id.ID, fixture.app.Now().UTC())
+	payload, payloadErr := feedbackPayload(event)
+	if err != nil || payloadErr != nil || payload.Outcome != "zero_hit" || payload.Result != nil || payload.Surface.Origin != "explicit" {
 		t.Fatalf("explicit zero hit changed: event=%#v err=%v", event, err)
 	}
 	before := len(entries)

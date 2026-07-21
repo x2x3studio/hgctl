@@ -59,12 +59,14 @@ purge command says otherwise.
 
 ## Protocol
 
-The companion Hourglass repository owns the branch and event contracts in
-`protocol/v1.md` and `protocol/v2.md`. V1 is closed to `turn`, `observation`,
-and `import_batch`; v2 is closed to receipt-bound `feedback`. Neither envelope
-nor payload extensions are accepted. Queue commits are schema-homogeneous and
-pending v1 evidence has priority over v2 feedback. Changing fields, IDs, branch
-ownership, or cursor semantics requires a new protocol version.
+The companion Hourglass repository owns the branch contract and the single
+closed `hourglass.event/v1` wire protocol in `protocol/event.md`. Its event
+kinds are exactly `observation`, `turn`, `import_batch`, and receipt-bound
+`feedback`; neither envelope nor payload extensions are accepted. One queue
+commit may mix any valid kinds while retaining the shared count and byte
+limits. Unsupported event schemas are invalid, not deferred compatibility
+work. Changing fields, IDs, branch ownership, or cursor semantics requires an
+explicit coordinated change across both Project repositories.
 
 ## Verification
 
@@ -78,7 +80,7 @@ Every behavior change needs focused tests. At minimum cover:
 - Git queue idempotence and failed-push recovery;
 - exact shared commit/tree/blob recall and Basic Memory JSON validation;
 - feedback identity, receipt expiry, first-writer-wins, and bounded reranking;
-- schema-homogeneous v1/v2 queue batching and interrupted recovery;
+- mixed-kind queue batching, feedback expiry, and interrupted recovery;
 - hook config merge/uninstall without damaging unrelated entries;
 - Codex hook discovery and trust through the official app-server only;
 - scheduler label/path stability;

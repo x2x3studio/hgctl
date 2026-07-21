@@ -96,8 +96,8 @@ func TestHookPairsPromptAndResponseWithoutTranscript(t *testing.T) {
 	if err := json.Unmarshal(b, &event); err != nil {
 		t.Fatal(err)
 	}
-	payload, ok := event.Payload.(map[string]any)
-	if !ok || payload["prompt"] != "why did this fail?" || payload["response"] != "because the invariant changed" {
+	payload, ok := event.Payload.(TurnPayload)
+	if !ok || payload.Prompt != "why did this fail?" || payload.Response != "because the invariant changed" {
 		t.Fatalf("unexpected payload: %#v", event.Payload)
 	}
 }
@@ -146,7 +146,7 @@ func TestConcurrentHookProcessesLeaveCanonicalOutbox(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := decodeCanonicalOutboxEvent(content, entry.Name(), identity.ID); err != nil {
+		if _, _, err := decodeCanonicalEvent(content, entry.Name(), identity.ID, app.Now().UTC()); err != nil {
 			t.Fatalf("non-canonical concurrent event %s: %v", entry.Name(), err)
 		}
 	}
@@ -564,7 +564,7 @@ func TestCanonicalOutboxRejectsKnownPayloadExtensions(t *testing.T) {
 	}
 }
 
-func TestKnownV1EventsRejectSemanticIDMismatch(t *testing.T) {
+func TestKnownEventsRejectSemanticIDMismatch(t *testing.T) {
 	app := testApp(t)
 	id, err := app.loadIdentity()
 	if err != nil {
@@ -606,7 +606,7 @@ func TestKnownV1EventsRejectSemanticIDMismatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := decodeCanonicalOutboxEvent(encoded, strings.TrimPrefix(wrongID, "sha256:")+".json", id.ID); err == nil || !strings.Contains(err.Error(), "semantic id mismatch") {
+		if _, _, err := decodeCanonicalEvent(encoded, strings.TrimPrefix(wrongID, "sha256:")+".json", id.ID, app.Now().UTC()); err == nil || !strings.Contains(err.Error(), "semantic id mismatch") {
 			t.Fatalf("kind %s accepted mismatched semantic id: %v", event.Kind, err)
 		}
 	}
@@ -619,7 +619,7 @@ func TestKnownV1EventsRejectSemanticIDMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := decodeCanonicalOutboxEvent(encoded, strings.TrimPrefix(wrongID, "sha256:")+".json", id.ID); err == nil || !strings.Contains(err.Error(), "unsupported v1 event kind") {
+	if _, _, err := decodeCanonicalEvent(encoded, strings.TrimPrefix(wrongID, "sha256:")+".json", id.ID, app.Now().UTC()); err == nil || !strings.Contains(err.Error(), "unsupported event kind") {
 		t.Fatalf("unknown kind was not rejected: err=%v", err)
 	}
 }
@@ -657,7 +657,7 @@ func TestSemanticIDWireContract(t *testing.T) {
 	}
 }
 
-func TestEveryV1PayloadIsClosedAndCanonical(t *testing.T) {
+func TestEveryPayloadIsClosedAndCanonical(t *testing.T) {
 	app := testApp(t)
 	id, err := app.loadIdentity()
 	if err != nil {
@@ -704,12 +704,12 @@ func TestEveryV1PayloadIsClosedAndCanonical(t *testing.T) {
 		contains string
 	}{
 		{name: "turn extension", content: turnExtended, eventID: turn.ID, contains: "invalid turn payload"},
-		{name: "turn field order", content: turnReordered, eventID: turn.ID, contains: "invalid turn payload"},
-		{name: "import extension", content: batchExtended, eventID: batch.ID, contains: "invalid import payload"},
+		{name: "turn field order", content: turnReordered, eventID: turn.ID, contains: "event is not canonical JSON"},
+		{name: "import extension", content: batchExtended, eventID: batch.ID, contains: "invalid import_batch payload"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			filename := strings.TrimPrefix(test.eventID, "sha256:") + ".json"
-			if _, _, err := decodeCanonicalOutboxEvent(test.content, filename, id.ID); err == nil || !strings.Contains(err.Error(), test.contains) {
+			if _, _, err := decodeCanonicalEvent(test.content, filename, id.ID, app.Now().UTC()); err == nil || !strings.Contains(err.Error(), test.contains) {
 				t.Fatalf("closed payload accepted: %v", err)
 			}
 		})
@@ -742,7 +742,7 @@ func TestImportItemSemanticIDIsValidated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := decodeCanonicalOutboxEvent(encoded, strings.TrimPrefix(event.ID, "sha256:")+".json", id.ID); err == nil || !strings.Contains(err.Error(), "import item semantic id mismatch") {
+	if _, _, err := decodeCanonicalEvent(encoded, strings.TrimPrefix(event.ID, "sha256:")+".json", id.ID, app.Now().UTC()); err == nil || !strings.Contains(err.Error(), "import item semantic id mismatch") {
 		t.Fatalf("invalid import item id was accepted: %v", err)
 	}
 }
@@ -754,10 +754,6 @@ func TestEventTimeMustMapToFourDigitUTCYear(t *testing.T) {
 		t.Fatal(err)
 	}
 	event, err := newObservation(id, "codex", "time boundary", app.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload, err := json.Marshal(event.Payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -775,7 +771,7 @@ func TestEventTimeMustMapToFourDigitUTCYear(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			event.CapturedAt = test.value
-			err := validateEventV1(event, payload, filename, id.ID)
+			err := validateEvent(event, filename, id.ID, event.CapturedAt)
 			if test.valid && err != nil {
 				t.Fatal(err)
 			}

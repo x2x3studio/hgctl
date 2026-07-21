@@ -1,11 +1,9 @@
 package hgctl
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -15,8 +13,7 @@ import (
 )
 
 const (
-	FeedbackProtocol = "hourglass.event/v2"
-	SurfaceProtocol  = "hourglass.surface/v1"
+	SurfaceProtocol = "hourglass.surface/v1"
 
 	MaxFeedbackEventBytes = 64 * 1024
 	MaxSurfaceResults     = 8
@@ -55,28 +52,6 @@ type FeedbackPayload struct {
 	Result  *int          `json:"result,omitempty"`
 }
 
-type FeedbackEvent struct {
-	Schema     string          `json:"schema"`
-	ID         string          `json:"id"`
-	Kind       string          `json:"kind"`
-	CapturedAt time.Time       `json:"captured_at"`
-	Machine    Machine         `json:"machine"`
-	Client     string          `json:"client"`
-	Source     Source          `json:"source"`
-	Payload    FeedbackPayload `json:"payload"`
-}
-
-type wireFeedbackEvent struct {
-	Schema     string          `json:"schema"`
-	ID         string          `json:"id"`
-	Kind       string          `json:"kind"`
-	CapturedAt time.Time       `json:"captured_at"`
-	Machine    Machine         `json:"machine"`
-	Client     string          `json:"client"`
-	Source     Source          `json:"source"`
-	Payload    json.RawMessage `json:"payload"`
-}
-
 func newRecallSurface(identity Identity, client, origin string, revision SharedRevision, results []SurfaceResult, issuedAt time.Time) (RecallSurface, error) {
 	nonceBytes := make([]byte, 16)
 	if _, err := rand.Read(nonceBytes); err != nil {
@@ -97,20 +72,20 @@ func newRecallSurface(identity Identity, client, origin string, revision SharedR
 	return surface, nil
 }
 
-func newFeedbackEvent(identity Identity, surface RecallSurface, outcome string, result *int, capturedAt time.Time) (FeedbackEvent, error) {
+func newFeedbackEvent(identity Identity, surface RecallSurface, outcome string, result *int, capturedAt time.Time) (Event, error) {
 	payload := FeedbackPayload{Surface: surface, Outcome: outcome, Result: result}
 	id, err := feedbackEventID(identity.ID, surface.Client, surface.ID)
 	if err != nil {
-		return FeedbackEvent{}, err
+		return Event{}, err
 	}
-	event := FeedbackEvent{
-		Schema: FeedbackProtocol, ID: id, Kind: "feedback", CapturedAt: capturedAt.UTC(),
+	event := Event{
+		Schema: Protocol, ID: id, Kind: "feedback", CapturedAt: capturedAt.UTC(),
 		Machine: Machine{ID: identity.ID, Hostname: identity.Hostname}, Client: surface.Client,
 		Source: Source{Kind: "recall", Locator: surface.ID}, Payload: payload,
 	}
 	name := strings.TrimPrefix(id, "sha256:") + ".json"
-	if err := validateFeedbackEvent(event, name, identity.ID, capturedAt.UTC()); err != nil {
-		return FeedbackEvent{}, err
+	if err := validateProducerEvent(event, name, identity.ID); err != nil {
+		return Event{}, err
 	}
 	return event, nil
 }
@@ -137,65 +112,23 @@ func feedbackEventID(machine, client, surfaceID string) (string, error) {
 	}{"feedback", machine, client, surfaceID})
 }
 
-func canonicalFeedbackEventBytes(event FeedbackEvent) ([]byte, error) {
-	content, err := json.Marshal(event)
-	if err != nil {
-		return nil, err
-	}
-	return append(content, '\n'), nil
-}
-
-func decodeCanonicalFeedbackEvent(content []byte, filename, machineID string, now time.Time) (FeedbackEvent, []byte, error) {
-	if len(content) == 0 || len(content) > MaxFeedbackEventBytes || !utf8.Valid(content) {
-		return FeedbackEvent{}, nil, errors.New("feedback event is empty, oversized, or not UTF-8")
-	}
-	var wire wireFeedbackEvent
-	if err := decodeClosedJSON(content, &wire); err != nil {
-		return FeedbackEvent{}, nil, fmt.Errorf("parse feedback event: %w", err)
-	}
-	var payload FeedbackPayload
-	if err := decodeCanonicalPayload(wire.Payload, &payload); err != nil {
-		return FeedbackEvent{}, nil, fmt.Errorf("invalid feedback payload: %w", err)
-	}
-	event := FeedbackEvent{
-		Schema: wire.Schema, ID: wire.ID, Kind: wire.Kind, CapturedAt: wire.CapturedAt,
-		Machine: wire.Machine, Client: wire.Client, Source: wire.Source, Payload: payload,
-	}
-	if err := validateFeedbackEvent(event, filename, machineID, now); err != nil {
-		return FeedbackEvent{}, nil, err
-	}
-	canonical, err := canonicalFeedbackEventBytes(event)
-	if err != nil {
-		return FeedbackEvent{}, nil, err
-	}
-	if !bytes.Equal(content, canonical) {
-		return FeedbackEvent{}, nil, errors.New("feedback event is not canonical JSON")
-	}
-	return event, canonical, nil
-}
-
-func validateFeedbackEvent(event FeedbackEvent, filename, machineID string, now time.Time) error {
-	digest, ok := eventDigest(event.ID)
-	if event.Schema != FeedbackProtocol || event.Kind != "feedback" || !ok || filename != digest+".json" {
-		return errors.New("invalid feedback schema, kind, id, or filename")
-	}
-	if !validMachineID(event.Machine.ID) || event.Machine.ID != machineID ||
-		!validRequiredString(event.Machine.Hostname, MaxMachineHostname) || !validEndpointClient(event.Client) {
+func validateFeedbackEvent(event Event, payload FeedbackPayload, now time.Time) error {
+	if event.Kind != "feedback" || event.SessionID != "" || event.TurnID != "" || !validEndpointClient(event.Client) {
 		return errors.New("feedback machine or client is invalid")
 	}
-	if event.Source.Kind != "recall" || event.Source.Locator != event.Payload.Surface.ID {
+	if event.Source.Kind != "recall" || event.Source.Locator != payload.Surface.ID {
 		return errors.New("feedback source does not bind its surface")
 	}
 	if !validEventTime(event.CapturedAt) || now.IsZero() {
 		return errors.New("feedback captured_at is invalid")
 	}
-	if err := validateRecallSurface(event.Payload.Surface, event.Machine.ID, event.Client); err != nil {
+	if err := validateRecallSurface(payload.Surface, event.Machine.ID, event.Client); err != nil {
 		return err
 	}
-	if err := validateFeedbackOutcome(event.Payload); err != nil {
+	if err := validateFeedbackOutcome(payload); err != nil {
 		return err
 	}
-	issuedAt := event.Payload.Surface.IssuedAt
+	issuedAt := payload.Surface.IssuedAt
 	if issuedAt.After(now.Add(FeedbackFutureSkew)) || event.CapturedAt.After(now.Add(FeedbackFutureSkew)) ||
 		event.CapturedAt.Before(issuedAt) || event.CapturedAt.Sub(issuedAt) > SurfaceLifetime {
 		return errors.New("feedback timestamps are outside the allowed clock skew")
@@ -203,7 +136,7 @@ func validateFeedbackEvent(event FeedbackEvent, filename, machineID string, now 
 	if now.Sub(issuedAt) > SurfaceLifetime {
 		return errFeedbackExpired
 	}
-	wantID, err := feedbackEventID(event.Machine.ID, event.Client, event.Payload.Surface.ID)
+	wantID, err := feedbackEventID(event.Machine.ID, event.Client, payload.Surface.ID)
 	if err != nil || event.ID != wantID {
 		return errors.New("feedback semantic id mismatch")
 	}
@@ -219,7 +152,7 @@ func validateRecallSurface(surface RecallSurface, machineID, client string) erro
 	}
 	seen := make(map[string]struct{}, len(surface.Results))
 	for index, result := range surface.Results {
-		if result.Rank != index+1 || !validMemoryPathV2(result.Path) || !validObjectID(result.Blob) {
+		if result.Rank != index+1 || !validMemoryPath(result.Path) || !validObjectID(result.Blob) {
 			return errors.New("surface result is invalid or out of order")
 		}
 		if _, duplicate := seen[result.Path]; duplicate {
@@ -250,7 +183,7 @@ func validateFeedbackOutcome(payload FeedbackPayload) error {
 	return nil
 }
 
-func validMemoryPathV2(name string) bool {
+func validMemoryPath(name string) bool {
 	if name == "" || len(name) > MaxImportPath || !utf8.ValidString(name) || strings.Contains(name, "\\") ||
 		strings.HasPrefix(name, "/") || path.Clean(name) != name {
 		return false

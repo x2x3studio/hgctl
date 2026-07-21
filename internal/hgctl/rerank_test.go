@@ -25,7 +25,7 @@ func TestFeedbackRerankMatchesFrozenVectors(t *testing.T) {
 			Expected []string     `json:"expected"`
 		} `json:"vectors"`
 	}
-	content, err := os.ReadFile(filepath.Join("testdata", "protocol", "v2", "rerank.json"))
+	content, err := os.ReadFile(filepath.Join("testdata", "protocol", "event", "rerank.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

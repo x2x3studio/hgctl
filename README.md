@@ -199,9 +199,11 @@ stores the query, scores, snippets, or rendered response.
 An explicit verified empty lookup automatically queues `zero_hit`; an empty
 SessionStart lookup does not. Agents can attach one terminal outcome to a
 surfaced rank. The event ID deliberately excludes outcome and rank, so the first
-assessment wins and identical retries replay the same bytes. Feedback queue
-commits are v2-only, pending v1 evidence is delivered first, and expired local
-feedback is pruned before sync.
+assessment wins and identical retries replay the same bytes. `observation`,
+`turn`, `import_batch`, and receipt-bound `feedback` all use the single closed
+`hourglass.event/v1` protocol owned by the companion repository's
+`protocol/event.md`; a bounded queue commit may mix any of those kinds. Expired
+local feedback is pruned before sync.
 
 Published feedback aggregates bind an exact memory path and Git blob. A closed,
 canonical shard may conservatively reorder Basic Memory results by adjacent

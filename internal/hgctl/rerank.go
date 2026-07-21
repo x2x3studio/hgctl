@@ -102,7 +102,7 @@ func decodeFeedbackShard(content []byte, prefix string) ([]feedbackAggregate, er
 	previous := ""
 	for _, entry := range shard.Entries {
 		if !validLowerHex(entry.Key, 64) || !strings.HasPrefix(entry.Key, prefix) || entry.Key <= previous ||
-			!validMemoryPathV2(entry.Path) || !validObjectID(entry.Blob) || entry.Key != aggregateKey(entry.Path, entry.Blob) ||
+			!validMemoryPath(entry.Path) || !validObjectID(entry.Blob) || entry.Key != aggregateKey(entry.Path, entry.Blob) ||
 			(entry.Used == 0 && entry.Irrelevant == 0 && entry.Stale == 0 && entry.Contradicted == 0) {
 			return nil, errors.New("shard contains an invalid, misplaced, or unsorted aggregate")
 		}

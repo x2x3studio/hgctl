@@ -145,7 +145,7 @@ func eligibleRecallPaths(candidatePaths []string) ([]string, error) {
 		if name == "Home.md" || name == "Hourglass.canvas" {
 			continue
 		}
-		if !validMemoryPathV2(name) {
+		if !validMemoryPath(name) {
 			return nil, fmt.Errorf("Basic Memory returned an invalid Hourglass path %q", name)
 		}
 		if _, duplicate := seen[name]; duplicate {

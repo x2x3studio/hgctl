@@ -20,9 +20,9 @@ const (
 )
 
 type localSurfaceReceipt struct {
-	SchemaVersion int            `json:"schema_version"`
-	Surface       RecallSurface  `json:"surface"`
-	Terminal      *FeedbackEvent `json:"terminal,omitempty"`
+	SchemaVersion int           `json:"schema_version"`
+	Surface       RecallSurface `json:"surface"`
+	Terminal      *Event        `json:"terminal,omitempty"`
 }
 
 func (a *App) runFeedback(ctx context.Context, args []string) error {
@@ -78,8 +78,8 @@ func (a *App) saveSurface(ctx context.Context, surface RecallSurface) error {
 	})
 }
 
-func (a *App) assessSurface(ctx context.Context, surfaceID, client, outcome string, result *int) (FeedbackEvent, error) {
-	var accepted FeedbackEvent
+func (a *App) assessSurface(ctx context.Context, surfaceID, client, outcome string, result *int) (Event, error) {
+	var accepted Event
 	err := withFileLockWait(ctx, a.Paths.SurfaceLock, func() error {
 		receipt, path, err := a.loadSurfaceReceipt(surfaceID)
 		if err != nil {
@@ -97,7 +97,11 @@ func (a *App) assessSurface(ctx context.Context, surfaceID, client, outcome stri
 			return errFeedbackExpired
 		}
 		if receipt.Terminal != nil {
-			if receipt.Terminal.Payload.Outcome != outcome || !sameOptionalRank(receipt.Terminal.Payload.Result, result) {
+			payload, err := feedbackPayload(*receipt.Terminal)
+			if err != nil {
+				return err
+			}
+			if payload.Outcome != outcome || !sameOptionalRank(payload.Result, result) {
 				return errors.New("surface already has a different terminal assessment")
 			}
 			accepted = *receipt.Terminal
@@ -112,11 +116,15 @@ func (a *App) assessSurface(ctx context.Context, surfaceID, client, outcome stri
 			return err
 		}
 		if exists {
+			payload, err := feedbackPayload(existing)
+			if err != nil {
+				return err
+			}
 			receipt.Terminal = &existing
 			if err := writeJSONAtomic(path, receipt, 0o600); err != nil {
 				return err
 			}
-			if existing.Payload.Outcome != outcome || !sameOptionalRank(existing.Payload.Result, result) {
+			if payload.Outcome != outcome || !sameOptionalRank(payload.Result, result) {
 				return errors.New("surface already has a different terminal assessment")
 			}
 			accepted = existing
@@ -135,24 +143,35 @@ func (a *App) assessSurface(ctx context.Context, surfaceID, client, outcome stri
 	return accepted, err
 }
 
-func (a *App) loadFeedbackOutbox(id, machineID string, now time.Time) (FeedbackEvent, bool, error) {
+func (a *App) loadFeedbackOutbox(id, machineID string, now time.Time) (Event, bool, error) {
 	digest, ok := eventDigest(id)
 	if !ok {
-		return FeedbackEvent{}, false, errors.New("invalid feedback event id")
+		return Event{}, false, errors.New("invalid feedback event id")
 	}
 	name := digest + ".json"
 	content, err := readOutboxFile(filepath.Join(a.Paths.Outbox, name))
 	if errors.Is(err, os.ErrNotExist) {
-		return FeedbackEvent{}, false, nil
+		return Event{}, false, nil
 	}
 	if err != nil {
-		return FeedbackEvent{}, false, err
+		return Event{}, false, err
 	}
-	event, _, err := decodeCanonicalFeedbackEvent(content, name, machineID, now)
+	event, _, err := decodeCanonicalEvent(content, name, machineID, now)
 	if err != nil {
-		return FeedbackEvent{}, false, fmt.Errorf("existing same-id feedback outbox is invalid: %w", err)
+		return Event{}, false, fmt.Errorf("existing same-id feedback outbox is invalid: %w", err)
+	}
+	if event.Kind != "feedback" {
+		return Event{}, false, errors.New("existing same-id feedback outbox is not feedback")
 	}
 	return event, true, nil
+}
+
+func feedbackPayload(event Event) (FeedbackPayload, error) {
+	payload, ok := event.Payload.(FeedbackPayload)
+	if !ok || event.Kind != "feedback" {
+		return FeedbackPayload{}, errors.New("event is not feedback")
+	}
+	return payload, nil
 }
 
 func sameOptionalRank(left, right *int) bool {
@@ -209,9 +228,10 @@ func (a *App) loadSurfaceReceipt(id string) (localSurfaceReceipt, string, error)
 		return localSurfaceReceipt{}, "", errors.New("local surface receipt is invalid")
 	}
 	if receipt.Terminal != nil {
+		payload, payloadErr := feedbackPayload(*receipt.Terminal)
 		name := strings.TrimPrefix(receipt.Terminal.ID, "sha256:") + ".json"
-		if receipt.Terminal.Payload.Surface.ID != receipt.Surface.ID ||
-			validateFeedbackEvent(*receipt.Terminal, name, receipt.Surface.MachineID, receipt.Terminal.CapturedAt) != nil {
+		if payloadErr != nil || payload.Surface.ID != receipt.Surface.ID ||
+			validateEvent(*receipt.Terminal, name, receipt.Surface.MachineID, receipt.Terminal.CapturedAt) != nil {
 			return localSurfaceReceipt{}, "", errors.New("local terminal assessment is invalid")
 		}
 	}

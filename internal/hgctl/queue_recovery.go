@@ -107,7 +107,6 @@ func (a *App) inspectUnpublishedQueue(ctx context.Context, base, head string) ([
 		if err != nil || len(names) == 0 || len(names) > MaxSyncEvents {
 			return nil, false, errors.New("unpublished queue commit has invalid event additions")
 		}
-		commitSchema := ""
 		commitBytes := 0
 		for _, name := range names {
 			baseName := filepath.Base(name)
@@ -116,20 +115,15 @@ func (a *App) inspectUnpublishedQueue(ctx context.Context, base, head string) ([
 			if err != nil {
 				return nil, false, fmt.Errorf("unpublished queue event has no outbox twin: %s", name)
 			}
-			event, expired, err := decodeCanonicalQueuedEventForRecovery(outbox, baseName, identity.ID, a.Now().UTC())
+			event, canonical, expired, err := decodeCanonicalEventForRecovery(outbox, baseName, identity.ID, a.Now().UTC())
 			if err != nil || queuedEventPath(event, baseName) != name {
 				return nil, false, fmt.Errorf("unpublished queue event has an invalid outbox twin: %s", name)
 			}
 			committed, err := runCommand(ctx, a.Paths.Queue, "git", "show", commit+":"+name)
-			if err != nil || !bytes.Equal([]byte(committed), event.Canonical) {
+			if err != nil || !bytes.Equal([]byte(committed), canonical) {
 				return nil, false, fmt.Errorf("unpublished queue event differs from its outbox twin: %s", name)
 			}
-			if commitSchema == "" {
-				commitSchema = event.Schema
-			} else if commitSchema != event.Schema {
-				return nil, false, errors.New("unpublished queue commit mixes event schemas")
-			}
-			commitBytes += len(event.Canonical)
+			commitBytes += len(canonical)
 			if commitBytes > MaxSyncBytes {
 				return nil, false, errors.New("unpublished queue commit exceeds its byte limit")
 			}
@@ -168,7 +162,7 @@ func addedPathsInCommit(ctx context.Context, repository, parent, commit string) 
 	return names, nil
 }
 
-func queuedEventPath(event queuedEvent, filename string) string {
+func queuedEventPath(event Event, filename string) string {
 	return filepath.ToSlash(filepath.Join(
 		"events", event.CapturedAt.UTC().Format("2006"), event.CapturedAt.UTC().Format("01"), filename,
 	))
