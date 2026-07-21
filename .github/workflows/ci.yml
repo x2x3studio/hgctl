@@ -33,8 +33,12 @@ jobs:
       - name: Verify formatting
         run: test -z "$(gofmt -l .)"
       - name: Test
+        env:
+          CGO_ENABLED: "1"
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
       - name: Build
+        env:
+          CGO_ENABLED: "0"
         run: go build ./cmd/hgctl
