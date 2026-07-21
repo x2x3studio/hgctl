@@ -3,7 +3,6 @@ package hgctl
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -72,9 +71,6 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 			return err
 		}
 	}
-	if err := a.markDelivered(batch.OutboxPaths); err != nil {
-		return err
-	}
 	for _, path := range batch.OutboxPaths {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -132,34 +128,19 @@ type queueBatch struct {
 	EventPaths  []string
 }
 
-type outboxCandidate struct {
-	path      string
-	name      string
-	event     Event
-	canonical []byte
-}
-
-func queuedEventPath(event Event, filename string) string {
-	return filepath.ToSlash(filepath.Join(
-		"events", event.CapturedAt.UTC().Format("2006"), event.CapturedAt.UTC().Format("01"), filename,
-	))
-}
-
+// copyOutboxToQueue moves up to a bounded batch of raw outbox events into the
+// queue worktree under events/. Events are opaque Markdown; there is no decode,
+// canonicalization, admission, or quarantine.
 func (a *App) copyOutboxToQueue() (queueBatch, error) {
-	identity, err := a.loadIdentity()
-	if err != nil {
-		return queueBatch{}, err
-	}
 	entries, err := os.ReadDir(a.Paths.Outbox)
 	if err != nil {
 		return queueBatch{}, err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	var selected []outboxCandidate
+	var batch queueBatch
 	selectedBytes := 0
-	selectionFull := false
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
 			continue
 		}
 		sourcePath := filepath.Join(a.Paths.Outbox, entry.Name())
@@ -168,57 +149,32 @@ func (a *App) copyOutboxToQueue() (queueBatch, error) {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			if quarantineErr := a.quarantineOutbox(sourcePath, err); quarantineErr != nil {
-				return queueBatch{}, quarantineErr
-			}
-			continue
+			return queueBatch{}, err
 		}
-		event, canonical, err := decodeCanonicalEvent(content, entry.Name(), identity.ID)
-		if err != nil {
-			if quarantineErr := a.quarantineOutbox(sourcePath, err); quarantineErr != nil {
-				return queueBatch{}, quarantineErr
-			}
-			continue
+		if len(batch.EventPaths) == MaxSyncEvents || (selectedBytes > 0 && selectedBytes+len(content) > MaxSyncBytes) {
+			break
 		}
-		if a.eventDelivered(event.ID) {
-			if err := os.Remove(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return queueBatch{}, err
-			}
-			continue
-		}
-		if selectionFull {
-			continue
-		}
-		if len(selected) == MaxSyncEvents || (selectedBytes > 0 && selectedBytes+len(canonical) > MaxSyncBytes) {
-			selectionFull = true
-			continue
-		}
-		selected = append(selected, outboxCandidate{path: sourcePath, name: entry.Name(), event: event, canonical: canonical})
-		selectedBytes += len(canonical)
-	}
-	var batch queueBatch
-	for _, candidate := range selected {
-		event := candidate.event
-		relTarget := filepath.FromSlash(queuedEventPath(event, candidate.name))
-		target := filepath.Join(a.Paths.Queue, relTarget)
-		if err := ensureQueueTargetDirectory(a.Paths.Queue, filepath.Dir(relTarget)); err != nil {
+		rel := filepath.ToSlash(filepath.Join("events", entry.Name()))
+		if err := ensureQueueTargetDirectory(a.Paths.Queue, "events"); err != nil {
 			return batch, err
 		}
+		target := filepath.Join(a.Paths.Queue, filepath.FromSlash(rel))
 		info, statErr := os.Lstat(target)
 		if statErr == nil && !info.Mode().IsRegular() {
 			return batch, fmt.Errorf("queue event target is not a regular file: %s", target)
 		}
 		if existing, err := os.ReadFile(target); err == nil {
-			if !bytes.Equal(existing, candidate.canonical) {
+			if !bytes.Equal(existing, content) {
 				return batch, fmt.Errorf("queue event collision: %s", target)
 			}
-		} else if !errors.Is(err, os.ErrNotExist) || (statErr != nil && !errors.Is(statErr, os.ErrNotExist)) {
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return batch, err
-		} else if err := writeFileAtomic(target, candidate.canonical, 0o600); err != nil {
+		} else if err := writeFileAtomic(target, content, 0o600); err != nil {
 			return batch, err
 		}
-		batch.OutboxPaths = append(batch.OutboxPaths, candidate.path)
-		batch.EventPaths = append(batch.EventPaths, filepath.ToSlash(relTarget))
+		batch.OutboxPaths = append(batch.OutboxPaths, sourcePath)
+		batch.EventPaths = append(batch.EventPaths, rel)
+		selectedBytes += len(content)
 	}
 	return batch, nil
 }
@@ -270,23 +226,6 @@ func readOutboxFile(path string) ([]byte, error) {
 	return content, nil
 }
 
-func (a *App) quarantineOutbox(path string, reason error) error {
-	if err := os.MkdirAll(a.Paths.Quarantine, 0o700); err != nil {
-		return err
-	}
-	target := filepath.Join(a.Paths.Quarantine, filepath.Base(path))
-	if _, err := os.Stat(target); err == nil {
-		target += fmt.Sprintf(".%d", a.Now().UnixNano())
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.Rename(path, target); err != nil {
-		return err
-	}
-	_, _ = fmt.Fprintf(a.Err, "hgctl: quarantined %s: %v\n", filepath.Base(path), reason)
-	return nil
-}
-
 func gitHasStagedChanges(ctx context.Context, dir string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet", "--exit-code")
 	cmd.Dir = dir
@@ -336,6 +275,9 @@ func requireQueueTrackedClean(ctx context.Context, queue string) error {
 	return nil
 }
 
+// recoverInterruptedQueueBatch re-derives a partially-staged batch after a crash.
+// Events are opaque Markdown under events/; a staged file must byte-match its
+// outbox source.
 func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, error) {
 	status, err := runCommand(ctx, a.Paths.Queue, "git", "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
@@ -344,16 +286,8 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 	if status == "" {
 		return queueBatch{}, nil
 	}
-	identity, err := a.loadIdentity()
-	if err != nil {
-		return queueBatch{}, err
-	}
-	type recoveryCandidate struct {
-		path       string
-		outboxPath string
-		canonical  []byte
-	}
-	var candidates []recoveryCandidate
+	var batch queueBatch
+	total := 0
 	var staged []string
 	for _, record := range strings.Split(status, "\x00") {
 		if record == "" {
@@ -368,29 +302,22 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 		}
 		rel := filepath.ToSlash(record[3:])
 		clean := filepath.ToSlash(filepath.Clean(rel))
-		if clean != rel || !strings.HasPrefix(clean, "events/") {
+		if clean != rel || !strings.HasPrefix(clean, "events/") || !strings.HasSuffix(clean, ".md") {
 			return queueBatch{}, fmt.Errorf("queue has unexpected change %q at %s", code, rel)
 		}
 		base := filepath.Base(clean)
-		digest := strings.TrimSuffix(base, ".json")
-		if base == digest || !validLowerHex(digest, sha256.Size*2) {
-			return queueBatch{}, fmt.Errorf("queue has unexpected change %q at %s", code, rel)
-		}
 		outboxPath := filepath.Join(a.Paths.Outbox, base)
 		outbox, err := readOutboxFile(outboxPath)
 		if err != nil {
 			return queueBatch{}, fmt.Errorf("staged queue event has no matching outbox entry: %s", rel)
 		}
-		event, canonical, err := decodeCanonicalEvent(outbox, base, identity.ID)
-		if err != nil {
-			return queueBatch{}, fmt.Errorf("staged queue event has an invalid outbox entry: %s", rel)
-		}
-		expected := queuedEventPath(event, base)
 		queued, err := readOutboxFile(filepath.Join(a.Paths.Queue, filepath.FromSlash(clean)))
-		if err != nil || clean != expected || !bytes.Equal(queued, canonical) {
+		if err != nil || !bytes.Equal(queued, outbox) {
 			return queueBatch{}, fmt.Errorf("staged queue event does not match its outbox entry: %s", rel)
 		}
-		candidates = append(candidates, recoveryCandidate{path: clean, outboxPath: outboxPath, canonical: canonical})
+		batch.OutboxPaths = append(batch.OutboxPaths, outboxPath)
+		batch.EventPaths = append(batch.EventPaths, clean)
+		total += len(queued)
 		if code == "A " {
 			staged = append(staged, clean)
 		}
@@ -400,13 +327,6 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 		if _, err := runCommand(ctx, a.Paths.Queue, "git", args...); err != nil {
 			return queueBatch{}, err
 		}
-	}
-	var batch queueBatch
-	total := 0
-	for _, candidate := range candidates {
-		batch.OutboxPaths = append(batch.OutboxPaths, candidate.outboxPath)
-		batch.EventPaths = append(batch.EventPaths, candidate.path)
-		total += len(candidate.canonical)
 	}
 	if len(batch.EventPaths) > MaxSyncEvents || total > MaxSyncBytes {
 		return queueBatch{}, errors.New("interrupted queue stage exceeds endpoint commit limits")

@@ -253,7 +253,11 @@ func (rpc *codexRPC) listHGCTLHooks(id int, cwd, hooksPath string, specs []codex
 			if seenSpecs[index] || hook.Key == "" || seenKeys[hook.Key] {
 				return nil, errors.New("Codex returned duplicate hgctl hooks")
 			}
-			if _, ok := eventDigest(hook.CurrentHash); !ok {
+			hash := hook.CurrentHash
+			if len(hash) == 71 && hash[:7] == "sha256:" {
+				hash = hash[7:]
+			}
+			if !validLowerHex(hash, 64) {
 				return nil, errors.New("Codex returned an invalid hook hash")
 			}
 			seenSpecs[index] = true
