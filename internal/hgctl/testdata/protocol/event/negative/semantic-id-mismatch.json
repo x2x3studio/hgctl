@@ -1,1 +1,0 @@
-{"schema":"hourglass.event/v1","id":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","kind":"observation","captured_at":"2026-07-21T00:00:00Z","machine":{"id":"00000000-0000-4000-8000-000000000000","hostname":"fixture-host"},"client":"codex","source":{"kind":"explicit","locator":"stdin"},"payload":{"text":"hello"}}
