@@ -275,7 +275,6 @@ type hookFileSpec struct {
 
 func hookFileSpecs() []hookFileSpec {
 	return []hookFileSpec{
-		{"SessionStart", "startup|resume|clear|compact", "session-start", 10},
 		{"UserPromptSubmit", "", "user-prompt", 3},
 		{"Stop", "", "stop", 5},
 	}

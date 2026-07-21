@@ -212,7 +212,6 @@ func (a *App) checkCodexHooks(ctx context.Context, writeTrust bool) error {
 func codexHookSpecs(binary string) []codexHookSpec {
 	prefix := shellQuote(binary) + " hook --client codex --event "
 	return []codexHookSpec{
-		{event: "sessionStart", command: prefix + "session-start", matcher: "startup|resume|clear|compact", hasMatcher: true, timeout: 10},
 		{event: "userPromptSubmit", command: prefix + "user-prompt", timeout: 3},
 		{event: "stop", command: prefix + "stop", timeout: 5},
 	}
@@ -288,7 +287,7 @@ func codexHookMatches(hook codexHookMetadata, spec codexHookSpec) bool {
 }
 
 func requireCodexHooksTrusted(hooks []codexHookMetadata) error {
-	if len(hooks) != 3 {
+	if len(hooks) != 2 {
 		return errors.New("Codex hgctl hook set is incomplete")
 	}
 	for _, hook := range hooks {

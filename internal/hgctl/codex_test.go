@@ -341,14 +341,18 @@ func validateFakeCodexTrustWrite(content json.RawMessage) error {
 	if err := json.Unmarshal(content, &params); err != nil {
 		return err
 	}
-	if len(params.Edits) != 1 || params.Edits[0].KeyPath != "hooks.state" || params.Edits[0].MergeStrategy != "upsert" || !params.ReloadUserConfig || len(params.Edits[0].Value) != 3 {
+	if len(params.Edits) != 1 || params.Edits[0].KeyPath != "hooks.state" || params.Edits[0].MergeStrategy != "upsert" || !params.ReloadUserConfig || len(params.Edits[0].Value) != 2 {
 		return errors.New("unexpected config/batchWrite shape")
 	}
 	for key, state := range params.Edits[0].Value {
 		if !state.Enabled || !strings.HasPrefix(key, "hgctl-") {
 			return errors.New("hook state is not enabled or has an unexpected key")
 		}
-		if _, ok := eventDigest(state.TrustedHash); !ok {
+		hash := state.TrustedHash
+		if len(hash) == 71 && hash[:7] == "sha256:" {
+			hash = hash[7:]
+		}
+		if !validLowerHex(hash, 64) {
 			return errors.New("hook state has an invalid trusted hash")
 		}
 	}
