@@ -20,6 +20,14 @@ func (a *App) enqueue(event Event) error {
 	if _, ok := a.deliveryReceiptPath(event.ID); event.Schema != Protocol || !ok {
 		return errors.New("invalid event envelope")
 	}
+	identity, err := a.loadIdentity()
+	if err != nil {
+		return err
+	}
+	name := strings.TrimPrefix(event.ID, "sha256:") + ".json"
+	if err := validateProducerEventV1(event, name, identity.ID); err != nil {
+		return fmt.Errorf("validate event before enqueue: %w", err)
+	}
 	b, err := canonicalEventBytes(event)
 	if err != nil {
 		return err
@@ -27,14 +35,17 @@ func (a *App) enqueue(event Event) error {
 	if len(b) > MaxEventBytes {
 		return fmt.Errorf("event is %d bytes; limit is %d", len(b), MaxEventBytes)
 	}
+	_, canonical, err := decodeCanonicalOutboxEvent(b, name, identity.ID)
+	if err != nil {
+		return fmt.Errorf("validate event before enqueue: %w", err)
+	}
 	if a.eventDelivered(event.ID) {
 		return nil
 	}
-	name := strings.TrimPrefix(event.ID, "sha256:") + ".json"
 	path := filepath.Join(a.Paths.Outbox, name)
 	existing, err := os.ReadFile(path)
 	if err == nil {
-		if _, _, decodeErr := decodeCanonicalOutboxEvent(existing, name, event.Machine.ID); decodeErr != nil {
+		if _, _, decodeErr := decodeCanonicalOutboxEvent(existing, name, identity.ID); decodeErr != nil {
 			return fmt.Errorf("outbox collision for %s: existing entry is invalid", name)
 		}
 		return nil
@@ -42,7 +53,7 @@ func (a *App) enqueue(event Event) error {
 	if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return writeFileAtomic(path, b, 0o600)
+	return writeFileAtomic(path, canonical, 0o600)
 }
 
 func (a *App) eventDelivered(id string) bool {

@@ -1,0 +1,1 @@
+{"schema":"hourglass.event/v1","id":"sha256:79426bfe2f11ff2813a8da2a4710ba14d76096f5c83916b6f43759e4fa2a019c","kind":"turn","captured_at":"2026-07-21T00:00:00Z","machine":{"id":"00000000-0000-4000-8000-000000000000","hostname":"fixture-host"},"client":"claude","session_id":"s","source":{"kind":"hook","locator":"claude:s"},"payload":{"response":"r","prompt":"p"}}

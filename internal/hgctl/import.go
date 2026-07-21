@@ -125,6 +125,9 @@ func (a *App) importFiles(root, source string, files []string) (int, error) {
 		return nil
 	}
 	addItem := func(path, content string) error {
+		if !validRequiredString(path, MaxImportPath) {
+			return fmt.Errorf("import item path is invalid or exceeds %d bytes", MaxImportPath)
+		}
 		sum := sha256.Sum256([]byte(content))
 		hash := hex.EncodeToString(sum[:])
 		itemID, err := importItemID(path, hash)

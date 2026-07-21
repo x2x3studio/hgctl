@@ -14,14 +14,23 @@ import (
 )
 
 const (
-	MaxEventBytes   = 512 * 1024
-	MaxTextBytes    = 120 * 1024
-	MaxImportBytes  = 400 * 1024
-	MaxImportFiles  = 50
-	MaxImportText   = 64 * 1024
-	MaxImportSource = 256
-	MaxSyncEvents   = 4
-	MaxSyncBytes    = 512 * 1024
+	MaxEventBytes      = 512 * 1024
+	MaxTextBytes       = 120 * 1024
+	MaxImportBytes     = 400 * 1024
+	MaxImportFiles     = 50
+	MaxImportText      = 64 * 1024
+	MaxImportSource    = 256
+	MaxImportPath      = 4096
+	MaxSourceKind      = 64
+	MaxSourceLocator   = 4096
+	MaxMachineHostname = 255
+	MaxClient          = 64
+	MaxSessionID       = 512
+	MaxTurnID          = 512
+	MaxCWD             = 4096
+	MaxModel           = 256
+	MaxSyncEvents      = 4
+	MaxSyncBytes       = 512 * 1024
 )
 
 type Machine struct {
@@ -212,21 +221,8 @@ func decodeCanonicalOutboxEvent(content []byte, filename, machineID string) (Eve
 }
 
 func validateEventV1(event Event, payload json.RawMessage, filename, machineID string) error {
-	digest, ok := eventDigest(event.ID)
-	if event.Schema != Protocol || !ok || filename != digest+".json" {
-		return errors.New("invalid event schema, id, or filename")
-	}
-	if event.Kind == "" || len(event.Kind) > 64 || !validEventTime(event.CapturedAt) {
-		return errors.New("event kind and captured_at are required")
-	}
-	if !validMachineID(event.Machine.ID) || event.Machine.ID != machineID || event.Machine.Hostname == "" || len(event.Machine.Hostname) > 255 {
-		return errors.New("event machine does not match the local identity")
-	}
-	if event.Client == "" || len(event.Client) > 64 || len(event.SessionID) > 512 || len(event.TurnID) > 512 {
-		return errors.New("invalid event client or session identifiers")
-	}
-	if event.Source.Kind == "" || event.Source.Locator == "" {
-		return errors.New("event source is incomplete")
+	if err := validateEventEnvelopeV1(event, filename, machineID); err != nil {
+		return err
 	}
 	if len(payload) == 0 || bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
 		return errors.New("event payload is required")
@@ -234,36 +230,112 @@ func validateEventV1(event Event, payload json.RawMessage, filename, machineID s
 	switch event.Kind {
 	case "observation":
 		var value ObservationPayload
-		if err := decodeCanonicalPayload(payload, &value); err != nil || value.Text == "" || len(value.Text) > MaxTextBytes {
+		if err := decodeCanonicalPayload(payload, &value); err != nil {
 			return errors.New("invalid observation payload")
 		}
-		expected, err := observationEventID(event.Machine.ID, event.Client, value)
-		if err != nil || event.ID != expected {
-			return errors.New("observation semantic id mismatch")
-		}
+		return validateObservationV1(event, value)
 	case "turn":
 		var value TurnPayload
-		if err := decodeCanonicalPayload(payload, &value); err != nil || (value.Prompt == "" && value.Response == "") || len(value.Prompt) > MaxTextBytes || len(value.Response) > MaxTextBytes || len(value.CWD) > 4096 || len(value.Model) > 256 {
+		if err := decodeCanonicalPayload(payload, &value); err != nil {
 			return errors.New("invalid turn payload")
 		}
-		expected, err := turnEventID(event.Machine.ID, event.Client, event.SessionID, event.TurnID, value)
-		if err != nil || event.ID != expected {
-			return errors.New("turn semantic id mismatch")
-		}
+		return validateTurnV1(event, value)
 	case "import_batch":
 		var value ImportPayload
 		if err := decodeCanonicalPayload(payload, &value); err != nil {
 			return errors.New("invalid import payload")
 		}
-		if err := validateImportPayload(value); err != nil {
-			return err
-		}
-		expected, err := importEventID(value.Items)
-		if err != nil || event.ID != expected {
-			return errors.New("import batch semantic id mismatch")
-		}
+		return validateImportEventV1(event, value)
 	default:
 		return fmt.Errorf("unsupported v1 event kind %q", event.Kind)
+	}
+}
+
+func validateProducerEventV1(event Event, filename, machineID string) error {
+	if err := validateEventEnvelopeV1(event, filename, machineID); err != nil {
+		return err
+	}
+	switch value := event.Payload.(type) {
+	case ObservationPayload:
+		if event.Kind != "observation" {
+			return errors.New("event payload type does not match its kind")
+		}
+		return validateObservationV1(event, value)
+	case TurnPayload:
+		if event.Kind != "turn" {
+			return errors.New("event payload type does not match its kind")
+		}
+		return validateTurnV1(event, value)
+	case ImportPayload:
+		if event.Kind != "import_batch" {
+			return errors.New("event payload type does not match its kind")
+		}
+		return validateImportEventV1(event, value)
+	default:
+		return fmt.Errorf("event kind %q has an unsupported producer payload type", event.Kind)
+	}
+}
+
+func validateEventEnvelopeV1(event Event, filename, machineID string) error {
+	digest, ok := eventDigest(event.ID)
+	if event.Schema != Protocol || !ok || filename != digest+".json" {
+		return errors.New("invalid event schema, id, or filename")
+	}
+	if event.Kind == "" || len(event.Kind) > 64 || !utf8.ValidString(event.Kind) || !validEventTime(event.CapturedAt) {
+		return errors.New("event kind and captured_at are required")
+	}
+	if !validMachineID(event.Machine.ID) || event.Machine.ID != machineID ||
+		!validRequiredString(event.Machine.Hostname, MaxMachineHostname) {
+		return errors.New("event machine does not match the local identity")
+	}
+	if !validRequiredString(event.Client, MaxClient) ||
+		!validOptionalString(event.SessionID, MaxSessionID) || !validOptionalString(event.TurnID, MaxTurnID) {
+		return errors.New("invalid event client or session identifiers")
+	}
+	if !validRequiredString(event.Source.Kind, MaxSourceKind) ||
+		!validRequiredString(event.Source.Locator, MaxSourceLocator) {
+		return errors.New("event source is incomplete")
+	}
+	return nil
+}
+
+func validateObservationV1(event Event, value ObservationPayload) error {
+	if event.SessionID != "" || event.TurnID != "" {
+		return errors.New("observation cannot carry session or turn identifiers")
+	}
+	if !validRequiredString(value.Text, MaxTextBytes) {
+		return errors.New("invalid observation payload")
+	}
+	expected, err := observationEventID(event.Machine.ID, event.Client, value)
+	if err != nil || event.ID != expected {
+		return errors.New("observation semantic id mismatch")
+	}
+	return nil
+}
+
+func validateTurnV1(event Event, value TurnPayload) error {
+	if (value.Prompt == "" && value.Response == "") ||
+		!validOptionalString(value.Prompt, MaxTextBytes) || !validOptionalString(value.Response, MaxTextBytes) ||
+		!validOptionalString(value.CWD, MaxCWD) || !validOptionalString(value.Model, MaxModel) {
+		return errors.New("invalid turn payload")
+	}
+	expected, err := turnEventID(event.Machine.ID, event.Client, event.SessionID, event.TurnID, value)
+	if err != nil || event.ID != expected {
+		return errors.New("turn semantic id mismatch")
+	}
+	return nil
+}
+
+func validateImportEventV1(event Event, value ImportPayload) error {
+	if event.SessionID != "" || event.TurnID != "" {
+		return errors.New("import batch cannot carry session or turn identifiers")
+	}
+	if err := validateImportPayload(value); err != nil {
+		return err
+	}
+	expected, err := importEventID(value.Items)
+	if err != nil || event.ID != expected {
+		return errors.New("import batch semantic id mismatch")
 	}
 	return nil
 }
@@ -306,12 +378,13 @@ func validEventTime(value time.Time) bool {
 }
 
 func validateImportPayload(payload ImportPayload) error {
-	if payload.Source == "" || len(payload.Source) > MaxImportSource || len(payload.Items) == 0 || len(payload.Items) > MaxImportFiles {
+	if !validRequiredString(payload.Source, MaxImportSource) || len(payload.Items) == 0 || len(payload.Items) > MaxImportFiles {
 		return errors.New("invalid import source or item count")
 	}
 	total := 0
 	for _, item := range payload.Items {
-		if _, ok := eventDigest(item.ID); !ok || item.Path == "" || len(item.Content) > MaxImportText || !validLowerHex(item.SHA256, sha256.Size*2) {
+		if _, ok := eventDigest(item.ID); !ok || !validRequiredString(item.Path, MaxImportPath) ||
+			!validOptionalString(item.Content, MaxImportText) || !validLowerHex(item.SHA256, sha256.Size*2) {
 			return errors.New("invalid import item")
 		}
 		sum := sha256.Sum256([]byte(item.Content))
@@ -358,6 +431,14 @@ func validMachineID(value string) bool {
 		return false
 	}
 	return validLowerHex(value[:8]+value[9:13]+value[14:18]+value[19:23]+value[24:], 32)
+}
+
+func validRequiredString(value string, limit int) bool {
+	return value != "" && validOptionalString(value, limit)
+}
+
+func validOptionalString(value string, limit int) bool {
+	return utf8.ValidString(value) && len(value) <= limit
 }
 
 func boundString(value string, limit int) string {
