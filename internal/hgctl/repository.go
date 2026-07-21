@@ -58,7 +58,7 @@ func (a *App) initGit(ctx context.Context, state State) error {
 			return err
 		}
 	}
-	if err := a.ensureSharedBranch(ctx, state.RepoURL); err != nil {
+	if err := a.ensureRepositoryBranches(ctx, state.RepoURL); err != nil {
 		return err
 	}
 	if err := a.fetchEndpointRefs(ctx, state); err != nil {
@@ -66,6 +66,9 @@ func (a *App) initGit(ctx context.Context, state State) error {
 	}
 	if !gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/shared") {
 		return errors.New("remote branch shared does not exist")
+	}
+	if !gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/queue-template") {
+		return errors.New("remote branch queue-template does not exist")
 	}
 	if err := a.ensureWorktree(ctx, a.Paths.Vault, "shared", "origin/shared"); err != nil {
 		return err
@@ -156,7 +159,7 @@ func queueStartRef(ctx context.Context, control, branch string) string {
 	if gitRefExists(ctx, control, remote) {
 		return "origin/" + branch
 	}
-	return "origin/main"
+	return "origin/queue-template"
 }
 
 func gitRefExists(ctx context.Context, dir, ref string) bool {
@@ -169,6 +172,7 @@ func (a *App) fetchEndpointRefs(ctx context.Context, state State) error {
 	refspecs := []string{
 		"+refs/heads/main:refs/remotes/origin/main",
 		"+refs/heads/shared:refs/remotes/origin/shared",
+		"+refs/heads/queue-template:refs/remotes/origin/queue-template",
 	}
 	exists := gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+state.QueueBranch)
 	if !exists {

@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-func TestSharedBootstrapNoopsWhenTheBranchExists(t *testing.T) {
+func TestRepositoryBootstrapNoopsWhenTheBranchesExist(t *testing.T) {
 	checks := 0
 	triggered := false
-	err := ensureSharedBranchWith(context.Background(), sharedBootstrapOperations{
+	err := ensureRepositoryBranchesWith(context.Background(), repositoryBootstrapOperations{
 		branchExists: func(context.Context) (bool, error) {
 			checks++
 			return true, nil
@@ -35,11 +35,11 @@ func TestSharedBootstrapNoopsWhenTheBranchExists(t *testing.T) {
 	}
 }
 
-func TestSharedBootstrapTriggersOnceAndWaitsForPublication(t *testing.T) {
+func TestRepositoryBootstrapTriggersOnceAndWaitsForPublication(t *testing.T) {
 	checks := 0
 	triggers := 0
 	waits := 0
-	err := ensureSharedBranchWith(context.Background(), sharedBootstrapOperations{
+	err := ensureRepositoryBranchesWith(context.Background(), repositoryBootstrapOperations{
 		branchExists: func(context.Context) (bool, error) {
 			checks++
 			return checks == 3, nil
@@ -61,10 +61,10 @@ func TestSharedBootstrapTriggersOnceAndWaitsForPublication(t *testing.T) {
 	}
 }
 
-func TestSharedBootstrapHonorsCancellationWhilePolling(t *testing.T) {
+func TestRepositoryBootstrapHonorsCancellationWhilePolling(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	waits := 0
-	err := ensureSharedBranchWith(ctx, sharedBootstrapOperations{
+	err := ensureRepositoryBranchesWith(ctx, repositoryBootstrapOperations{
 		branchExists: func(context.Context) (bool, error) { return false, nil },
 		trigger:      func(context.Context) error { return nil },
 		wait: func(context.Context, time.Duration) error {
@@ -78,7 +78,7 @@ func TestSharedBootstrapHonorsCancellationWhilePolling(t *testing.T) {
 	}
 }
 
-func TestTriggerSharedBootstrapUsesAuthenticatedDefaultBranchWorkflow(t *testing.T) {
+func TestTriggerRepositoryBootstrapUsesAuthenticatedDefaultBranchWorkflow(t *testing.T) {
 	bin := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "gh.log")
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HGCTL_GH_LOG\"\n"
@@ -87,7 +87,7 @@ func TestTriggerSharedBootstrapUsesAuthenticatedDefaultBranchWorkflow(t *testing
 	}
 	t.Setenv("PATH", bin)
 	t.Setenv("HGCTL_GH_LOG", logPath)
-	if err := triggerSharedBootstrap(context.Background(), "git@github.com:x2x3studio/hourglass.git"); err != nil {
+	if err := triggerRepositoryBootstrap(context.Background(), "git@github.com:x2x3studio/hourglass.git"); err != nil {
 		t.Fatal(err)
 	}
 	content, err := os.ReadFile(logPath)
@@ -103,8 +103,8 @@ func TestTriggerSharedBootstrapUsesAuthenticatedDefaultBranchWorkflow(t *testing
 	}
 }
 
-func TestTriggerSharedBootstrapRejectsUnsupportedRemote(t *testing.T) {
-	if err := triggerSharedBootstrap(context.Background(), "/tmp/hourglass.git"); err == nil {
+func TestTriggerRepositoryBootstrapRejectsUnsupportedRemote(t *testing.T) {
+	if err := triggerRepositoryBootstrap(context.Background(), "/tmp/hourglass.git"); err == nil {
 		t.Fatal("accepted a non-GitHub remote for automatic bootstrap")
 	}
 }

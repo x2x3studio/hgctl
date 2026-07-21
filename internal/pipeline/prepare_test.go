@@ -20,9 +20,10 @@ import (
 const secondTestMachine = "223e4567-e89b-42d3-b456-426614174000"
 
 type prepareFixture struct {
-	repository string
-	main       string
-	prompt     string
+	repository    string
+	main          string
+	queueTemplate string
+	prompt        string
 }
 
 type fixtureEvent struct {
@@ -455,7 +456,7 @@ func TestPrepareIsolatesCursorOutsideBoundedAncestry(t *testing.T) {
 	fixture.updateShared(t, func() {
 		writeTestFile(t, fixture.repository, ".hourglass/cursors/"+testMachine, fixture.main+"\n")
 	})
-	parent := createLinearQueueHistory(t, fixture.repository, fixture.main, maxAncestryWindow+1)
+	parent := createLinearQueueHistory(t, fixture.repository, fixture.queueTemplate, maxAncestryWindow)
 	runTestGit(t, fixture.repository, "update-ref", "refs/remotes/origin/queue/"+testMachine, parent)
 
 	options := fixture.options(t, 0)
@@ -480,6 +481,28 @@ func TestPrepareIsolatesCursorOutsideBoundedAncestry(t *testing.T) {
 	}
 }
 
+func TestPrepareIsolatesQueueBasedOnMain(t *testing.T) {
+	fixture := newPrepareFixture(t)
+	event := makeObservationEvent(t, testMachine, "legacy main-based queue")
+	runTestGit(t, fixture.repository, "checkout", "-q", "-B", "legacy-queue", fixture.main)
+	writeTestFile(t, fixture.repository, event.path, string(event.content))
+	commitTestRepository(t, fixture.repository)
+	tip := strings.TrimSpace(runTestGit(t, fixture.repository, "rev-parse", "HEAD"))
+	runTestGit(t, fixture.repository, "update-ref", "refs/remotes/origin/queue/"+testMachine, tip)
+	runTestGit(t, fixture.repository, "checkout", "-q", "shared")
+
+	result, err := Prepare(context.Background(), fixture.options(t, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.HasWork || len(result.Manifest.Events) != 0 {
+		t.Fatalf("main-based queue produced work: %#v", result)
+	}
+	if len(result.Notices) != 1 || result.Notices[0].Reason != "queue-template-not-on-first-parent" {
+		t.Fatalf("main-based queue was not isolated: %#v", result.Notices)
+	}
+}
+
 func newPrepareFixture(t *testing.T) prepareFixture {
 	t.Helper()
 	repository := newTestRepository(t)
@@ -489,8 +512,15 @@ func newPrepareFixture(t *testing.T) prepareFixture {
 	main := strings.TrimSpace(runTestGit(t, repository, "rev-parse", "HEAD"))
 	runTestGit(t, repository, "update-ref", "refs/remotes/origin/main", main)
 
-	runTestGit(t, repository, "checkout", "-q", "-B", "shared")
-	runTestGit(t, repository, "rm", "-q", "control.txt")
+	runTestGit(t, repository, "checkout", "-q", "--orphan", "queue-template")
+	runTestGit(t, repository, "rm", "-q", "-f", "control.txt")
+	writeTestFile(t, repository, queueTemplateMarker, queueTemplateContent)
+	commitTestRepository(t, repository)
+	queueTemplate := strings.TrimSpace(runTestGit(t, repository, "rev-parse", "HEAD"))
+	runTestGit(t, repository, "update-ref", "refs/remotes/origin/queue-template", queueTemplate)
+
+	runTestGit(t, repository, "checkout", "-q", "--orphan", "shared")
+	runTestGit(t, repository, "rm", "-q", "-f", queueTemplateMarker)
 	writeTestFile(t, repository, ".gitignore", ".hourglass-runtime/\n")
 	writeTestFile(t, repository, "Home.md", "# Hourglass\n")
 	writeTestFile(t, repository, "Hourglass.canvas", `{"nodes":[],"edges":[]}`)
@@ -503,7 +533,7 @@ func newPrepareFixture(t *testing.T) prepareFixture {
 	if err := os.WriteFile(prompt, []byte("Reconcile durable evidence.\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return prepareFixture{repository: repository, main: main, prompt: prompt}
+	return prepareFixture{repository: repository, main: main, queueTemplate: queueTemplate, prompt: prompt}
 }
 
 func (fixture prepareFixture) options(t *testing.T, slot uint64) PrepareOptions {
@@ -520,7 +550,7 @@ func (fixture prepareFixture) options(t *testing.T, slot uint64) PrepareOptions 
 func (fixture prepareFixture) createQueue(t *testing.T, machine string, commits []map[string][]byte) []string {
 	t.Helper()
 	branch := "fixture-queue-" + machine
-	runTestGit(t, fixture.repository, "checkout", "-q", "-B", branch, fixture.main)
+	runTestGit(t, fixture.repository, "checkout", "-q", "-B", branch, fixture.queueTemplate)
 	result := make([]string, 0, len(commits))
 	for _, changes := range commits {
 		for name, content := range changes {
@@ -529,7 +559,7 @@ func (fixture prepareFixture) createQueue(t *testing.T, machine string, commits 
 		commitTestRepository(t, fixture.repository)
 		result = append(result, strings.TrimSpace(runTestGit(t, fixture.repository, "rev-parse", "HEAD")))
 	}
-	tip := fixture.main
+	tip := fixture.queueTemplate
 	if len(result) != 0 {
 		tip = result[len(result)-1]
 	}

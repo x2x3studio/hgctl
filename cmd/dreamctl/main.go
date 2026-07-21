@@ -24,11 +24,13 @@ func main() {
 
 func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) error {
 	if len(arguments) == 0 {
-		return errors.New("usage: dreamctl <bootstrap|prepare|finalize|apply>")
+		return errors.New("usage: dreamctl <bootstrap|bootstrap-queue|prepare|finalize|apply>")
 	}
 	switch arguments[0] {
 	case "bootstrap":
 		return runBootstrap(ctx, arguments[1:], stdout, stderr)
+	case "bootstrap-queue":
+		return runBootstrapQueue(ctx, arguments[1:], stdout, stderr)
 	case "prepare":
 		return runPrepare(ctx, arguments[1:], stdout, stderr)
 	case "finalize":
@@ -38,6 +40,32 @@ func run(ctx context.Context, arguments []string, stdout, stderr io.Writer) erro
 	default:
 		return fmt.Errorf("unknown command %q", arguments[0])
 	}
+}
+
+func runBootstrapQueue(ctx context.Context, arguments []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("bootstrap-queue", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	checkout := flags.String("checkout", "", "clean trusted control checkout")
+	controlSHA := flags.String("control-sha", os.Getenv("GITHUB_SHA"), "trusted control commit")
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("bootstrap-queue accepts flags only")
+	}
+	result, err := pipeline.BootstrapQueue(ctx, pipeline.BootstrapOptions{Checkout: *checkout, ControlSHA: *controlSHA})
+	if err != nil {
+		return err
+	}
+	if err := writeOutputs(map[string]string{"created": strconv.FormatBool(result.Created)}); err != nil {
+		return err
+	}
+	if result.Created {
+		_, err = fmt.Fprintln(stdout, "Generated queue template")
+	} else {
+		_, err = fmt.Fprintln(stdout, "Queue template already exists; nothing to do")
+	}
+	return err
 }
 
 func runBootstrap(ctx context.Context, arguments []string, stdout, stderr io.Writer) error {

@@ -43,6 +43,51 @@ func TestBootstrapCreatesAValidOrphanSharedProduct(t *testing.T) {
 	}
 }
 
+func TestBootstrapQueueCreatesExactOrphanTemplate(t *testing.T) {
+	repository, remote, mainCommit := newBootstrapRepository(t)
+	result, err := BootstrapQueue(context.Background(), BootstrapOptions{Checkout: repository, ControlSHA: mainCommit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Created {
+		t.Fatal("queue bootstrap reported a NOOP for a missing template")
+	}
+	commitTestRepository(t, repository)
+	commit := strings.TrimSpace(runTestGit(t, repository, "rev-parse", "HEAD"))
+	if err := validateQueueTemplate(context.Background(), gitRepository{directory: repository}, commit); err != nil {
+		t.Fatalf("generated queue template is invalid: %v", err)
+	}
+	if tree := strings.Fields(runTestGit(t, repository, "ls-tree", "-r", "--name-only", "HEAD")); len(tree) != 1 || tree[0] != queueTemplateMarker {
+		t.Fatalf("queue template tree = %v", tree)
+	}
+	runTestGit(t, repository, "push", "origin", "queue-template")
+	if branch := strings.TrimSpace(runTestGit(t, "", "--git-dir", remote, "rev-parse", "--verify", queueTemplateRef)); branch == "" {
+		t.Fatal("test did not publish queue template")
+	}
+}
+
+func TestBootstrapQueueNoopsWithoutMutatingWhenTemplateExists(t *testing.T) {
+	repository, remote, mainCommit := newBootstrapRepository(t)
+	if _, err := BootstrapQueue(context.Background(), BootstrapOptions{Checkout: repository, ControlSHA: mainCommit}); err != nil {
+		t.Fatal(err)
+	}
+	commitTestRepository(t, repository)
+	runTestGit(t, repository, "push", "origin", "queue-template")
+
+	clone := filepath.Join(t.TempDir(), "clone")
+	runTestGit(t, "", "clone", "--quiet", "--branch", "main", remote, clone)
+	result, err := BootstrapQueue(context.Background(), BootstrapOptions{Checkout: clone, ControlSHA: mainCommit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created {
+		t.Fatal("bootstrap recreated an existing queue template")
+	}
+	if branch := strings.TrimSpace(runTestGit(t, clone, "branch", "--show-current")); branch != "main" {
+		t.Fatalf("NOOP changed branch to %q", branch)
+	}
+}
+
 func TestBootstrapNoopsWithoutMutatingWhenSharedExists(t *testing.T) {
 	repository, remote, mainCommit := newBootstrapRepository(t)
 	if _, err := Bootstrap(context.Background(), BootstrapOptions{Checkout: repository, ControlSHA: mainCommit}); err != nil {

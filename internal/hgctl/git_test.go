@@ -42,6 +42,7 @@ func TestGitQueueAndSharedWorktrees(t *testing.T) {
 	runGitTest(t, seed, "add", "-A")
 	runGitTest(t, seed, "commit", "-m", "shared")
 	runGitTest(t, seed, "push", "origin", "shared")
+	seedQueueTemplate(t, seed)
 	runGitTest(t, "", "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/main")
 
 	app := testApp(t)
@@ -176,6 +177,7 @@ func TestFailedPushKeepsOutboxForRetry(t *testing.T) {
 	runGitTest(t, seed, "add", "-A")
 	runGitTest(t, seed, "commit", "-m", "shared")
 	runGitTest(t, seed, "push", "origin", "shared")
+	seedQueueTemplate(t, seed)
 
 	app := testApp(t)
 	id, err := app.loadIdentity()
@@ -259,8 +261,11 @@ func TestQueueNeverMergesMainAndSkipsNoopPush(t *testing.T) {
 		t.Fatalf("no-op sync pushed: body=%q err=%v", body, err)
 	}
 	tree := runGitTest(t, "", "--git-dir", fixture.remote, "ls-tree", "-r", "--name-only", queueRef)
-	if strings.Contains(tree, "control-v2") {
-		t.Fatal("queue branch absorbed a later main commit")
+	if strings.Contains(tree, "README.md") || strings.Contains(tree, "control-v2") {
+		t.Fatalf("queue branch inherited control-plane files:\n%s", tree)
+	}
+	if !strings.Contains(tree, ".hourglass-queue") {
+		t.Fatal("queue branch does not descend from the queue template")
 	}
 }
 
@@ -415,15 +420,15 @@ func TestQueueStagesOnlyValidatedTargetsAndRecoversOwnTemps(t *testing.T) {
 	if err := fixture.app.enqueue(second); err != nil {
 		t.Fatal(err)
 	}
-	readme := filepath.Join(fixture.app.Paths.Queue, "README.md")
-	if err := os.WriteFile(readme, []byte("user edit\n"), 0o600); err != nil {
+	marker := filepath.Join(fixture.app.Paths.Queue, ".hourglass-queue")
+	if err := os.WriteFile(marker, []byte("user edit\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	err = fixture.app.sync(testContext(t))
 	if err == nil || !strings.Contains(err.Error(), "tracked worktree changes") {
 		t.Fatalf("tracked queue edit was not rejected: %v", err)
 	}
-	if err := os.WriteFile(readme, []byte("control\n"), 0o600); err != nil {
+	if err := os.WriteFile(marker, []byte("hourglass.queue-template/v1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := fixture.app.sync(testContext(t)); err != nil {
@@ -745,6 +750,7 @@ func newGitFixture(t *testing.T) gitFixture {
 	runGitTest(t, seed, "add", "-A")
 	runGitTest(t, seed, "commit", "-m", "shared")
 	runGitTest(t, seed, "push", "origin", "shared")
+	seedQueueTemplate(t, seed)
 	runGitTest(t, "", "--git-dir", remote, "symbolic-ref", "HEAD", "refs/heads/main")
 
 	app := testApp(t)
@@ -761,4 +767,16 @@ func newGitFixture(t *testing.T) gitFixture {
 	}
 	markCurrentIndexForTest(t, app)
 	return gitFixture{app: app, id: id, state: state, remote: remote, seed: seed}
+}
+
+func seedQueueTemplate(t *testing.T, repository string) {
+	t.Helper()
+	runGitTest(t, repository, "checkout", "--orphan", "queue-template")
+	runGitTest(t, repository, "rm", "-rf", "--ignore-unmatch", "--", ".")
+	if err := os.WriteFile(filepath.Join(repository, ".hourglass-queue"), []byte("hourglass.queue-template/v1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, repository, "add", ".hourglass-queue")
+	runGitTest(t, repository, "commit", "-m", "queue template")
+	runGitTest(t, repository, "push", "origin", "queue-template")
 }

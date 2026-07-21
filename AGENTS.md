@@ -30,6 +30,8 @@ language-neutral code points when needed.
 - Only `sync` writes Git. It appends to `queue/<machine-id>` and
   fast-forwards the local `shared` worktree. It never commits to `main` or
   `shared`.
+- Every new machine queue starts from the exact machine-neutral orphan
+  `queue-template` branch, never from `main` or `shared`.
 - Use an OS-released advisory lock for sync. Process death must not leave a
   logical lock or require manual cleanup.
 - Never scan source Git history or bulk-copy transcript stores and tool output.

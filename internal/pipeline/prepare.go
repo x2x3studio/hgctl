@@ -88,7 +88,7 @@ type preparePlanner struct {
 	sharedContents   map[string][]byte
 	seen             map[string]string
 	rejected         map[string]rejectionEntry
-	mainCommits      map[string]struct{}
+	queueTemplate    string
 	semanticMachine  string
 	runSeen          map[string]struct{}
 	events           []preparedEvent
@@ -151,13 +151,12 @@ func Prepare(ctx context.Context, options PrepareOptions) (result PrepareResult,
 	}
 	promptRecord := fileRecord("prompt.md", promptContent)
 
-	mainChain, err := boundedFirstParentChain(ctx, repository, mainRevision.Commit)
+	queueTemplate, err := repository.revision(ctx, "origin/queue-template")
 	if err != nil {
-		return PrepareResult{}, fmt.Errorf("read bounded main ancestry: %w", err)
+		return PrepareResult{}, fmt.Errorf("resolve origin/queue-template: %w", err)
 	}
-	mainCommits := make(map[string]struct{}, len(mainChain))
-	for _, commit := range mainChain {
-		mainCommits[commit] = struct{}{}
+	if err := validateQueueTemplate(ctx, repository, queueTemplate.Commit); err != nil {
+		return PrepareResult{}, fmt.Errorf("validate queue template: %w", err)
 	}
 	queues, queueTips, notices, err := discoverQueues(ctx, repository)
 	if err != nil {
@@ -165,7 +164,7 @@ func Prepare(ctx context.Context, options PrepareOptions) (result PrepareResult,
 	}
 	planner := preparePlanner{
 		repository: repository, sharedContents: sharedContents, seen: sharedControl.seen.entries,
-		rejected: sharedControl.rejections.entries, mainCommits: mainCommits,
+		rejected: sharedControl.rejections.entries, queueTemplate: queueTemplate.Commit,
 		runSeen: make(map[string]struct{}), cursors: make(map[string]string),
 		rejections: make(map[string]RejectionOperation), notices: notices,
 	}
@@ -334,10 +333,51 @@ func boundedFirstParentChain(ctx context.Context, repository gitRepository, tip 
 	return chain, nil
 }
 
+func validateQueueTemplate(ctx context.Context, repository gitRepository, commit string) error {
+	lineage, err := repository.run(ctx, 256, "rev-list", "--parents", "-n", "1", commit)
+	if err != nil {
+		return err
+	}
+	if fields := strings.Fields(string(lineage)); len(fields) != 1 || fields[0] != commit {
+		return errors.New("queue template is not an orphan commit")
+	}
+	output, err := repository.run(ctx, 4096, "ls-tree", "-r", "-z", commit)
+	if err != nil {
+		return err
+	}
+	entries, err := parseTree(output)
+	if err != nil || len(entries) != 1 {
+		return errors.New("queue template tree is not exact")
+	}
+	entry := entries[0]
+	if entry.Path != queueTemplateMarker || entry.Mode != "100644" || entry.Type != "blob" {
+		return errors.New("queue template marker is invalid")
+	}
+	content, err := repository.run(ctx, len(queueTemplateContent)+1, "cat-file", "blob", entry.Object)
+	if err != nil {
+		return err
+	}
+	if string(content) != queueTemplateContent {
+		return errors.New("queue template marker content is invalid")
+	}
+	return nil
+}
+
 func (planner *preparePlanner) planQueue(ctx context.Context, queue queueReference) {
 	chain, err := boundedFirstParentChain(ctx, planner.repository, queue.tip)
 	if err != nil {
 		planner.isolate(queue.machine, queue.tip, "unreadable-bounded-ancestry")
+		return
+	}
+	templateIndex := -1
+	for index, commit := range chain {
+		if commit == planner.queueTemplate {
+			templateIndex = index
+			break
+		}
+	}
+	if templateIndex < 0 {
+		planner.isolate(queue.machine, queue.tip, "queue-template-not-on-first-parent")
 		return
 	}
 	cursor := ""
@@ -345,16 +385,7 @@ func (planner *preparePlanner) planQueue(ctx context.Context, queue queueReferen
 	if content, exists := planner.sharedContents[cursorPath]; exists {
 		cursor = strings.TrimSuffix(string(content), "\n")
 	} else {
-		for _, commit := range chain {
-			if _, onMain := planner.mainCommits[commit]; onMain {
-				cursor = commit
-				break
-			}
-		}
-		if cursor == "" {
-			planner.isolate(queue.machine, queue.tip, "base-outside-ancestry-window")
-			return
-		}
+		cursor = planner.queueTemplate
 	}
 	cursorIndex := -1
 	for index, commit := range chain {

@@ -101,6 +101,11 @@ The event protocol contains only `turn`, `observation`, and
 commits, pushes only the machine branch, requests reconciliation, pulls
 `shared`, and reindexes Basic Memory only after a fast-forward.
 
+Repository bootstrap also creates a machine-neutral orphan `queue-template`
+whose tree contains only `.hourglass-queue`. A new machine queue starts from
+that exact commit rather than inheriting `main` or `shared`; all later commits
+are append-only event commits.
+
 ## Release artifacts
 
 GoReleaser publishes:

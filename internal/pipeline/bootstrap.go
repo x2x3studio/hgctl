@@ -15,6 +15,9 @@ import (
 const (
 	bootstrapGitOutputLimit = 8 * 1024 * 1024
 	sharedRef               = "refs/heads/shared"
+	queueTemplateRef        = "refs/heads/queue-template"
+	queueTemplateMarker     = ".hourglass-queue"
+	queueTemplateContent    = "hourglass.queue-template/v1\n"
 )
 
 type BootstrapOptions struct {
@@ -24,6 +27,38 @@ type BootstrapOptions struct {
 
 type BootstrapResult struct {
 	Created bool
+}
+
+// BootstrapQueue creates the machine-neutral orphan root for endpoint queues.
+func BootstrapQueue(ctx context.Context, options BootstrapOptions) (BootstrapResult, error) {
+	checkout, repository, err := bootstrapRepository(ctx, options)
+	if err != nil {
+		return BootstrapResult{}, err
+	}
+	exists, err := remoteRefExists(ctx, repository, queueTemplateRef)
+	if err != nil {
+		return BootstrapResult{}, err
+	}
+	if exists {
+		return BootstrapResult{Created: false}, nil
+	}
+	if err := verifyTrustedBootstrapCheckout(ctx, repository, options.ControlSHA); err != nil {
+		return BootstrapResult{}, err
+	}
+	if _, err := repository.run(ctx, bootstrapGitOutputLimit, "checkout", "--orphan", "queue-template"); err != nil {
+		return BootstrapResult{}, fmt.Errorf("create local queue template branch: %w", err)
+	}
+	if _, err := repository.run(ctx, bootstrapGitOutputLimit, "rm", "-rf", "--ignore-unmatch", "--", "."); err != nil {
+		return BootstrapResult{}, fmt.Errorf("clear control files from queue template branch: %w", err)
+	}
+	files := map[string][]byte{queueTemplateMarker: []byte(queueTemplateContent)}
+	if err := writeBootstrapFile(filepath.Join(checkout, queueTemplateMarker), files[queueTemplateMarker]); err != nil {
+		return BootstrapResult{}, fmt.Errorf("write queue template marker: %w", err)
+	}
+	if err := verifyBootstrapTree(checkout, files); err != nil {
+		return BootstrapResult{}, err
+	}
+	return BootstrapResult{Created: true}, nil
 }
 
 type bootstrapCanvas struct {
@@ -52,31 +87,11 @@ type bootstrapEdge struct {
 }
 
 func Bootstrap(ctx context.Context, options BootstrapOptions) (BootstrapResult, error) {
-	if options.Checkout == "" {
-		return BootstrapResult{}, errors.New("bootstrap checkout is required")
-	}
-	checkout, err := filepath.Abs(options.Checkout)
+	checkout, repository, err := bootstrapRepository(ctx, options)
 	if err != nil {
-		return BootstrapResult{}, fmt.Errorf("resolve bootstrap checkout: %w", err)
+		return BootstrapResult{}, err
 	}
-	checkout, err = filepath.EvalSymlinks(checkout)
-	if err != nil {
-		return BootstrapResult{}, fmt.Errorf("resolve bootstrap checkout links: %w", err)
-	}
-	repository := gitRepository{directory: checkout}
-	top, err := repository.run(ctx, product.MaxPathBytes, "rev-parse", "--show-toplevel")
-	if err != nil {
-		return BootstrapResult{}, fmt.Errorf("verify bootstrap checkout: %w", err)
-	}
-	resolvedTop, err := filepath.Abs(strings.TrimSpace(string(top)))
-	if err == nil {
-		resolvedTop, err = filepath.EvalSymlinks(resolvedTop)
-	}
-	if err != nil || filepath.Clean(resolvedTop) != filepath.Clean(checkout) {
-		return BootstrapResult{}, errors.New("bootstrap checkout must be the repository root")
-	}
-
-	exists, err := remoteSharedExists(ctx, repository)
+	exists, err := remoteRefExists(ctx, repository, sharedRef)
 	if err != nil {
 		return BootstrapResult{}, err
 	}
@@ -84,19 +99,8 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (BootstrapResult, 
 		return BootstrapResult{Created: false}, nil
 	}
 
-	revision, err := repository.revision(ctx, "HEAD")
-	if err != nil {
-		return BootstrapResult{}, fmt.Errorf("read trusted bootstrap revision: %w", err)
-	}
-	if options.ControlSHA == "" || revision.Commit != options.ControlSHA {
-		return BootstrapResult{}, errors.New("bootstrap checkout does not match the trusted control revision")
-	}
-	status, err := repository.run(ctx, bootstrapGitOutputLimit, "status", "--porcelain=v1", "-z", "--untracked-files=all")
-	if err != nil {
-		return BootstrapResult{}, fmt.Errorf("inspect bootstrap checkout: %w", err)
-	}
-	if len(status) != 0 {
-		return BootstrapResult{}, errors.New("bootstrap checkout is not clean")
+	if err := verifyTrustedBootstrapCheckout(ctx, repository, options.ControlSHA); err != nil {
+		return BootstrapResult{}, err
 	}
 	if _, err := repository.run(ctx, bootstrapGitOutputLimit, "checkout", "--orphan", "shared"); err != nil {
 		return BootstrapResult{}, fmt.Errorf("create local shared branch: %w", err)
@@ -118,6 +122,51 @@ func Bootstrap(ctx context.Context, options BootstrapOptions) (BootstrapResult, 
 		return BootstrapResult{}, err
 	}
 	return BootstrapResult{Created: true}, nil
+}
+
+func bootstrapRepository(ctx context.Context, options BootstrapOptions) (string, gitRepository, error) {
+	if options.Checkout == "" {
+		return "", gitRepository{}, errors.New("bootstrap checkout is required")
+	}
+	checkout, err := filepath.Abs(options.Checkout)
+	if err != nil {
+		return "", gitRepository{}, fmt.Errorf("resolve bootstrap checkout: %w", err)
+	}
+	checkout, err = filepath.EvalSymlinks(checkout)
+	if err != nil {
+		return "", gitRepository{}, fmt.Errorf("resolve bootstrap checkout links: %w", err)
+	}
+	repository := gitRepository{directory: checkout}
+	top, err := repository.run(ctx, product.MaxPathBytes, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", gitRepository{}, fmt.Errorf("verify bootstrap checkout: %w", err)
+	}
+	resolvedTop, err := filepath.Abs(strings.TrimSpace(string(top)))
+	if err == nil {
+		resolvedTop, err = filepath.EvalSymlinks(resolvedTop)
+	}
+	if err != nil || filepath.Clean(resolvedTop) != filepath.Clean(checkout) {
+		return "", gitRepository{}, errors.New("bootstrap checkout must be the repository root")
+	}
+	return checkout, repository, nil
+}
+
+func verifyTrustedBootstrapCheckout(ctx context.Context, repository gitRepository, controlSHA string) error {
+	revision, err := repository.revision(ctx, "HEAD")
+	if err != nil {
+		return fmt.Errorf("read trusted bootstrap revision: %w", err)
+	}
+	if controlSHA == "" || revision.Commit != controlSHA {
+		return errors.New("bootstrap checkout does not match the trusted control revision")
+	}
+	status, err := repository.run(ctx, bootstrapGitOutputLimit, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if err != nil {
+		return fmt.Errorf("inspect bootstrap checkout: %w", err)
+	}
+	if len(status) != 0 {
+		return errors.New("bootstrap checkout is not clean")
+	}
+	return nil
 }
 
 func writeBootstrapFile(name string, content []byte) error {
@@ -145,17 +194,17 @@ func writeBootstrapFile(name string, content []byte) error {
 	return nil
 }
 
-func remoteSharedExists(ctx context.Context, repository gitRepository) (bool, error) {
-	output, err := repository.run(ctx, 256, "ls-remote", "--heads", "origin", sharedRef)
+func remoteRefExists(ctx context.Context, repository gitRepository, ref string) (bool, error) {
+	output, err := repository.run(ctx, 256, "ls-remote", "--heads", "origin", ref)
 	if err != nil {
-		return false, fmt.Errorf("inspect remote shared branch: %w", err)
+		return false, fmt.Errorf("inspect remote branch %s: %w", ref, err)
 	}
 	if len(output) == 0 {
 		return false, nil
 	}
 	fields := strings.Fields(string(output))
-	if len(fields) != 2 || !commitPattern.MatchString(fields[0]) || fields[1] != sharedRef {
-		return false, errors.New("remote returned an invalid shared branch advertisement")
+	if len(fields) != 2 || !commitPattern.MatchString(fields[0]) || fields[1] != ref {
+		return false, errors.New("remote returned an invalid branch advertisement")
 	}
 	return true, nil
 }
