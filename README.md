@@ -18,6 +18,8 @@ endpoint integration; GitHub Actions owns Dream; Basic Memory owns local recall.
   expose recall through the read-only `hgctl recall` command;
 - capture bounded turns and explicit observations in an atomic local outbox;
 - commit and push only `queue/<machine-id>` and fast-forward only `shared`;
+- request the trusted default-branch bootstrap workflow when a fresh repository
+  has no `shared`, then wait under a fixed deadline;
 - initialize existing durable memory through deterministic import batches;
 - periodically sync and check GitHub Releases for a newer binary;
 - uninstall integration without deleting knowledge or machine identity.
@@ -91,9 +93,11 @@ export PATH="$HOME/.local/bin:$PATH"
 uv tool install basic-memory
 ```
 
-Run `gh auth login` once if GitHub CLI is not already authenticated. Basic
-Memory's isolated Python environment is replaceable local index machinery;
-`hgctl` itself is one static Go binary and never invokes a project venv.
+Run `gh auth login` once if GitHub CLI is not already authenticated. The active
+account must be able to read the private Hourglass repository and dispatch its
+Actions workflows. Basic Memory's isolated Python environment is replaceable
+local index machinery; `hgctl` itself is one static Go binary and never invokes
+a project venv.
 
 Download the release asset matching the machine and verify the published
 checksum:
@@ -122,6 +126,12 @@ On the first machine only, bootstrap the current checkout of the old vault:
 
 Every later machine uses the first command without `--import`. Open
 `~/hourglass-vault` in Obsidian as a view and leave Obsidian Git sync disabled.
+If this is a fresh Hourglass repository, `install` first detects that `shared`
+is absent, uses authenticated `gh` to dispatch `bootstrap.yml` from the
+repository default branch, and polls for at most five minutes. The trusted
+self-hosted workflow creates the initial product; `hgctl` only fetches it and
+never commits or pushes `shared`. Concurrent first installs are safe because
+the workflow is serialized and NOOPs after the branch appears.
 `hgctl` asks Codex's official app-server to discover and trust only the three
 exact user hooks it just installed; it never computes a trust hash or edits
 Codex TOML itself. Installation reports failure if Codex cannot prove the hooks
@@ -131,9 +141,10 @@ at most once every six hours; `hgctl doctor` repeats discovery read-only.
 
 `install` has two phases:
 
-1. **Read initialization:** clone the control branch, create the shared and
-   queue worktrees, fast-forward `shared`, configure Basic Memory, start the
-   recovery scheduler, and then install the client adapters.
+1. **Read initialization:** clone the control branch, request bounded server-side
+   bootstrap if `shared` is missing, create the shared and queue worktrees,
+   fast-forward `shared`, configure Basic Memory, start the recovery scheduler,
+   and then install the client adapters.
 2. **Backfill:** after the recovery path is active, discover existing durable
    agent memory and optionally import an existing vault's current checkout.
    Imported Markdown enters the same machine queue as every later event; it

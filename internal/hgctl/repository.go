@@ -58,6 +58,9 @@ func (a *App) initGit(ctx context.Context, state State) error {
 			return err
 		}
 	}
+	if err := a.ensureSharedBranch(ctx, state.RepoURL); err != nil {
+		return err
+	}
 	if err := a.fetchEndpointRefs(ctx, state); err != nil {
 		return err
 	}
