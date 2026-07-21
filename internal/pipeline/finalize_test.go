@@ -92,6 +92,24 @@ func TestFinalizeAllowsCanvasOnlyTopologyRepair(t *testing.T) {
 	}
 }
 
+func TestFinalizeAllowsHomeWithCanvasTopologyRepair(t *testing.T) {
+	fixture := newFinalizeFixture(t, true)
+	if err := os.Remove(filepath.Join(fixture.modelRoot, "workspace", filepath.FromSlash(fixture.newNotePath))); err != nil {
+		t.Fatal(err)
+	}
+	writeFinalizeFile(t, fixture.modelRoot, "workspace/Home.md", "# Current agent entry point\n")
+	writeFinalizeFile(t, fixture.modelRoot, "workspace/Hourglass.canvas", `{"nodes":[{"id":"topology","type":"text","text":"Current topology","x":0,"y":0,"width":300,"height":200}],"edges":[]}`)
+
+	manifest, err := Finalize(fixture.modelRoot, fixture.controlRoot, fixture.publicationRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := publicationPaths(manifest)
+	if !containsString(paths, "Home.md") || !containsString(paths, "Hourglass.canvas") || containsString(paths, fixture.newNotePath) {
+		t.Fatalf("publication paths=%v", paths)
+	}
+}
+
 func TestFinalizeRejectsHomeOnlyChange(t *testing.T) {
 	fixture := newFinalizeFixture(t, true)
 	if err := os.Remove(filepath.Join(fixture.modelRoot, "workspace", filepath.FromSlash(fixture.newNotePath))); err != nil {
@@ -100,7 +118,7 @@ func TestFinalizeRejectsHomeOnlyChange(t *testing.T) {
 	writeFinalizeFile(t, fixture.modelRoot, "workspace/Home.md", "# Changed navigation\n")
 
 	if _, err := Finalize(fixture.modelRoot, fixture.controlRoot, fixture.publicationRoot); err == nil ||
-		!strings.Contains(err.Error(), "Home.md changed without a sourced memory change") {
+		!strings.Contains(err.Error(), "Home.md changed without a sourced memory or topology change") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
