@@ -102,7 +102,7 @@ func notifyDream(ctx context.Context, remote string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, err := runCommand(ctx, "", "gh", "api", "--method", "POST", "repos/"+repo+"/dispatches", "-f", "event_type=hourglass_queue")
+	_, err := runCommand(ctx, "", "gh", "api", "--hostname", "github.com", "--method", "POST", "repos/"+repo+"/dispatches", "-f", "event_type=hourglass_queue")
 	return err
 }
 

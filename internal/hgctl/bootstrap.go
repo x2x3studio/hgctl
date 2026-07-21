@@ -77,7 +77,7 @@ func triggerSharedBootstrap(ctx context.Context, remote string) error {
 	if _, err := runCommand(ctx, "", "gh", "auth", "status", "--hostname", "github.com"); err != nil {
 		return fmt.Errorf("GitHub CLI authentication is not ready: %w", err)
 	}
-	if _, err := runCommand(ctx, "", "gh", "workflow", "run", sharedBootstrapWorkflow, "--repo", repository); err != nil {
+	if _, err := runCommand(ctx, "", "gh", "workflow", "run", sharedBootstrapWorkflow, "--repo", "github.com/"+repository); err != nil {
 		return fmt.Errorf("dispatch %s from the default branch: %w", sharedBootstrapWorkflow, err)
 	}
 	return nil

@@ -94,7 +94,7 @@ func TestTriggerSharedBootstrapUsesAuthenticatedDefaultBranchWorkflow(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "auth status --hostname github.com\nworkflow run bootstrap.yml --repo x2x3studio/hourglass\n"
+	want := "auth status --hostname github.com\nworkflow run bootstrap.yml --repo github.com/x2x3studio/hourglass\n"
 	if string(content) != want {
 		t.Fatalf("gh calls = %q, want %q", content, want)
 	}

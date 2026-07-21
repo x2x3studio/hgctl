@@ -98,10 +98,11 @@ export PATH="$HOME/.local/bin:$PATH"
 uv tool install basic-memory
 ```
 
-Run `gh auth login` once if GitHub CLI is not already authenticated. The active
-account must be able to read the private Hourglass repository and dispatch its
-Actions workflows. Basic Memory's isolated Python environment is replaceable
-local index machinery; `hgctl` itself is one static Go binary and never invokes
+Run `gh auth login --hostname github.com` once if GitHub CLI is not already
+authenticated. The account must be able to read the private Hourglass repository
+and dispatch its Actions workflows. Basic Memory's isolated Python environment
+is replaceable local index machinery; `hgctl` itself is one static Go binary and
+never invokes
 a project venv.
 
 Download the release asset matching the machine and verify the published
@@ -111,7 +112,7 @@ checksum:
 case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) exit 1 ;; esac
 case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=amd64 ;; *) exit 1 ;; esac
 asset="hgctl_${os}_${arch}"
-gh release download --repo x2x3studio/hgctl --pattern "$asset" --pattern checksums.txt
+gh release download --repo github.com/x2x3studio/hgctl --pattern "$asset" --pattern checksums.txt
 if command -v sha256sum >/dev/null; then
   grep "  ${asset}$" checksums.txt | sha256sum -c -
 else

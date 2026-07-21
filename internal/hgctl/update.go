@@ -382,7 +382,7 @@ func downloadAsset(ctx context.Context, url string, limit int64) ([]byte, error)
 }
 
 func ghAPI(ctx context.Context, accept, endpoint string, limit int64) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "gh", "api", "-H", "Accept: "+accept, endpoint)
+	cmd := exec.CommandContext(ctx, "gh", "api", "--hostname", "github.com", "-H", "Accept: "+accept, endpoint)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err

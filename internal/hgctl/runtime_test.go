@@ -2,6 +2,7 @@ package hgctl
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -470,6 +471,28 @@ func TestUpdateReceiptDoesNotRewriteInstallState(t *testing.T) {
 func TestReadLimitedRejectsOversizeResponse(t *testing.T) {
 	if _, err := readLimited(strings.NewReader("12345"), 4); err == nil {
 		t.Fatal("oversize response was accepted")
+	}
+}
+
+func TestGitHubAPIPinsGitHubDotCom(t *testing.T) {
+	bin := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "gh.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$HGCTL_GH_LOG\"\nprintf '{}'\n"
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HGCTL_GH_LOG", logPath)
+	if _, err := ghAPI(context.Background(), "application/vnd.github+json", "repos/x2x3studio/hgctl/releases/latest", 1024); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "api --hostname github.com -H Accept: application/vnd.github+json repos/x2x3studio/hgctl/releases/latest\n"
+	if string(content) != want {
+		t.Fatalf("gh call = %q, want %q", content, want)
 	}
 }
 
