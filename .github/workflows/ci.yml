@@ -16,7 +16,7 @@ concurrency:
 jobs:
   test:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, hgctl-ci]
+    runs-on: [self-hosted, Linux, X64, x2x3studio-paas]
     timeout-minutes: 10
     env:
       GIT_CONFIG_GLOBAL: /dev/null

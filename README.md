@@ -233,6 +233,5 @@ go vet ./...
 
 The companion repository is `x2x3studio/hourglass`.
 
-Repository operators provide dedicated self-hosted runner labels:
-`hgctl-ci` for tests and `hgctl-release` for tagged publishing. Keeping release
-jobs off a generic runner pool preserves the same trust boundary used by Dream.
+CI and release jobs target the trusted organization runner pool with labels
+`self-hosted`, `Linux`, `X64`, and `x2x3studio-paas`.

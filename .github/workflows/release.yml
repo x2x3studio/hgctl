@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: [self-hosted, hgctl-release]
+    runs-on: [self-hosted, Linux, X64, x2x3studio-paas]
     timeout-minutes: 15
     env:
       GIT_CONFIG_GLOBAL: /dev/null
