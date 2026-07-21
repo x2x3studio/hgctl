@@ -16,7 +16,11 @@ import (
 	"time"
 )
 
-const updateInterval = 5 * time.Minute
+const (
+	updateInterval           = 5 * time.Minute
+	updateCheckSchemaVersion = 1
+	maxCandidateVersionBytes = 4 * 1024
+)
 
 const (
 	maxReleaseBinaryBytes = 64 * 1024 * 1024
@@ -35,22 +39,23 @@ type releaseAsset struct {
 }
 
 type updateCheck struct {
-	CheckedAt time.Time `json:"checked_at"`
+	SchemaVersion int       `json:"schema_version"`
+	CheckedAt     time.Time `json:"checked_at"`
 }
 
 func (a *App) update(ctx context.Context, force bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	updateLocked := func() error {
-		var previous updateCheck
-		if err := readJSON(a.Paths.UpdateCheck, &previous); err != nil && !errors.Is(err, os.ErrNotExist) {
+		previous, err := a.loadUpdateCheck()
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		now := a.Now().UTC()
 		if !force && !previous.CheckedAt.IsZero() && now.Sub(previous.CheckedAt) < updateInterval {
 			return nil
 		}
-		if err := writeJSONAtomic(a.Paths.UpdateCheck, updateCheck{CheckedAt: now}, 0o600); err != nil {
+		if err := a.saveUpdateCheck(updateCheck{CheckedAt: now}); err != nil {
 			return err
 		}
 
@@ -98,19 +103,7 @@ func (a *App) update(ctx context.Context, force bool) error {
 		if !strings.EqualFold(actual, expected) {
 			return fmt.Errorf("checksum mismatch for %s", binaryName)
 		}
-		version := strings.TrimPrefix(rel.TagName, "v")
-		target := filepath.Join(a.Paths.Versions, version, "hgctl")
-		if err := writeFileAtomic(target, binary, 0o755); err != nil {
-			return err
-		}
-		if err := os.MkdirAll(a.Paths.Bin, 0o755); err != nil {
-			return err
-		}
-		link := filepath.Join(a.Paths.Bin, "hgctl")
-		if info, err := os.Lstat(link); err == nil && info.Mode()&os.ModeSymlink != 0 && !managedStableSymlink(link, a.Paths.Versions) {
-			return fmt.Errorf("refusing to replace unmanaged symlink %s", link)
-		}
-		if err := replaceStableSymlink(link, target); err != nil {
+		if err := a.installReleaseBinary(ctx, rel.TagName, binary); err != nil {
 			return err
 		}
 		_, err = fmt.Fprintf(a.Out, "updated hgctl to %s\n", rel.TagName)
@@ -120,6 +113,126 @@ func (a *App) update(ctx context.Context, force bool) error {
 		return withFileLockWait(ctx, a.Paths.UpdateLock, updateLocked)
 	}
 	return withFileLock(a.Paths.UpdateLock, updateLocked)
+}
+
+func (a *App) loadUpdateCheck() (updateCheck, error) {
+	var check updateCheck
+	if err := readJSON(a.Paths.UpdateCheck, &check); err != nil {
+		return updateCheck{}, err
+	}
+	migrated, err := migrateSchemaVersion(a.Paths.UpdateCheck, &check.SchemaVersion, updateCheckSchemaVersion)
+	if err != nil {
+		return updateCheck{}, err
+	}
+	if migrated {
+		if err := writeJSONAtomic(a.Paths.UpdateCheck, check, 0o600); err != nil {
+			return updateCheck{}, err
+		}
+	}
+	return check, nil
+}
+
+func (a *App) saveUpdateCheck(check updateCheck) error {
+	check.SchemaVersion = updateCheckSchemaVersion
+	return writeJSONAtomic(a.Paths.UpdateCheck, check, 0o600)
+}
+
+func (a *App) installReleaseBinary(ctx context.Context, tag string, content []byte) error {
+	if _, err := parseSemanticVersion(tag); err != nil {
+		return fmt.Errorf("release tag: %w", err)
+	}
+	version := strings.TrimPrefix(tag, "v")
+	targetDir := filepath.Join(a.Paths.Versions, version)
+	target := filepath.Join(targetDir, "hgctl")
+	link := filepath.Join(a.Paths.Bin, "hgctl")
+	if info, err := os.Lstat(link); err == nil {
+		if info.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("refusing to replace non-symlink %s", link)
+		}
+		if !managedStableSymlink(link, a.Paths.Versions) {
+			return fmt.Errorf("refusing to replace unmanaged symlink %s", link)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	candidate, err := writeExecutableTemp(targetDir, content)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(candidate)
+	if err := verifyCandidateVersion(ctx, candidate, tag); err != nil {
+		return err
+	}
+	if err := os.Rename(candidate, target); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(a.Paths.Bin, 0o755); err != nil {
+		return err
+	}
+	return replaceStableSymlink(link, target)
+}
+
+func writeExecutableTemp(dir string, content []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(dir, ".hgctl-candidate-*")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(path)
+		}
+	}()
+	if err := f.Chmod(0o755); err != nil {
+		return "", err
+	}
+	if _, err := f.Write(content); err != nil {
+		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return path, nil
+}
+
+func verifyCandidateVersion(parent context.Context, path, tag string) error {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "version")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start release candidate: %w", err)
+	}
+	output, readErr := readLimited(stdout, maxCandidateVersionBytes)
+	if readErr != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	waitErr := cmd.Wait()
+	if readErr != nil {
+		return fmt.Errorf("read release candidate version: %w", readErr)
+	}
+	if waitErr != nil {
+		return fmt.Errorf("run release candidate version: %w", waitErr)
+	}
+	want := tag + "\n"
+	if string(output) != want {
+		return fmt.Errorf("release candidate version is %q; expected exact tag %q", strings.TrimSuffix(string(output), "\n"), tag)
+	}
+	return nil
 }
 
 func latestRelease(ctx context.Context) (release, error) {

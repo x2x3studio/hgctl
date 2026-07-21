@@ -52,6 +52,109 @@ func TestIdentityIsStableAndHostnameIsMetadata(t *testing.T) {
 	if first.Hostname == "" {
 		t.Fatal("hostname metadata is empty")
 	}
+	if first.SchemaVersion != identitySchemaVersion {
+		t.Fatalf("identity schema_version=%d", first.SchemaVersion)
+	}
+}
+
+func TestLegacyPersistedFilesMigrateToCurrentSchemas(t *testing.T) {
+	app := testApp(t)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	updated := time.Date(2025, 2, 3, 4, 5, 6, 0, time.UTC)
+	legacyIdentity := map[string]any{
+		"id": "00000000-0000-4000-8000-000000000000", "hostname": hostname,
+		"created_at": created, "updated_at": updated,
+	}
+	if err := writeJSONAtomic(app.Paths.Identity, legacyIdentity, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := app.loadIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.SchemaVersion != identitySchemaVersion || !identity.CreatedAt.Equal(created) || !identity.UpdatedAt.Equal(updated) {
+		t.Fatalf("migrated identity=%+v", identity)
+	}
+
+	legacyState := map[string]any{
+		"repo_url":     "git@github.com:x2x3studio/hourglass.git",
+		"queue_branch": "queue/00000000-0000-4000-8000-000000000000",
+		"basic_memory_project": map[string]any{
+			"external_id": "project-id", "path": app.Paths.Vault, "managed": true,
+		},
+	}
+	if err := writeJSONAtomic(app.Paths.State, legacyState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := app.loadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SchemaVersion != stateSchemaVersion || state.BasicMemoryProject == nil || state.BasicMemoryProject.ExternalID != "project-id" {
+		t.Fatalf("migrated state=%+v", state)
+	}
+
+	checkedAt := time.Date(2026, 6, 7, 8, 9, 10, 0, time.UTC)
+	if err := writeJSONAtomic(app.Paths.UpdateCheck, map[string]any{"checked_at": checkedAt}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check, err := app.loadUpdateCheck()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.SchemaVersion != updateCheckSchemaVersion || !check.CheckedAt.Equal(checkedAt) {
+		t.Fatalf("migrated update check=%+v", check)
+	}
+
+	legacyIndex := map[string]any{"shared_sha": strings.Repeat("a", 40), "project_external_id": "project-id"}
+	if err := writeJSONAtomic(app.Paths.IndexedSHA, legacyIndex, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	index, err := app.loadBasicMemoryIndexReceipt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index.SchemaVersion != basicMemoryIndexReceiptSchemaVersion || index.ProjectExternalID != "project-id" {
+		t.Fatalf("migrated Basic Memory receipt=%+v", index)
+	}
+
+	for _, path := range []string{app.Paths.Identity, app.Paths.State, app.Paths.UpdateCheck, app.Paths.IndexedSHA} {
+		var content map[string]any
+		if err := readJSON(path, &content); err != nil {
+			t.Fatal(err)
+		}
+		if content["schema_version"] != float64(1) {
+			t.Fatalf("%s schema_version=%v", path, content["schema_version"])
+		}
+	}
+}
+
+func TestPersistedFilesRejectFutureSchemas(t *testing.T) {
+	tests := []struct {
+		name string
+		path func(*App) string
+		load func(*App) error
+	}{
+		{"identity", func(app *App) string { return app.Paths.Identity }, func(app *App) error { _, err := app.loadIdentity(); return err }},
+		{"state", func(app *App) string { return app.Paths.State }, func(app *App) error { _, err := app.loadState(); return err }},
+		{"update", func(app *App) string { return app.Paths.UpdateCheck }, func(app *App) error { _, err := app.loadUpdateCheck(); return err }},
+		{"basic-memory", func(app *App) string { return app.Paths.IndexedSHA }, func(app *App) error { _, err := app.loadBasicMemoryIndexReceipt(); return err }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			app := testApp(t)
+			if err := writeJSONAtomic(test.path(app), map[string]any{"schema_version": 2}, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.load(app); err == nil || !strings.Contains(err.Error(), "unsupported schema_version 2") {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
 }
 
 func TestLaunchAgentUsesOneStableLabelAndPath(t *testing.T) {
@@ -120,6 +223,44 @@ func TestVersionUpdateIsNewerOnly(t *testing.T) {
 		if err != nil || got != test.want {
 			t.Fatalf("versionIsNewer(%q,%q)=(%v,%v), want %v", test.current, test.candidate, got, err, test.want)
 		}
+	}
+}
+
+func TestReleaseInstallRequiresCandidateVersionToMatchTag(t *testing.T) {
+	app := testApp(t)
+	oldTarget := filepath.Join(app.Paths.Versions, "0.1.0", "hgctl")
+	if err := os.MkdirAll(filepath.Dir(oldTarget), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldTarget, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(app.Paths.Bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stable := filepath.Join(app.Paths.Bin, "hgctl")
+	if err := replaceStableSymlink(stable, oldTarget); err != nil {
+		t.Fatal(err)
+	}
+
+	wrong := []byte("#!/bin/sh\nprintf 'v9.9.9\\n'\n")
+	if err := app.installReleaseBinary(testContext(t), "v0.2.0", wrong); err == nil || !strings.Contains(err.Error(), "expected exact tag") {
+		t.Fatalf("got %v", err)
+	}
+	if target, err := os.Readlink(stable); err != nil || target != oldTarget {
+		t.Fatalf("stable link changed after rejected candidate: target=%q err=%v", target, err)
+	}
+	if _, err := os.Stat(filepath.Join(app.Paths.Versions, "0.2.0", "hgctl")); !os.IsNotExist(err) {
+		t.Fatalf("rejected candidate was promoted: %v", err)
+	}
+
+	matching := []byte("#!/bin/sh\nprintf 'v0.2.0\\n'\n")
+	if err := app.installReleaseBinary(testContext(t), "v0.2.0", matching); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(app.Paths.Versions, "0.2.0", "hgctl")
+	if target, err := os.Readlink(stable); err != nil || target != want {
+		t.Fatalf("stable link target=%q err=%v, want %q", target, err, want)
 	}
 }
 

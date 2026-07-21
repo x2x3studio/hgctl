@@ -20,9 +20,15 @@ const (
 	Protocol       = "hourglass.event/v1"
 	ProjectName    = "hourglass"
 	LaunchLabel    = "com.x2x3studio.hgctl.sync"
+
+	identitySchemaVersion                = 1
+	stateSchemaVersion                   = 1
+	basicMemoryIndexReceiptSchemaVersion = 1
 )
 
 var Version = "dev"
+
+var errUnsupportedSchemaVersion = errors.New("unsupported persisted schema version")
 
 type Paths struct {
 	Home          string
@@ -89,10 +95,11 @@ func DefaultPaths() (Paths, error) {
 }
 
 type Identity struct {
-	ID        string    `json:"id"`
-	Hostname  string    `json:"hostname"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	SchemaVersion int       `json:"schema_version"`
+	ID            string    `json:"id"`
+	Hostname      string    `json:"hostname"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type BasicMemoryOwnership struct {
@@ -103,11 +110,13 @@ type BasicMemoryOwnership struct {
 }
 
 type BasicMemoryIndexReceipt struct {
+	SchemaVersion     int    `json:"schema_version"`
 	SharedSHA         string `json:"shared_sha"`
 	ProjectExternalID string `json:"project_external_id"`
 }
 
 type State struct {
+	SchemaVersion      int                   `json:"schema_version"`
 	RepoURL            string                `json:"repo_url"`
 	QueueBranch        string                `json:"queue_branch"`
 	BasicMemoryProject *BasicMemoryOwnership `json:"basic_memory_project,omitempty"`
@@ -156,18 +165,26 @@ func (a *App) loadIdentity() (Identity, error) {
 		if err != nil {
 			return Identity{}, err
 		}
-		id = Identity{ID: machineID, Hostname: host, CreatedAt: now, UpdatedAt: now}
+		id = Identity{SchemaVersion: identitySchemaVersion, ID: machineID, Hostname: host, CreatedAt: now, UpdatedAt: now}
 		if err := writeJSONAtomic(a.Paths.Identity, id, 0o600); err != nil {
 			return Identity{}, err
 		}
 		return id, nil
 	}
+	migrated, err := migrateSchemaVersion(a.Paths.Identity, &id.SchemaVersion, identitySchemaVersion)
+	if err != nil {
+		return Identity{}, err
+	}
 	if !validMachineID(id.ID) {
 		return Identity{}, errors.New("identity.json has an invalid machine id")
 	}
+	changed := migrated
 	if id.Hostname != host {
 		id.Hostname = host
 		id.UpdatedAt = a.Now().UTC()
+		changed = true
+	}
+	if changed {
 		if err := writeJSONAtomic(a.Paths.Identity, id, 0o600); err != nil {
 			return Identity{}, err
 		}
@@ -180,11 +197,58 @@ func (a *App) loadState() (State, error) {
 	if err := readJSON(a.Paths.State, &state); err != nil {
 		return State{}, err
 	}
+	migrated, err := migrateSchemaVersion(a.Paths.State, &state.SchemaVersion, stateSchemaVersion)
+	if err != nil {
+		return State{}, err
+	}
+	if migrated {
+		if err := writeJSONAtomic(a.Paths.State, state, 0o600); err != nil {
+			return State{}, err
+		}
+	}
 	return state, nil
 }
 
 func (a *App) saveState(state State) error {
+	state.SchemaVersion = stateSchemaVersion
 	return writeJSONAtomic(a.Paths.State, state, 0o600)
+}
+
+func (a *App) loadBasicMemoryIndexReceipt() (BasicMemoryIndexReceipt, error) {
+	var receipt BasicMemoryIndexReceipt
+	if err := readJSON(a.Paths.IndexedSHA, &receipt); err != nil {
+		return BasicMemoryIndexReceipt{}, err
+	}
+	migrated, err := migrateSchemaVersion(a.Paths.IndexedSHA, &receipt.SchemaVersion, basicMemoryIndexReceiptSchemaVersion)
+	if err != nil {
+		return BasicMemoryIndexReceipt{}, err
+	}
+	if migrated {
+		if err := writeJSONAtomic(a.Paths.IndexedSHA, receipt, 0o600); err != nil {
+			return BasicMemoryIndexReceipt{}, err
+		}
+	}
+	return receipt, nil
+}
+
+func (a *App) saveBasicMemoryIndexReceipt(receipt BasicMemoryIndexReceipt) error {
+	receipt.SchemaVersion = basicMemoryIndexReceiptSchemaVersion
+	return writeJSONAtomic(a.Paths.IndexedSHA, receipt, 0o600)
+}
+
+func migrateSchemaVersion(path string, version *int, current int) (bool, error) {
+	switch *version {
+	case 0:
+		if current != 1 {
+			return false, fmt.Errorf("%w: %s requires an explicit migration from the legacy schema to %d", errUnsupportedSchemaVersion, path, current)
+		}
+		*version = 1
+		return true, nil
+	case current:
+		return false, nil
+	default:
+		return false, fmt.Errorf("%w: %s has unsupported schema_version %d; current is %d", errUnsupportedSchemaVersion, path, *version, current)
+	}
 }
 
 func readJSON(path string, dst any) error {

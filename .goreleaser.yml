@@ -17,7 +17,7 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      - -s -w -X github.com/x2x3studio/hgctl/internal/hgctl.Version={{ .Version }}
+      - -s -w -X github.com/x2x3studio/hgctl/internal/hgctl.Version={{ .Tag }}
 
 archives:
   - id: binaries

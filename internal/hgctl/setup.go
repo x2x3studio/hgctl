@@ -134,10 +134,13 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 		return errors.New("Basic Memory project identity is not configured")
 	}
 	projectID := state.BasicMemoryProject.ExternalID
-	var indexed BasicMemoryIndexReceipt
-	if err := readJSON(a.Paths.IndexedSHA, &indexed); err == nil &&
+	indexed, indexedErr := a.loadBasicMemoryIndexReceipt()
+	if indexedErr == nil &&
 		indexed.SharedSHA == head && indexed.ProjectExternalID == projectID {
 		return nil
+	}
+	if errors.Is(indexedErr, errUnsupportedSchemaVersion) {
+		return indexedErr
 	}
 	if !commandExists("basic-memory") {
 		return errors.New("basic-memory is not installed")
@@ -159,10 +162,10 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 	if strings.TrimSpace(status) != "" {
 		return errors.New("Basic Memory modified the shared worktree; index receipt withheld")
 	}
-	return writeJSONAtomic(a.Paths.IndexedSHA, BasicMemoryIndexReceipt{
+	return a.saveBasicMemoryIndexReceipt(BasicMemoryIndexReceipt{
 		SharedSHA:         head,
 		ProjectExternalID: projectID,
-	}, 0o600)
+	})
 }
 
 type basicMemoryProject struct {
@@ -945,8 +948,7 @@ func (a *App) doctor(ctx context.Context) error {
 	}
 	indexedOK := false
 	if head, err := runCommand(ctx, a.Paths.Vault, "git", "rev-parse", "HEAD"); err == nil {
-		var indexed BasicMemoryIndexReceipt
-		if readErr := readJSON(a.Paths.IndexedSHA, &indexed); readErr == nil {
+		if indexed, readErr := a.loadBasicMemoryIndexReceipt(); readErr == nil {
 			indexedOK = indexed.SharedSHA == strings.TrimSpace(head) && indexed.ProjectExternalID == projectID
 		}
 	}

@@ -38,7 +38,11 @@ jobs:
         run: go test ./...
       - name: Vet
         run: go vet ./...
-      - name: Build
+      - name: Cross-build supported targets
         env:
           CGO_ENABLED: "0"
-        run: go build ./cmd/hgctl
+        run: |
+          GOOS=darwin GOARCH=amd64 go build -o "$RUNNER_TEMP/hgctl_darwin_amd64" ./cmd/hgctl
+          GOOS=darwin GOARCH=arm64 go build -o "$RUNNER_TEMP/hgctl_darwin_arm64" ./cmd/hgctl
+          GOOS=linux GOARCH=amd64 go build -o "$RUNNER_TEMP/hgctl_linux_amd64" ./cmd/hgctl
+          GOOS=linux GOARCH=arm64 go build -o "$RUNNER_TEMP/hgctl_linux_arm64" ./cmd/hgctl
