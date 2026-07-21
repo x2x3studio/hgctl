@@ -55,8 +55,16 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 					}
 				}
 
-				if err := a.removeManagedBasicMemoryProject(ctx); err != nil {
+				basicMemoryCleanup, err := a.managedBasicMemoryCleanupRequired()
+				if err != nil {
+					errs = append(errs, fmt.Errorf("inspect Basic Memory ownership: %w", err))
+					safeToRemoveBinary = false
+				} else if basicMemoryCleanup && !commandExists("basic-memory") {
+					errs = append(errs, errors.New("managed Basic Memory project cleanup requires the basic-memory command"))
+					safeToRemoveBinary = false
+				} else if err := a.removeManagedBasicMemoryProject(ctx); err != nil {
 					errs = append(errs, err)
+					safeToRemoveBinary = false
 				}
 
 				if err := a.removeSchedulerFiles(ctx); err != nil {
@@ -88,7 +96,18 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 	if safeToRemoveBinary {
 		_, _ = fmt.Fprintln(a.Out, "Hourglass integration removed; vault, outbox, and machine identity were preserved.")
 	} else {
-		_, _ = fmt.Fprintln(a.Out, "Hourglass integration removal is incomplete; the binary was preserved so remaining hooks or the scheduler cannot break.")
+		_, _ = fmt.Fprintln(a.Out, "Hourglass integration removal is incomplete; the binary was preserved so managed cleanup can be retried.")
 	}
 	return errors.Join(errs...)
+}
+
+func (a *App) managedBasicMemoryCleanupRequired() (bool, error) {
+	state, err := a.loadState()
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return state.BasicMemoryProject != nil && state.BasicMemoryProject.Managed, nil
 }

@@ -167,6 +167,102 @@ func TestSetupHookFilesConfiguresOnlyInstalledClients(t *testing.T) {
 	}
 }
 
+func TestBackgroundHookRepairIsIdempotentAndDefersCodexTrust(t *testing.T) {
+	prepareInstalledBinary := func(t *testing.T, app *App) {
+		t.Helper()
+		target := filepath.Join(app.Paths.Versions, "test", "hgctl")
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte("binary"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(app.Paths.Bin, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(app.Paths.Bin, "hgctl")); err != nil {
+			t.Fatal(err)
+		}
+		if err := app.saveState(State{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("uninstalled", func(t *testing.T) {
+		app := testApp(t)
+		bin := filepath.Join(app.Paths.Home, "client-bin")
+		writeFakeExecutable(t, bin, "claude")
+		t.Setenv("PATH", bin)
+		app.repairClientHooks(testContext(t))
+		if _, err := os.Stat(filepath.Join(app.Paths.Home, ".claude", "settings.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("background repair configured an uninstalled endpoint: %v", err)
+		}
+	})
+	t.Run("lifecycle busy", func(t *testing.T) {
+		app := testApp(t)
+		prepareInstalledBinary(t, app)
+		bin := filepath.Join(app.Paths.Home, "client-bin")
+		writeFakeExecutable(t, bin, "claude")
+		t.Setenv("PATH", bin)
+		locked := make(chan struct{})
+		release := make(chan struct{})
+		done := make(chan error, 1)
+		ctx := testContext(t)
+		go func() {
+			done <- withFileLockWait(ctx, app.Paths.LifecycleLock, func() error {
+				close(locked)
+				<-release
+				return nil
+			})
+		}()
+		<-locked
+		app.repairClientHooks(ctx)
+		close(release)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(app.Paths.Home, ".claude", "settings.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("background repair raced a lifecycle transaction: %v", err)
+		}
+	})
+
+	t.Run("Claude", func(t *testing.T) {
+		app := testApp(t)
+		prepareInstalledBinary(t, app)
+		bin := filepath.Join(app.Paths.Home, "client-bin")
+		writeFakeExecutable(t, bin, "claude")
+		t.Setenv("PATH", bin)
+		app.repairClientHooks(testContext(t))
+		path := filepath.Join(app.Paths.Home, ".claude", "settings.json")
+		first, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		app.repairClientHooks(testContext(t))
+		second, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(first, second) || !hooksConfigured(path, filepath.Join(app.Paths.Bin, "hgctl"), "claude") {
+			t.Fatal("background repair changed an already-correct Claude hook set")
+		}
+	})
+
+	t.Run("Codex", func(t *testing.T) {
+		app := testApp(t)
+		prepareInstalledBinary(t, app)
+		t.Setenv("PATH", t.TempDir())
+		installFakeCodex(t, app, "rpc-error")
+		app.repairClientHooks(testContext(t))
+		path := filepath.Join(app.Paths.Home, ".codex", "hooks.json")
+		if !hooksConfigured(path, filepath.Join(app.Paths.Bin, "hgctl"), "codex") {
+			t.Fatal("background repair did not restore Codex hooks")
+		}
+		if output := app.Err.(*bytes.Buffer).String(); !strings.Contains(output, "Codex hook trust deferred") {
+			t.Fatalf("temporary Codex trust failure was not deferred: %q", output)
+		}
+	})
+}
+
 func TestSetupClientHooksSupportsClaudeOnlyAndCodexOnly(t *testing.T) {
 	t.Run("Claude only", func(t *testing.T) {
 		app := testApp(t)
@@ -640,6 +736,51 @@ func TestUninstallPreservesBinaryWhenHookOrSchedulerCleanupFails(t *testing.T) {
 	})
 }
 
+func TestUninstallReportsIncompleteBasicMemoryCleanupAndPreservesRetryPath(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		installTool bool
+	}{
+		{name: "command missing"},
+		{name: "remove fails", installTool: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			app := testApp(t)
+			stable := prepareUninstallFixture(t, app, false)
+			if err := app.saveState(State{BasicMemoryProject: &BasicMemoryOwnership{
+				ExternalID: "project-id", Path: app.Paths.Vault, Managed: true,
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", filepath.Join(app.Paths.Home, "fake-bin"))
+			if test.installTool {
+				script := `#!/bin/sh
+if [ "$1 $2" = "tool list-projects" ]; then
+  printf '{"projects":[{"name":"hourglass","external_id":"project-id","local_path":"%s"}]}\n' "$BM_PATH"
+  exit 0
+fi
+if [ "$1 $2" = "project remove" ]; then exit 9; fi
+exit 20
+`
+				if err := os.WriteFile(filepath.Join(app.Paths.Home, "fake-bin", "basic-memory"), []byte(script), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("BM_PATH", app.Paths.Vault)
+			}
+			if err := app.uninstall(testContext(t)); err == nil {
+				t.Fatal("uninstall succeeded without completing Basic Memory cleanup")
+			}
+			if !managedStableSymlink(stable, app.Paths.Versions) {
+				t.Fatal("binary retry path was removed after Basic Memory cleanup failed")
+			}
+			output := app.Out.(*bytes.Buffer).String()
+			if !strings.Contains(output, "removal is incomplete") || strings.Contains(output, "integration removed;") {
+				t.Fatalf("untruthful uninstall output: %q", output)
+			}
+		})
+	}
+}
+
 func prepareUninstallFixture(t *testing.T, app *App, blockSchedulerRemoval bool) string {
 	t.Helper()
 	target := filepath.Join(app.Paths.Versions, "test", "hgctl")
@@ -754,6 +895,20 @@ func TestSchedulerOwnershipRejectsUnrelatedFiles(t *testing.T) {
 	}
 	if err := verifySchedulerFile(path, stable); err != nil {
 		t.Fatalf("managed scheduler file was rejected: %v", err)
+	}
+	changedTemplate := strings.ReplaceAll(launchAgent(stable, "data", root, "vault"), "  <key>StartInterval</key><integer>60</integer>\n", "")
+	if err := os.WriteFile(path, []byte(changedTemplate), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySchedulerFile(path, stable); err != nil {
+		t.Fatalf("versioned ownership depended on the scheduler template: %v", err)
+	}
+	futureOwnership := strings.Replace(changedTemplate, schedulerOwnership, "x2x3studio.hgctl.scheduler/v2", 1)
+	if err := os.WriteFile(path, []byte(futureOwnership), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySchedulerFile(path, stable); err == nil {
+		t.Fatal("future scheduler ownership version was overwritten")
 	}
 }
 

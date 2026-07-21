@@ -1,6 +1,7 @@
 package hgctl
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -11,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 )
 
@@ -24,11 +24,21 @@ const (
 	identitySchemaVersion                = 1
 	stateSchemaVersion                   = 1
 	basicMemoryIndexReceiptSchemaVersion = 1
+	stateProbeMarker                     = "hgctl-state-compatible/v1"
+	stateProbeEnvironment                = "HGCTL_INTERNAL_STATE_PROBE"
+)
+
+const (
+	defaultCommandOutputLimit     = 1 << 20
+	gitCommandOutputLimit         = 8 << 20
+	basicMemoryCommandOutputLimit = 4 << 20
 )
 
 var Version = "dev"
 
 var errUnsupportedSchemaVersion = errors.New("unsupported persisted schema version")
+
+var errCommandOutputLimit = errors.New("subprocess output limit exceeded")
 
 type Paths struct {
 	Home          string
@@ -135,7 +145,54 @@ func New(in io.Reader, out, errOut io.Writer) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &App{Paths: paths, In: in, Out: out, Err: errOut, Now: time.Now}, nil
+	app := &App{Paths: paths, In: in, Out: out, Err: errOut, Now: time.Now}
+	if os.Getenv(stateProbeEnvironment) == "1" {
+		if err := app.probePersistedStateCompatibility(); err != nil {
+			return nil, fmt.Errorf("persisted state compatibility: %w", err)
+		}
+		if _, err := fmt.Fprintln(out, stateProbeMarker); err != nil {
+			return nil, err
+		}
+	}
+	return app, nil
+}
+
+// probePersistedStateCompatibility is deliberately read-only. A candidate
+// binary runs it before promotion so an older release cannot rewrite a newer
+// persisted schema while merely checking compatibility.
+func (a *App) probePersistedStateCompatibility() error {
+	var identity Identity
+	if exists, err := probeJSONSchema(a.Paths.Identity, &identity, &identity.SchemaVersion, identitySchemaVersion); err != nil {
+		return err
+	} else if exists && !validMachineID(identity.ID) {
+		return errors.New("identity.json has an invalid machine id")
+	}
+
+	var state State
+	if _, err := probeJSONSchema(a.Paths.State, &state, &state.SchemaVersion, stateSchemaVersion); err != nil {
+		return err
+	}
+	var receipt BasicMemoryIndexReceipt
+	if _, err := probeJSONSchema(a.Paths.IndexedSHA, &receipt, &receipt.SchemaVersion, basicMemoryIndexReceiptSchemaVersion); err != nil {
+		return err
+	}
+	var check updateCheck
+	if _, err := probeJSONSchema(a.Paths.UpdateCheck, &check, &check.SchemaVersion, updateCheckSchemaVersion); err != nil {
+		return err
+	}
+	return nil
+}
+
+func probeJSONSchema(path string, dst any, version *int, current int) (bool, error) {
+	if err := readJSON(path, dst); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	if _, err := migrateSchemaVersion(path, version, current); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (a *App) ensureDataDirs() error {
@@ -343,11 +400,90 @@ func runCommandEnv(ctx context.Context, dir string, environment []string, name s
 			cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10")
 		}
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	policy := commandPolicyFor(name)
+	output := boundedCommandOutput{limit: policy.outputLimit}
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	err := cmd.Run()
+	if output.truncated {
+		return output.String(), &commandRunError{class: policy.class, cause: errors.Join(err, errCommandOutputLimit), output: output.String(), outputLimit: policy.outputLimit}
 	}
-	return string(out), nil
+	if err != nil {
+		return output.String(), &commandRunError{class: policy.class, cause: err, output: output.String()}
+	}
+	return output.String(), nil
+}
+
+type commandPolicy struct {
+	class       string
+	outputLimit int
+}
+
+func commandPolicyFor(name string) commandPolicy {
+	switch name {
+	case "git":
+		return commandPolicy{class: "git", outputLimit: gitCommandOutputLimit}
+	case "basic-memory":
+		return commandPolicy{class: "Basic Memory", outputLimit: basicMemoryCommandOutputLimit}
+	case "gh":
+		return commandPolicy{class: "GitHub CLI", outputLimit: 2 << 20}
+	case "launchctl", "systemctl", "loginctl":
+		return commandPolicy{class: "scheduler", outputLimit: 256 << 10}
+	default:
+		return commandPolicy{class: "external", outputLimit: defaultCommandOutputLimit}
+	}
+}
+
+type boundedCommandOutput struct {
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *boundedCommandOutput) Write(content []byte) (int, error) {
+	written := len(content)
+	remaining := b.limit - b.buffer.Len()
+	if remaining > 0 {
+		if len(content) > remaining {
+			_, _ = b.buffer.Write(content[:remaining])
+		} else {
+			_, _ = b.buffer.Write(content)
+		}
+	}
+	if len(content) > remaining {
+		b.truncated = true
+	}
+	return written, nil
+}
+
+func (b *boundedCommandOutput) String() string {
+	return b.buffer.String()
+}
+
+type commandRunError struct {
+	class       string
+	cause       error
+	output      string
+	outputLimit int
+}
+
+func (e *commandRunError) Error() string {
+	if e.outputLimit > 0 {
+		return fmt.Sprintf("%s command exceeded its %d-byte output limit", e.class, e.outputLimit)
+	}
+	return fmt.Sprintf("%s command failed: %v (output suppressed)", e.class, e.cause)
+}
+
+func (e *commandRunError) Unwrap() error {
+	return e.cause
+}
+
+func commandFailureOutput(err error) string {
+	var commandErr *commandRunError
+	if errors.As(err, &commandErr) {
+		return commandErr.output
+	}
+	return ""
 }
 
 func executableAssetName() string {

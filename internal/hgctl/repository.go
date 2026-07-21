@@ -187,21 +187,18 @@ func (a *App) fetchEndpointRefs(ctx context.Context, state State) error {
 }
 
 func remoteBranchExists(ctx context.Context, dir, branch string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--exit-code", "--heads", "origin", branch)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	if os.Getenv("GIT_SSH_COMMAND") == "" {
-		cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10")
-	}
-	out, err := cmd.CombinedOutput()
+	_, err := runCommand(ctx, dir, "git", "ls-remote", "--exit-code", "--heads", "origin", branch)
 	if err == nil {
 		return true, nil
+	}
+	if errors.Is(err, errCommandOutputLimit) {
+		return false, err
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
 		return false, nil
 	}
-	return false, fmt.Errorf("git ls-remote %s: %w: %s", branch, err, strings.TrimSpace(string(out)))
+	return false, fmt.Errorf("git ls-remote: %w", err)
 }
 
 func directoryNotEmpty(path string) (bool, error) {
@@ -257,7 +254,7 @@ func (a *App) sync(ctx context.Context) error {
 	})
 	cancel()
 	if ctx.Err() == nil {
-		a.retryCodexTrust(ctx)
+		a.repairClientHooks(ctx)
 	}
 	return coreErr
 }
@@ -319,21 +316,16 @@ func (a *App) syncSharedUnlocked(ctx context.Context) error {
 }
 
 func gitIsAncestor(ctx context.Context, dir, ancestor, descendant string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git",
-		"-c", "core.hooksPath=/dev/null",
-		"-c", "commit.gpgSign=false",
-		"-c", "tag.gpgSign=false",
-		"merge-base", "--is-ancestor", ancestor, descendant,
-	)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	out, err := cmd.CombinedOutput()
+	_, err := runCommand(ctx, dir, "git", "merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
 		return true, nil
+	}
+	if errors.Is(err, errCommandOutputLimit) {
+		return false, err
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 		return false, nil
 	}
-	return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %w: %s", ancestor, descendant, err, strings.TrimSpace(string(out)))
+	return false, fmt.Errorf("git merge-base --is-ancestor: %w", err)
 }

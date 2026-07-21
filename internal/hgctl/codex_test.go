@@ -106,7 +106,7 @@ func TestCodexTrustRetryIsLowFrequencyAndNonBlocking(t *testing.T) {
 	app.retryCodexTrust(testContext(t))
 	var check codexTrustCheck
 	err := readJSON(app.Paths.CodexCheck, &check)
-	if err != nil || !check.CheckedAt.Equal(now) {
+	if err != nil || !check.CheckedAt.Equal(now) || len(check.HooksSHA256) != 64 {
 		t.Fatalf("trust retry timestamp=%v err=%v", check.CheckedAt, err)
 	}
 	output := app.Err.(*bytes.Buffer).String()
@@ -127,6 +127,34 @@ func TestCodexTrustRetryIsLowFrequencyAndNonBlocking(t *testing.T) {
 	log, err := os.ReadFile(writeLog)
 	if err != nil || string(log) != "write\n" {
 		t.Fatalf("recovery writes=%q err=%v", log, err)
+	}
+}
+
+func TestCodexTrustRetryDoesNotThrottleAChangedHookFile(t *testing.T) {
+	app := testApp(t)
+	trustFile, _ := installFakeCodex(t, app, "rpc-error")
+	stable := filepath.Join(app.Paths.Bin, "hgctl")
+	hooksPath := filepath.Join(app.Paths.Home, ".codex", "hooks.json")
+	if err := configureHookFile(hooksPath, stable, "codex", true); err != nil {
+		t.Fatal(err)
+	}
+	now := app.Now()
+	app.Now = func() time.Time { return now }
+	app.retryCodexTrust(testContext(t))
+	if _, err := os.Stat(trustFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failing trust attempt unexpectedly succeeded: %v", err)
+	}
+	content, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hooksPath, append(content, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HGCTL_FAKE_CODEX_MODE", "success")
+	app.retryCodexTrust(testContext(t))
+	if _, err := os.Stat(trustFile); err != nil {
+		t.Fatalf("changed hook file remained throttled by the old receipt: %v", err)
 	}
 }
 

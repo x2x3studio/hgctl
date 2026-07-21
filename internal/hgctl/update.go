@@ -145,6 +145,8 @@ func (a *App) installReleaseBinary(ctx context.Context, tag string, content []by
 	targetDir := filepath.Join(a.Paths.Versions, version)
 	target := filepath.Join(targetDir, "hgctl")
 	link := filepath.Join(a.Paths.Bin, "hgctl")
+	previousTarget := ""
+	hadPreviousTarget := false
 	if info, err := os.Lstat(link); err == nil {
 		if info.Mode()&os.ModeSymlink == 0 {
 			return fmt.Errorf("refusing to replace non-symlink %s", link)
@@ -152,8 +154,26 @@ func (a *App) installReleaseBinary(ctx context.Context, tag string, content []by
 		if !managedStableSymlink(link, a.Paths.Versions) {
 			return fmt.Errorf("refusing to replace unmanaged symlink %s", link)
 		}
+		previousTarget, err = resolvedSymlinkTarget(link)
+		if err != nil {
+			return err
+		}
+		hadPreviousTarget = true
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	if hadPreviousTarget && filepath.Clean(previousTarget) == filepath.Clean(target) {
+		matches, err := installedBinaryMatches(target, content)
+		if err != nil {
+			return err
+		}
+		if !matches {
+			return fmt.Errorf("release target %s already exists with different content", target)
+		}
+		if err := a.verifyCandidateVersion(ctx, target, tag); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	candidate, err := writeExecutableTemp(targetDir, content)
@@ -161,7 +181,7 @@ func (a *App) installReleaseBinary(ctx context.Context, tag string, content []by
 		return err
 	}
 	defer os.Remove(candidate)
-	if err := verifyCandidateVersion(ctx, candidate, tag); err != nil {
+	if err := a.verifyCandidateVersion(ctx, candidate, tag); err != nil {
 		return err
 	}
 	if err := os.Rename(candidate, target); err != nil {
@@ -170,7 +190,29 @@ func (a *App) installReleaseBinary(ctx context.Context, tag string, content []by
 	if err := os.MkdirAll(a.Paths.Bin, 0o755); err != nil {
 		return err
 	}
+	// Cleanup happens before the atomic switch, so every possible failure still
+	// leaves the currently running stable binary selected.
+	if err := pruneManagedVersions(a.Paths.Versions, target, previousTarget); err != nil {
+		return err
+	}
 	return replaceStableSymlink(link, target)
+}
+
+func installedBinaryMatches(path string, expected []byte) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxReleaseBinaryBytes || info.Size() != int64(len(expected)) {
+		return false, nil
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	want := sha256.Sum256(expected)
+	got := sha256.Sum256(content)
+	return want == got, nil
 }
 
 func writeExecutableTemp(dir string, content []byte) (string, error) {
@@ -205,15 +247,25 @@ func writeExecutableTemp(dir string, content []byte) (string, error) {
 	return path, nil
 }
 
-func verifyCandidateVersion(parent context.Context, path, tag string) error {
+func (a *App) verifyCandidateVersion(parent context.Context, path, tag string) error {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "version")
+	cmd.Env = os.Environ()
+	for key, value := range map[string]string{
+		"HGCTL_HOME":          a.Paths.Home,
+		"HGCTL_DATA_DIR":      a.Paths.Data,
+		"HOURGLASS_VAULT":     a.Paths.Vault,
+		stateProbeEnvironment: "1",
+	} {
+		cmd.Env = setEnvironment(cmd.Env, key, value)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
-	cmd.Stderr = io.Discard
+	stderr := boundedCommandOutput{limit: 64 << 10}
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start release candidate: %w", err)
 	}
@@ -225,14 +277,89 @@ func verifyCandidateVersion(parent context.Context, path, tag string) error {
 	if readErr != nil {
 		return fmt.Errorf("read release candidate version: %w", readErr)
 	}
-	if waitErr != nil {
-		return fmt.Errorf("run release candidate version: %w", waitErr)
+	if stderr.truncated {
+		return errors.New("release candidate compatibility probe exceeded its stderr limit")
 	}
-	want := tag + "\n"
+	if waitErr != nil {
+		return fmt.Errorf("run release candidate compatibility probe: %w (output suppressed)", waitErr)
+	}
+	want := stateProbeMarker + "\n" + tag + "\n"
 	if string(output) != want {
-		return fmt.Errorf("release candidate version is %q; expected exact tag %q", strings.TrimSuffix(string(output), "\n"), tag)
+		return fmt.Errorf("release candidate did not return the compatibility marker and expected exact tag %q", tag)
 	}
 	return nil
+}
+
+func setEnvironment(environment []string, key, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(environment)+1)
+	for _, entry := range environment {
+		if !strings.HasPrefix(entry, prefix) {
+			result = append(result, entry)
+		}
+	}
+	return append(result, prefix+value)
+}
+
+func resolvedSymlinkTarget(link string) (string, error) {
+	target, err := os.Readlink(link)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(link), target)
+	}
+	return filepath.Clean(target), nil
+}
+
+func pruneManagedVersions(root string, current, rollback string) error {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	keep := map[string]bool{filepath.Clean(filepath.Dir(current)): true}
+	if rollback != "" {
+		keep[filepath.Clean(filepath.Dir(rollback))] = true
+	}
+	for _, entry := range entries {
+		dir := filepath.Join(root, entry.Name())
+		if keep[filepath.Clean(dir)] || !managedVersionDirectory(entry, dir) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, "hgctl")); err != nil {
+			return err
+		}
+		if err := os.Remove(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func managedVersionDirectory(entry os.DirEntry, dir string) bool {
+	if !entry.IsDir() {
+		return false
+	}
+	name := entry.Name()
+	if name != "dev" {
+		// installReleaseBinary strips the tag's v prefix. A prefixed directory
+		// therefore belongs to another layout and must be preserved.
+		if strings.HasPrefix(name, "v") {
+			return false
+		}
+		if _, err := parseSemanticVersion(name); err != nil {
+			return false
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "hgctl" {
+		return false
+	}
+	info, err := entries[0].Info()
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }
 
 func latestRelease(ctx context.Context) (release, error) {
@@ -260,7 +387,7 @@ func ghAPI(ctx context.Context, accept, endpoint string, limit int64) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	var stderr strings.Builder
+	stderr := boundedCommandOutput{limit: 64 << 10}
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -273,8 +400,11 @@ func ghAPI(ctx context.Context, accept, endpoint string, limit int64) ([]byte, e
 	if readErr != nil {
 		return nil, readErr
 	}
+	if stderr.truncated {
+		return nil, &commandRunError{class: "GitHub CLI", cause: errors.Join(waitErr, errCommandOutputLimit), outputLimit: stderr.limit}
+	}
 	if waitErr != nil {
-		return nil, fmt.Errorf("gh api: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
+		return nil, &commandRunError{class: "GitHub CLI", cause: waitErr}
 	}
 	return body, nil
 }
@@ -291,8 +421,8 @@ func readLimited(reader io.Reader, limit int64) ([]byte, error) {
 }
 
 type semanticVersion struct {
-	major, minor, patch int
-	prerelease          string
+	major, minor, patch uint64
+	prerelease          []string
 }
 
 func versionIsNewer(current, candidate string) (bool, error) {
@@ -308,42 +438,121 @@ func versionIsNewer(current, candidate string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("release version: %w", err)
 	}
-	left := []int{candidateVersion.major, candidateVersion.minor, candidateVersion.patch}
-	right := []int{currentVersion.major, currentVersion.minor, currentVersion.patch}
-	for i := range left {
-		if left[i] != right[i] {
-			return left[i] > right[i], nil
-		}
-	}
-	return currentVersion.prerelease != "" && candidateVersion.prerelease == "", nil
+	return compareSemanticVersions(candidateVersion, currentVersion) > 0, nil
 }
 
 func parseSemanticVersion(value string) (semanticVersion, error) {
-	value = strings.TrimPrefix(strings.TrimSpace(value), "v")
-	value = strings.SplitN(value, "+", 2)[0]
-	parts := strings.SplitN(value, "-", 2)
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "v")
+	buildParts := strings.Split(value, "+")
+	if len(buildParts) > 2 || (len(buildParts) == 2 && !validSemanticIdentifiers(buildParts[1], false)) {
+		return semanticVersion{}, fmt.Errorf("invalid semantic version %q", value)
+	}
+	parts := strings.SplitN(buildParts[0], "-", 2)
 	numbers := strings.Split(parts[0], ".")
 	if len(numbers) != 3 {
 		return semanticVersion{}, fmt.Errorf("invalid semantic version %q", value)
 	}
-	parsed := make([]int, 3)
+	parsed := make([]uint64, 3)
 	for i, number := range numbers {
 		if number == "" || (len(number) > 1 && number[0] == '0') {
 			return semanticVersion{}, fmt.Errorf("invalid semantic version %q", value)
 		}
-		parsed[i], _ = strconv.Atoi(number)
-		if strconv.Itoa(parsed[i]) != number {
+		parsed[i], _ = strconv.ParseUint(number, 10, 64)
+		if strconv.FormatUint(parsed[i], 10) != number {
 			return semanticVersion{}, fmt.Errorf("invalid semantic version %q", value)
 		}
 	}
-	prerelease := ""
+	var prerelease []string
 	if len(parts) == 2 {
-		prerelease = parts[1]
-		if prerelease == "" {
+		if !validSemanticIdentifiers(parts[1], true) {
 			return semanticVersion{}, fmt.Errorf("invalid semantic version %q", value)
 		}
+		prerelease = strings.Split(parts[1], ".")
 	}
 	return semanticVersion{major: parsed[0], minor: parsed[1], patch: parsed[2], prerelease: prerelease}, nil
+}
+
+func validSemanticIdentifiers(value string, prerelease bool) bool {
+	if value == "" {
+		return false
+	}
+	for _, identifier := range strings.Split(value, ".") {
+		if identifier == "" || (prerelease && numericIdentifier(identifier) && len(identifier) > 1 && identifier[0] == '0') {
+			return false
+		}
+		for i := 0; i < len(identifier); i++ {
+			character := identifier[i]
+			if (character < '0' || character > '9') && (character < 'A' || character > 'Z') &&
+				(character < 'a' || character > 'z') && character != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func numericIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func compareSemanticVersions(left, right semanticVersion) int {
+	for _, pair := range [][2]uint64{{left.major, right.major}, {left.minor, right.minor}, {left.patch, right.patch}} {
+		if pair[0] < pair[1] {
+			return -1
+		}
+		if pair[0] > pair[1] {
+			return 1
+		}
+	}
+	if len(left.prerelease) == 0 && len(right.prerelease) == 0 {
+		return 0
+	}
+	if len(left.prerelease) == 0 {
+		return 1
+	}
+	if len(right.prerelease) == 0 {
+		return -1
+	}
+	for index := 0; index < len(left.prerelease) && index < len(right.prerelease); index++ {
+		leftID := left.prerelease[index]
+		rightID := right.prerelease[index]
+		if leftID == rightID {
+			continue
+		}
+		leftNumeric := numericIdentifier(leftID)
+		rightNumeric := numericIdentifier(rightID)
+		switch {
+		case leftNumeric && rightNumeric:
+			if len(leftID) < len(rightID) || (len(leftID) == len(rightID) && leftID < rightID) {
+				return -1
+			}
+			return 1
+		case leftNumeric:
+			return -1
+		case rightNumeric:
+			return 1
+		case leftID < rightID:
+			return -1
+		default:
+			return 1
+		}
+	}
+	if len(left.prerelease) < len(right.prerelease) {
+		return -1
+	}
+	if len(left.prerelease) > len(right.prerelease) {
+		return 1
+	}
+	return 0
 }
 
 func checksumFor(content, name string) (string, error) {

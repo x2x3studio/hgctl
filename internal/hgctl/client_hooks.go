@@ -58,6 +58,28 @@ func (a *App) setupClientHooks(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+func (a *App) repairClientHooks(ctx context.Context) {
+	err := withFileLock(a.Paths.LifecycleLock, func() error {
+		stable := filepath.Join(a.Paths.Bin, "hgctl")
+		if !managedStableSymlink(stable, a.Paths.Versions) {
+			return nil
+		}
+		if _, err := os.Stat(a.Paths.State); err != nil {
+			return nil
+		}
+		if err := a.setupHookFiles(); err != nil {
+			return err
+		}
+		if commandExists("codex") {
+			a.retryCodexTrust(ctx)
+		}
+		return nil
+	})
+	if err != nil {
+		_, _ = fmt.Fprintln(a.Err, "hgctl: client hook repair deferred")
+	}
+}
+
 const hookConfigWriteAttempts = 4
 
 type hookConfigSnapshot struct {

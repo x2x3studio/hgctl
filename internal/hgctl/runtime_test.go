@@ -2,6 +2,7 @@ package hgctl
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,6 +169,15 @@ func TestLaunchAgentUsesOneStableLabelAndPath(t *testing.T) {
 	if strings.Contains(body, "/versions/") {
 		t.Fatal("version-specific path leaked into LaunchAgent")
 	}
+	if !strings.Contains(body, schedulerOwnership) {
+		t.Fatal("versioned scheduler ownership is missing")
+	}
+	if strings.Contains(body, "<key>HGCTLOwnership</key>") || !strings.Contains(body, "<key>HGCTL_SCHEDULER_OWNERSHIP</key>") {
+		t.Fatal("LaunchAgent ownership is not stored in the supported environment dictionary")
+	}
+	if strings.Contains(body, "sync.log") || strings.Contains(body, "sync.err.log") || strings.Count(body, "<string>/dev/null</string>") != 2 {
+		t.Fatal("LaunchAgent output is not bounded by /dev/null")
+	}
 	if !strings.Contains(body, "/opt/homebrew/bin") {
 		t.Fatal("LaunchAgent cannot discover Homebrew gh")
 	}
@@ -217,11 +227,24 @@ func TestVersionUpdateIsNewerOnly(t *testing.T) {
 		{"v1.0.0", "v1.0.0", false},
 		{"v1.0.0-rc.1", "v1.0.0", true},
 		{"v1.0.0", "v1.0.0-rc.2", false},
+		{"v1.0.0-alpha", "v1.0.0-alpha.1", true},
+		{"v1.0.0-alpha.1", "v1.0.0-alpha.beta", true},
+		{"v1.0.0-beta.2", "v1.0.0-beta.11", true},
+		{"v1.0.0-rc.2", "v1.0.0-rc.10", true},
+		{"v1.0.0+build.1", "v1.0.0+build.2", false},
 	}
 	for _, test := range tests {
 		got, err := versionIsNewer(test.current, test.candidate)
 		if err != nil || got != test.want {
 			t.Fatalf("versionIsNewer(%q,%q)=(%v,%v), want %v", test.current, test.candidate, got, err, test.want)
+		}
+	}
+}
+
+func TestSemanticVersionRejectsMalformedIdentifiers(t *testing.T) {
+	for _, value := range []string{"1.0", "1.0.0-", "1.0.0-alpha..1", "1.0.0-01", "1.0.0+", "1.0.0+build..1", "1.0.0-alpha_1"} {
+		if _, err := parseSemanticVersion(value); err == nil {
+			t.Fatalf("accepted malformed version %q", value)
 		}
 	}
 }
@@ -243,7 +266,7 @@ func TestReleaseInstallRequiresCandidateVersionToMatchTag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wrong := []byte("#!/bin/sh\nprintf 'v9.9.9\\n'\n")
+	wrong := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\nv9.9.9\\n'\n")
 	if err := app.installReleaseBinary(testContext(t), "v0.2.0", wrong); err == nil || !strings.Contains(err.Error(), "expected exact tag") {
 		t.Fatalf("got %v", err)
 	}
@@ -254,13 +277,154 @@ func TestReleaseInstallRequiresCandidateVersionToMatchTag(t *testing.T) {
 		t.Fatalf("rejected candidate was promoted: %v", err)
 	}
 
-	matching := []byte("#!/bin/sh\nprintf 'v0.2.0\\n'\n")
+	matching := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\nv0.2.0\\n'\n")
 	if err := app.installReleaseBinary(testContext(t), "v0.2.0", matching); err != nil {
 		t.Fatal(err)
 	}
 	want := filepath.Join(app.Paths.Versions, "0.2.0", "hgctl")
 	if target, err := os.Readlink(stable); err != nil || target != want {
 		t.Fatalf("stable link target=%q err=%v, want %q", target, err, want)
+	}
+}
+
+func TestPersistedStateCompatibilityProbeIsReadOnly(t *testing.T) {
+	app := testApp(t)
+	content := []byte("{\n  \"schema_version\": 2,\n  \"repo_url\": \"private\"\n}\n")
+	if err := writeFileAtomic(app.Paths.State, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.probePersistedStateCompatibility(); err == nil || !errors.Is(err, errUnsupportedSchemaVersion) {
+		t.Fatalf("future schema probe error=%v", err)
+	}
+	after, err := os.ReadFile(app.Paths.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, content) {
+		t.Fatalf("compatibility probe rewrote state:\n%s", after)
+	}
+}
+
+func TestCandidateMustImplementOfflineStateProbe(t *testing.T) {
+	app := testApp(t)
+	legacyCandidate := []byte("#!/bin/sh\nprintf 'v0.2.0\\n'\n")
+	if err := app.installReleaseBinary(testContext(t), "v0.2.0", legacyCandidate); err == nil || !strings.Contains(err.Error(), "compatibility marker") {
+		t.Fatalf("candidate without state probe was accepted: %v", err)
+	}
+}
+
+func TestRepeatedReleaseInstallDoesNotOverwriteTheActiveTarget(t *testing.T) {
+	app := testApp(t)
+	target := filepath.Join(app.Paths.Versions, "0.2.0", "hgctl")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\nv0.2.0\\n'\n")
+	if err := os.WriteFile(target, content, 0o701); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(app.Paths.Bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceStableSymlink(filepath.Join(app.Paths.Bin, "hgctl"), target); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.installReleaseBinary(testContext(t), "v0.2.0", content); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o701 {
+		t.Fatalf("same-target install replaced the active inode: mode=%o", info.Mode().Perm())
+	}
+
+	different := append(append([]byte(nil), content...), []byte("# different build\n")...)
+	before, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.installReleaseBinary(testContext(t), "v0.2.0", different); err == nil || !strings.Contains(err.Error(), "different content") {
+		t.Fatalf("same-target content collision was accepted: %v", err)
+	}
+	after, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("same-target collision overwrote the active binary")
+	}
+}
+
+func TestManagedVersionPruningRetainsCurrentAndOneRollback(t *testing.T) {
+	root := t.TempDir()
+	for _, version := range []string{"0.1.0", "0.2.0", "0.3.0"} {
+		path := filepath.Join(root, version, "hgctl")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(version), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unmanaged := filepath.Join(root, "notes", "hgctl")
+	if err := os.MkdirAll(filepath.Dir(unmanaged), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unmanaged, []byte("user"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pruneManagedVersions(root, filepath.Join(root, "0.3.0", "hgctl"), filepath.Join(root, "0.2.0", "hgctl")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "0.1.0")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old managed version remains: %v", err)
+	}
+	for _, path := range []string{filepath.Join(root, "0.2.0", "hgctl"), filepath.Join(root, "0.3.0", "hgctl"), unmanaged} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("retained path %s: %v", path, err)
+		}
+	}
+}
+
+func TestCommandOutputIsBoundedAndFailureErrorsAreRedacted(t *testing.T) {
+	app := testApp(t)
+	bin := filepath.Join(app.Paths.Home, "fake-bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+if [ "$HGCTL_TEST_MODE" = "large" ]; then
+  dd if=/dev/zero bs=1048576 count=5 2>/dev/null
+  exit 0
+fi
+printf '%s\n' "$*" >&2
+printf 'token-secret-value\n' >&2
+exit 9
+`
+	if err := os.WriteFile(filepath.Join(bin, "basic-memory"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HGCTL_TEST_MODE", "large")
+	output, err := runCommand(testContext(t), "", "basic-memory")
+	if err == nil || !errors.Is(err, errCommandOutputLimit) {
+		t.Fatalf("oversized output error=%v", err)
+	}
+	if len(output) != basicMemoryCommandOutputLimit {
+		t.Fatalf("captured output bytes=%d, want %d", len(output), basicMemoryCommandOutputLimit)
+	}
+
+	t.Setenv("HGCTL_TEST_MODE", "failure")
+	_, err = runCommand(testContext(t), "", "basic-memory", "tool", "search-notes", "private-query")
+	if err == nil {
+		t.Fatal("failing command returned success")
+	}
+	for _, secret := range []string{"private-query", "token-secret-value"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("command error leaked %q: %v", secret, err)
+		}
 	}
 }
 

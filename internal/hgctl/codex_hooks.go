@@ -2,6 +2,7 @@ package hgctl
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,7 +61,8 @@ type codexHookSpec struct {
 }
 
 type codexTrustCheck struct {
-	CheckedAt time.Time `json:"checked_at"`
+	CheckedAt   time.Time `json:"checked_at"`
+	HooksSHA256 string    `json:"hooks_sha256,omitempty"`
 }
 
 func (a *App) trustCodexHooks(ctx context.Context) error {
@@ -69,7 +71,11 @@ func (a *App) trustCodexHooks(ctx context.Context) error {
 
 func (a *App) attemptCodexTrust(ctx context.Context) error {
 	return withFileLockWait(ctx, a.Paths.CodexLock, func() error {
-		if err := writeJSONAtomic(a.Paths.CodexCheck, codexTrustCheck{CheckedAt: a.Now().UTC()}, 0o600); err != nil {
+		digest, err := codexHooksDigest(filepath.Join(a.Paths.Home, ".codex", "hooks.json"))
+		if err != nil {
+			return err
+		}
+		if err := writeJSONAtomic(a.Paths.CodexCheck, codexTrustCheck{CheckedAt: a.Now().UTC(), HooksSHA256: digest}, 0o600); err != nil {
 			return err
 		}
 		return a.trustCodexHooks(ctx)
@@ -84,14 +90,18 @@ func (a *App) retryCodexTrust(ctx context.Context) {
 	}
 	err := withFileLock(a.Paths.CodexLock, func() error {
 		now := a.Now().UTC()
+		digest, err := codexHooksDigest(hooksPath)
+		if err != nil {
+			return err
+		}
 		var previous codexTrustCheck
 		if err := readJSON(a.Paths.CodexCheck, &previous); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		if !previous.CheckedAt.IsZero() && now.Sub(previous.CheckedAt) < codexTrustInterval {
+		if previous.HooksSHA256 == digest && !previous.CheckedAt.IsZero() && now.Sub(previous.CheckedAt) < codexTrustInterval {
 			return nil
 		}
-		if err := writeJSONAtomic(a.Paths.CodexCheck, codexTrustCheck{CheckedAt: now}, 0o600); err != nil {
+		if err := writeJSONAtomic(a.Paths.CodexCheck, codexTrustCheck{CheckedAt: now, HooksSHA256: digest}, 0o600); err != nil {
 			return err
 		}
 		return a.trustCodexHooks(ctx)
@@ -99,6 +109,15 @@ func (a *App) retryCodexTrust(ctx context.Context) {
 	if err != nil {
 		_, _ = fmt.Fprintln(a.Err, "hgctl: Codex hook trust deferred")
 	}
+}
+
+func codexHooksDigest(path string) (string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(content)
+	return fmt.Sprintf("%x", digest), nil
 }
 
 func (a *App) verifyCodexHooks(ctx context.Context) error {

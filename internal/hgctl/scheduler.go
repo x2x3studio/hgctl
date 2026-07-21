@@ -13,7 +13,16 @@ import (
 	"time"
 )
 
+const schedulerOwnership = "x2x3studio.hgctl.scheduler/v1"
+
 func (a *App) installScheduler(ctx context.Context) error {
+	if err := a.writeSchedulerDefinition(); err != nil {
+		return err
+	}
+	return a.activateScheduler(ctx)
+}
+
+func (a *App) writeSchedulerDefinition() error {
 	stable := filepath.Join(a.Paths.Bin, "hgctl")
 	switch runtime.GOOS {
 	case "darwin":
@@ -26,20 +35,17 @@ func (a *App) installScheduler(ctx context.Context) error {
 		if err := writeFileAtomic(path, []byte(plist), 0o644); err != nil {
 			return err
 		}
-		domain := "gui/" + strconv.Itoa(os.Getuid())
-		_, _ = runCommand(ctx, "", "launchctl", "bootout", domain, path)
-		_, err := runCommand(ctx, "", "launchctl", "bootstrap", domain, path)
-		return err
-	case "linux":
-		if err := ensureUserLinger(ctx); err != nil {
+		if err := removeLegacySchedulerLogs(a.Paths.Data); err != nil {
 			return err
 		}
+		return nil
+	case "linux":
 		dir := filepath.Join(a.Paths.Home, ".config", "systemd", "user")
 		service := filepath.Join(dir, LaunchLabel+".service")
 		timer := filepath.Join(dir, LaunchLabel+".timer")
 		pathValue := a.Paths.Bin + ":" + filepath.Join(a.Paths.Home, ".local", "bin") + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-		serviceBody := fmt.Sprintf("[Unit]\nDescription=Hourglass sync\n\n[Service]\nType=oneshot\nTimeoutStartSec=180\nEnvironment=\"PATH=%s\"\nEnvironment=\"HGCTL_HOME=%s\"\nEnvironment=\"HGCTL_DATA_DIR=%s\"\nEnvironment=\"HOURGLASS_VAULT=%s\"\nExecStart=%s sync --update\n", systemdQuote(pathValue), systemdQuote(a.Paths.Home), systemdQuote(a.Paths.Data), systemdQuote(a.Paths.Vault), systemdEscape(stable))
-		timerBody := "[Unit]\nDescription=Run Hourglass sync every minute\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec=60s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+		serviceBody := fmt.Sprintf("# X-HGCTL-Ownership=%s\n[Unit]\nDescription=Hourglass sync\n\n[Service]\nType=oneshot\nTimeoutStartSec=180\nEnvironment=\"PATH=%s\"\nEnvironment=\"HGCTL_HOME=%s\"\nEnvironment=\"HGCTL_DATA_DIR=%s\"\nEnvironment=\"HOURGLASS_VAULT=%s\"\nExecStart=%s sync --update\n", schedulerOwnership, systemdQuote(pathValue), systemdQuote(a.Paths.Home), systemdQuote(a.Paths.Data), systemdQuote(a.Paths.Vault), systemdEscape(stable))
+		timerBody := "# X-HGCTL-Ownership=" + schedulerOwnership + "\n[Unit]\nDescription=Run Hourglass sync every minute\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec=60s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
 		for _, path := range []string{service, timer} {
 			if err := verifySchedulerFile(path, stable); err != nil {
 				return err
@@ -48,7 +54,22 @@ func (a *App) installScheduler(ctx context.Context) error {
 		if err := writeFileAtomic(service, []byte(serviceBody), 0o644); err != nil {
 			return err
 		}
-		if err := writeFileAtomic(timer, []byte(timerBody), 0o644); err != nil {
+		return writeFileAtomic(timer, []byte(timerBody), 0o644)
+	default:
+		return nil
+	}
+}
+
+func (a *App) activateScheduler(ctx context.Context) error {
+	switch runtime.GOOS {
+	case "darwin":
+		path := filepath.Join(a.Paths.Home, "Library", "LaunchAgents", LaunchLabel+".plist")
+		domain := "gui/" + strconv.Itoa(os.Getuid())
+		_, _ = runCommand(ctx, "", "launchctl", "bootout", domain, path)
+		_, err := runCommand(ctx, "", "launchctl", "bootstrap", domain, path)
+		return err
+	case "linux":
+		if err := ensureUserLinger(ctx); err != nil {
 			return err
 		}
 		if _, err := runCommand(ctx, "", "systemctl", "--user", "daemon-reload"); err != nil {
@@ -116,12 +137,33 @@ func launchAgent(binary, data, home, vault string) string {
 	<key>HGCTL_HOME</key><string>` + escape(home) + `</string>
 	<key>HGCTL_DATA_DIR</key><string>` + escape(data) + `</string>
 	<key>HOURGLASS_VAULT</key><string>` + escape(vault) + `</string>
+	<key>HGCTL_SCHEDULER_OWNERSHIP</key><string>` + schedulerOwnership + `</string>
   </dict>
-  <key>StandardOutPath</key><string>` + escape(filepath.Join(data, "sync.log")) + `</string>
-  <key>StandardErrorPath</key><string>` + escape(filepath.Join(data, "sync.err.log")) + `</string>
+	<key>StandardOutPath</key><string>/dev/null</string>
+	<key>StandardErrorPath</key><string>/dev/null</string>
 </dict>
 </plist>
 `
+}
+
+func removeLegacySchedulerLogs(data string) error {
+	for _, name := range []string{"sync.log", "sync.err.log"} {
+		path := filepath.Join(data, name)
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func systemdEscape(path string) string {
@@ -152,21 +194,46 @@ func verifySchedulerFile(path, stable string) error {
 	}
 	text := string(content)
 	managed := false
+	marker := "X-HGCTL-Ownership=" + schedulerOwnership
 	switch {
 	case strings.HasSuffix(path, ".plist"):
-		managed = strings.Contains(text, "<key>Label</key><string>"+LaunchLabel+"</string>") &&
+		identity := strings.Contains(text, "<key>Label</key><string>"+LaunchLabel+"</string>") &&
 			strings.Contains(text, "<string>"+html.EscapeString(stable)+"</string>")
+		current := strings.Contains(text, "<key>HGCTL_SCHEDULER_OWNERSHIP</key><string>"+schedulerOwnership+"</string>")
+		previousMarker := strings.Contains(text, "<key>HGCTLOwnership</key><string>"+schedulerOwnership+"</string>")
+		hasMarker := strings.Contains(text, "<key>HGCTL_SCHEDULER_OWNERSHIP</key>") || strings.Contains(text, "<key>HGCTLOwnership</key>")
+		legacy := !hasMarker && legacySchedulerFile(path, text, stable)
+		managed = identity && (current || previousMarker || legacy)
 	case strings.HasSuffix(path, ".service"):
-		managed = strings.Contains(text, "\nDescription=Hourglass sync\n") &&
-			strings.Contains(text, "\nExecStart="+systemdEscape(stable)+" sync --update\n")
+		identity := strings.Contains(text, "\nExecStart="+systemdEscape(stable)+" sync --update\n")
+		current := strings.Contains(text, marker+"\n")
+		legacy := !strings.Contains(text, "X-HGCTL-Ownership=") && legacySchedulerFile(path, text, stable)
+		managed = identity && (current || legacy)
 	case strings.HasSuffix(path, ".timer"):
-		managed = strings.Contains(text, "\nDescription=Run Hourglass sync every minute\n") &&
-			strings.Contains(text, "\nOnUnitActiveSec=60s\n")
+		current := strings.Contains(text, marker+"\n")
+		legacy := !strings.Contains(text, "X-HGCTL-Ownership=") && legacySchedulerFile(path, text, stable)
+		managed = current || legacy
 	}
 	if !managed {
 		return fmt.Errorf("refusing unmanaged scheduler file %s", path)
 	}
 	return nil
+}
+
+func legacySchedulerFile(path, text, stable string) bool {
+	switch {
+	case strings.HasSuffix(path, ".plist"):
+		return strings.Contains(text, "<key>StandardOutPath</key><string>") &&
+			strings.Contains(text, "<key>StandardErrorPath</key><string>")
+	case strings.HasSuffix(path, ".service"):
+		return strings.Contains(text, "\nDescription=Hourglass sync\n") &&
+			strings.Contains(text, "\nExecStart="+systemdEscape(stable)+" sync --update\n")
+	case strings.HasSuffix(path, ".timer"):
+		return strings.Contains(text, "\nDescription=Run Hourglass sync every minute\n") &&
+			strings.Contains(text, "\nOnUnitActiveSec=60s\n")
+	default:
+		return false
+	}
 }
 
 func (a *App) verifySchedulerOwnership() error {
@@ -276,7 +343,7 @@ func (a *App) schedulerFilesPresent() (bool, error) {
 }
 
 func ignorableSchedulerStopError(err error) bool {
-	message := strings.ToLower(err.Error())
+	message := strings.ToLower(err.Error() + " " + commandFailureOutput(err))
 	for _, text := range []string{"could not find specified service", "could not find service", "could not be found", "no such process", "not loaded", "not found", "does not exist"} {
 		if strings.Contains(message, text) {
 			return true
