@@ -1,8 +1,8 @@
 # hgctl
 
-`hgctl` is the static endpoint runtime for Hourglass. This repository also
-builds `dreamctl`, the model-free control tool used by the companion
-`x2x3studio/hourglass` GitHub Actions.
+`hgctl` is the static endpoint runtime for Hourglass and the only binary this
+repository builds. The companion `x2x3studio/hourglass` runs its reflect step
+from shell scripts plus the official Claude Action, not from any tool here.
 
 ## Minimal loop
 
@@ -10,7 +10,7 @@ builds `dreamctl`, the model-free control tool used by the companion
 Claude Code / Codex
   -> hgctl hooks and capture
   -> queue/<machine-id>
-  -> GitHub Action + dreamctl + official Claude
+  -> GitHub Action (reflect: official Claude + Basic Memory)
   -> shared
   -> hgctl pull and Basic Memory reindex
   -> Basic Memory MCP recall
@@ -23,12 +23,10 @@ must not run Git automation.
 ## Commands
 
 ```text
-hgctl install [--repo <git-url>] [--import <path>]
-hgctl hook --client <claude|codex> --event <session-start|user-prompt|stop>
-hgctl observe --client <claude|codex>
-hgctl import <path> [--source <name>]
+hgctl install [--repo <git-url>]
+hgctl hook --client <claude|codex> --event <user-prompt|stop>
 hgctl sync [--update]
-hgctl context <repo-path> --client <claude|codex>
+hgctl ingest [--client all|claude|codex] [--limit N]
 hgctl update
 hgctl doctor
 hgctl uninstall
@@ -36,26 +34,27 @@ hgctl version
 ```
 
 Hooks always return success to the client. Disk, Git, network, Basic Memory,
-and update failures are diagnostic and retried by sync.
+and update failures are diagnostic and retried by the next sync.
 
 ## Install
 
-The authoritative autonomous onboarding instructions are
+`hgctl` ships as a prebuilt, date-versioned release binary
+(`v0.YYYYMMDD.<secs>`), so onboarding needs no Go or build toolchain. The
+authoritative autonomous onboarding contract is
 `x2x3studio/hourglass/AGENTS.md`. In short, the Agent:
 
-1. installs missing `git`, `gh`, and `uv` with Homebrew on macOS or the
-   supported Ubuntu paths;
+1. installs missing `git`, `gh` (authenticated to github.com), and `uv`
+   (Homebrew on macOS or the supported Ubuntu paths);
 2. runs `uv tool install --upgrade basic-memory`;
-3. downloads the current platform release asset and `checksums.txt`;
-4. verifies the exact checksum and runs:
+3. downloads the current platform release asset and `checksums.txt`, verifies
+   the exact checksum, then runs:
 
 ```sh
 ./hgctl_<os>_<arch> install --repo git@github.com:x2x3studio/hourglass.git
 ```
 
-For a deliberate one-time migration, append `--import
-/path/to/current-markdown-tree`. Import reads the current tree only and does
-not inspect Git history.
+`--repo` defaults to `git@github.com:x2x3studio/hourglass.git` (override with the
+flag or `HOURGLASS_REPO`). Install is idempotent.
 
 Install creates:
 
@@ -63,64 +62,69 @@ Install creates:
 ~/.local/bin/hgctl -> ~/.local/lib/hgctl/versions/<version>/hgctl
 
 ~/.local/share/hgctl/
-  identity.json
-  state.json
-  outbox/
-  delivered/
-  repo/
-  queue/
+  identity.json      stable random machine UUID
+  state.json         repo URL + queue branch
+  repo/              control clone (main, shared, queue/<machine-id>)
+  outbox/ queue/ pending/ shared/
 
-~/hourglass-vault/
+~/hourglass-vault/   Basic Memory project (recall mirror)
 ```
 
 It also installs one scheduler, managed Claude Code and Codex hooks, the Basic
 Memory project `hourglass`, and the `hourglass-memory` MCP server in every
-installed MVP client. It verifies exact MCP command, arguments, environment,
-project identity, and indexed `shared` revision. Run `hgctl doctor` until
-all managed checks pass.
+installed client. It verifies the exact MCP command, arguments, environment,
+project identity, and indexed `shared` revision. Run `hgctl doctor` until all
+managed checks pass.
 
-On macOS the one scheduler label is
-`com.x2x3studio.hgctl.sync`. Ubuntu uses a user systemd timer with the same
-logical name. Neither needs an application daemon or a Go/Python runtime.
+On macOS the one scheduler label is `com.x2x3studio.hgctl.sync` (a LaunchAgent);
+Ubuntu uses a user systemd timer with the same logical name. Neither needs an
+application daemon or a Go/Python runtime. The scheduler runs `hgctl sync
+--update` about once a minute.
 
-## Capture and sync
+## Capture, ingest, and sync
 
-`SessionStart` performs a bounded sync and tells the Agent to use Basic
-Memory MCP. `UserPromptSubmit` stages the bounded prompt. `Stop` pairs it
-with the bounded response and emits one turn.
+Capture is automatic and hook-driven. `UserPromptSubmit` stages the bounded
+prompt; `Stop` pairs it with the bounded response and enqueues one turn event.
+An event is just a Markdown file with closed frontmatter (`captured_at`,
+`client`, `machine`) and a free-form body - the intake protocol has no kinds or
+validation.
 
-Explicit durable evidence enters through:
+`hgctl ingest` is the one-time historical backlog counterpart to the Stop hook.
+It reads local Claude Code and Codex transcripts, stamps each session with its
+real historical time, and enqueues every new one oldest-first in one batch, then
+pushes once so the backlog lands on origin before the command returns. A dedup
+ledger keeps re-runs idempotent. `--client` selects the source (`all`, `claude`,
+or `codex`); `--limit` caps a run.
 
-```sh
-printf '%s\n' '<private durable observation>' |
-  hgctl observe --client <claude|codex>
-```
+`hgctl sync` atomically drains the outbox, appends bounded queue commits, pushes
+only the machine branch, requests reconciliation, pulls `shared`, and reindexes
+Basic Memory only after a fast-forward. A new machine's queue branch is
+self-seeded as an orphan root (or adopted from an existing `queue-template` when
+the remote carries one), never inheriting `main` or `shared`; all later commits
+are append-only events.
 
-The event protocol contains only `turn`, `observation`, and
-`import_batch`. Sync atomically drains the outbox, appends bounded queue
-commits, pushes only the machine branch, requests reconciliation, pulls
-`shared`, and reindexes Basic Memory only after a fast-forward.
+## Releases and updates
 
-Repository bootstrap also creates a machine-neutral orphan `queue-template`
-whose tree contains only `.hourglass-queue`. A new machine queue starts from
-that exact commit rather than inheriting `main` or `shared`; all later commits
-are append-only event commits.
-
-## Release artifacts
-
-GoReleaser publishes:
+The Release workflow runs on every push to `main`: it cross-builds the four
+platform binaries, writes `checksums.txt`, and publishes a date-versioned
+(`v0.YYYYMMDD.<secs>`) GitHub release.
 
 ```text
 hgctl_darwin_amd64
 hgctl_darwin_arm64
 hgctl_linux_amd64
 hgctl_linux_arm64
-dreamctl_linux_amd64
 checksums.txt
 ```
 
-The endpoint updater installs only `hgctl`. Hourglass Actions download the
-exact released `dreamctl_linux_amd64` and verify its pinned checksum.
+Auto-update runs inside the scheduled `sync --update` (throttled to at most one
+check every five minutes): it fetches the latest release, verifies the checksum,
+and atomically retargets the stable `~/.local/bin/hgctl` symlink. `hgctl update`
+forces a check now.
+
+This repository is currently private, so the updater uses authenticated `gh` to
+fetch releases. Going public and dropping the `gh` dependency is a planned
+formal-release step.
 
 ## Development
 
@@ -131,5 +135,4 @@ go test -race ./internal/...
 go vet ./...
 ```
 
-All CI and release jobs use
-`[self-hosted, Linux, X64, x2x3studio-paas]`.
+All CI and release jobs use `[self-hosted, Linux, X64, x2x3studio-paas]`.
