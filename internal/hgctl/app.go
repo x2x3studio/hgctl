@@ -29,6 +29,8 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		a.clearHookDiagnostic(client, eventName)
 	case "sync":
 		err = a.runSync(ctx, args[1:])
+	case "ingest":
+		err = a.runIngest(ctx, args[1:])
 	case "update":
 		err = a.update(ctx, true)
 	case "doctor":
@@ -46,7 +48,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 }
 
 func (a *App) usage() {
-	_, _ = fmt.Fprintln(a.Err, "usage: hgctl <install|hook|sync|update|doctor|uninstall|version>")
+	_, _ = fmt.Fprintln(a.Err, "usage: hgctl <install|hook|sync|ingest|update|doctor|uninstall|version>")
 }
 
 func (a *App) runInstall(ctx context.Context, args []string) error {

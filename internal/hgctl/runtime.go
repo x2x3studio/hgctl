@@ -34,7 +34,7 @@ const (
 	basicMemoryCommandOutputLimit = 4 << 20
 )
 
-var Version = "dev"
+var Version = "v0.2.0"
 
 var errUnsupportedSchemaVersion = errors.New("unsupported persisted schema version")
 

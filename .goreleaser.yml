@@ -19,20 +19,6 @@ builds:
     ldflags:
       - -s -w -X github.com/x2x3studio/hgctl/internal/hgctl.Version={{ .Tag }}
 
-  - id: dreamctl
-    main: ./cmd/dreamctl
-    binary: dreamctl
-    env:
-      - CGO_ENABLED=0
-    goos:
-      - linux
-    goarch:
-      - amd64
-    flags:
-      - -trimpath
-    ldflags:
-      - -s -w
-
 archives:
   - id: binaries
     formats:
