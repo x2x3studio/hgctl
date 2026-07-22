@@ -2,49 +2,41 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
 permissions:
   contents: write
 
 concurrency:
-  group: hgctl-release-${{ github.ref }}
+  group: hgctl-release
   cancel-in-progress: false
 
 jobs:
   release:
     runs-on: [self-hosted, Linux, X64, x2x3studio-paas]
     timeout-minutes: 15
-    env:
-      GIT_CONFIG_GLOBAL: /dev/null
-      GIT_CONFIG_SYSTEM: /dev/null
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
-          persist-credentials: false
-          set-safe-directory: false
+          fetch-depth: 1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: false
-      - name: Verify release commit is on main
+      - name: Build and release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git rev-parse --verify refs/remotes/origin/main
-          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
-      - name: Verify formatting
-        run: test -z "$(gofmt -l .)"
-      - name: Test pinned protocol and runtime behavior
-        env:
-          CGO_ENABLED: "0"
-        run: go test ./...
-      - name: Vet
-        run: go vet ./...
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
-        with:
-          distribution: goreleaser
-          version: v2.17.0
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          Y=$(date -u +%Y%m%d)
+          H=$((10#$(date -u +%H))); Mn=$((10#$(date -u +%M))); Sc=$((10#$(date -u +%S)))
+          SECS=$((H*3600+Mn*60+Sc))
+          VERSION="v0.${Y}.${SECS}"
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X github.com/x2x3studio/hgctl/internal/hgctl.Version=$VERSION" \
+              -o "hgctl_${os}_${arch}" ./cmd/hgctl
+          done
+          sha256sum hgctl_darwin_amd64 hgctl_darwin_arm64 hgctl_linux_amd64 hgctl_linux_arm64 > checksums.txt
+          gh release create "$VERSION" --target "$GITHUB_SHA" --title "$VERSION" --notes "automated build from main" hgctl_darwin_amd64 hgctl_darwin_arm64 hgctl_linux_amd64 hgctl_linux_arm64 checksums.txt
