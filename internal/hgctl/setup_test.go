@@ -76,6 +76,53 @@ func TestHookConfigIsIdempotentAndPreservesUnrelatedHooks(t *testing.T) {
 	}
 }
 
+func TestConfigureHookFilePrunesStaleSessionStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	binary := "/Users/test/.local/bin/hgctl"
+	original := map[string]any{
+		"hooks": map[string]any{
+			"SessionStart": []any{map[string]any{
+				"hooks": []any{
+					map[string]any{"type": "command", "command": binary + " hook --client claude --event session-start", "timeout": 3},
+				},
+			}},
+			"Stop": []any{map[string]any{
+				"hooks": []any{
+					map[string]any{"type": "command", "command": binary + " hook --client claude --event stop --user-owned"},
+				},
+			}},
+		},
+	}
+	if err := writeJSONAtomic(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := configureHookFile(path, binary, "claude", true); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := countJSONText(b, "session-start"); got != 0 {
+		t.Fatalf("stale SessionStart hook was not pruned (count=%d):\n%s", got, b)
+	}
+	if got := countJSONText(b, "--user-owned"); got != 1 {
+		t.Fatalf("user-owned look-alike hook was not preserved (count=%d):\n%s", got, b)
+	}
+	if !hooksConfigured(path, binary, "claude") {
+		t.Fatalf("installed hook set is not the exact managed set:\n%s", b)
+	}
+	var root struct {
+		Hooks map[string]json.RawMessage `json:"hooks"`
+	}
+	if err := json.Unmarshal(b, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root.Hooks["SessionStart"]; exists {
+		t.Fatalf("empty SessionStart event group was left behind:\n%s", b)
+	}
+}
+
 func TestSetupHookFilesConfiguresOnlyInstalledClients(t *testing.T) {
 	tests := []struct {
 		name       string

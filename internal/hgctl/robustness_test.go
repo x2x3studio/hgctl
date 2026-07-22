@@ -55,6 +55,29 @@ func TestHookFailureIsSilentAndPersistedForDoctor(t *testing.T) {
 	}
 }
 
+func TestUnknownHookEventNoOpsAndRecordsNoDiagnostic(t *testing.T) {
+	app := testApp(t)
+	app.In = strings.NewReader(`{"session_id":"s1","prompt":"hi","last_assistant_message":"yo"}`)
+	if code := app.Run(testContext(t), []string{"hook", "--client", "claude", "--event", "session-start"}); code != 0 {
+		t.Fatalf("unknown hook event exit code=%d, want 0", code)
+	}
+	if _, err := os.Stat(app.hookDiagnosticPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unknown hook event recorded a diagnostic: %v", err)
+	}
+	for _, dir := range []string{app.Paths.Pending, app.Paths.Outbox} {
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("unknown hook event captured %d files under %s, want 0", len(entries), dir)
+		}
+	}
+}
+
 func TestHookConfigPreservesRawRootValuesAndRetriesConcurrentChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	original := []byte(`{

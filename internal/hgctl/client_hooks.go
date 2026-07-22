@@ -201,7 +201,7 @@ func mergeHookConfig(content []byte, existed bool, displayPath, binary, client s
 				}
 				var command string
 				_ = json.Unmarshal(handler["command"], &command)
-				if !managedHookCommand(command, binary, client) {
+				if !hgctlManagedHookCommand(command, binary, client) {
 					kept = append(kept, rawHandler)
 				}
 			}
@@ -316,6 +316,17 @@ func managedHookCommand(command, binary, client string) bool {
 		}
 	}
 	return false
+}
+
+// hgctlManagedHookCommand reports whether command is an hgctl-installed hook
+// invocation for client, whatever event it targets. The prune step uses this so
+// a retired or future event (e.g. session-start) is removed on install/repair,
+// while a look-alike that merely shares the prefix but carries extra arguments
+// (a distinct, user-owned command) is left untouched.
+func hgctlManagedHookCommand(command, binary, client string) bool {
+	prefix := shellQuote(binary) + " hook --client " + client + " --event "
+	rest, ok := strings.CutPrefix(command, prefix)
+	return ok && rest != "" && !strings.ContainsAny(rest, " \t")
 }
 
 func shellQuote(value string) string {

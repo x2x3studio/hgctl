@@ -170,7 +170,10 @@ func (a *App) runHook(ctx context.Context, args []string) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("unsupported hook event %q", eventName)
+		// Fail open on any unknown or retired event (e.g. a stale session-start
+		// registration): capture nothing and exit clean so no client session is
+		// broken and no diagnostic is recorded for an event we no longer handle.
+		return nil
 	}
 }
 
