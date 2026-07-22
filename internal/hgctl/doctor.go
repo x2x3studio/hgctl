@@ -86,7 +86,7 @@ func (a *App) doctor(ctx context.Context) error {
 		{"stable binary", managedStableSymlink(filepath.Join(a.Paths.Bin, "hgctl"), a.Paths.Versions), filepath.Join(a.Paths.Bin, "hgctl")},
 		{"control checkout", isGitWorktree(a.Paths.Control), a.Paths.Control},
 		{"queue worktree", isGitWorktree(a.Paths.Queue), a.Paths.Queue},
-		{"shared worktree", isGitWorktree(a.Paths.Vault), a.Paths.Vault},
+		{"shared worktree", isGitWorktree(a.Paths.Shared), a.Paths.Shared},
 	}
 	checks = append(checks, a.clientDoctorChecks(ctx)...)
 	checks = append(checks, a.basicMemoryMCPDoctorChecks(ctx)...)

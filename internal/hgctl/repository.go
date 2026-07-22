@@ -67,10 +67,7 @@ func (a *App) initGit(ctx context.Context, state State) error {
 	if !gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/shared") {
 		return errors.New("remote branch shared does not exist")
 	}
-	if !gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/queue-template") {
-		return errors.New("remote branch queue-template does not exist")
-	}
-	if err := a.ensureWorktree(ctx, a.Paths.Vault, "shared", "origin/shared"); err != nil {
+	if err := a.ensureWorktree(ctx, a.Paths.Shared, "shared", "origin/shared"); err != nil {
 		return err
 	}
 	if err := a.ensureWorktree(ctx, a.Paths.Queue, state.QueueBranch, queueStartRef(ctx, a.Paths.Control, state.QueueBranch)); err != nil {
@@ -172,7 +169,11 @@ func (a *App) fetchEndpointRefs(ctx context.Context, state State) error {
 	refspecs := []string{
 		"+refs/heads/main:refs/remotes/origin/main",
 		"+refs/heads/shared:refs/remotes/origin/shared",
-		"+refs/heads/queue-template:refs/remotes/origin/queue-template",
+	}
+	if exists, err := remoteBranchExists(ctx, a.Paths.Control, "queue-template"); err != nil {
+		return err
+	} else if exists {
+		refspecs = append(refspecs, "+refs/heads/queue-template:refs/remotes/origin/queue-template")
 	}
 	exists := gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+state.QueueBranch)
 	if !exists {
@@ -285,36 +286,91 @@ func (a *App) syncShared(ctx context.Context) error {
 }
 
 func (a *App) syncSharedUnlocked(ctx context.Context) error {
-	if _, err := os.Stat(filepath.Join(a.Paths.Vault, ".git")); err != nil {
+	if _, err := os.Stat(filepath.Join(a.Paths.Shared, ".git")); err != nil {
 		return nil
 	}
-	status, err := runCommand(ctx, a.Paths.Vault, "git", "status", "--porcelain")
+	status, err := runCommand(ctx, a.Paths.Shared, "git", "status", "--porcelain")
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(status) != "" {
 		return errors.New("shared worktree is dirty; refusing automatic merge")
 	}
-	remote, err := runCommand(ctx, a.Paths.Vault, "git", "rev-parse", "origin/shared")
+	remote, err := runCommand(ctx, a.Paths.Shared, "git", "rev-parse", "origin/shared")
 	if err != nil {
 		return err
 	}
-	ancestor, err := gitIsAncestor(ctx, a.Paths.Vault, "HEAD", "origin/shared")
+	ancestor, err := gitIsAncestor(ctx, a.Paths.Shared, "HEAD", "origin/shared")
 	if err != nil {
 		return err
 	}
 	if !ancestor {
 		return errors.New("shared worktree is ahead of or diverged from origin/shared")
 	}
-	if _, err := runCommand(ctx, a.Paths.Vault, "git", "merge", "--ff-only", "origin/shared"); err != nil {
+	if _, err := runCommand(ctx, a.Paths.Shared, "git", "merge", "--ff-only", "origin/shared"); err != nil {
 		return err
 	}
-	head, err := runCommand(ctx, a.Paths.Vault, "git", "rev-parse", "HEAD")
+	head, err := runCommand(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(head) != strings.TrimSpace(remote) {
 		return errors.New("shared worktree did not converge exactly to origin/shared")
+	}
+	return a.mirrorProductToVault()
+}
+
+// mirrorProductToVault copies the distilled product subset from the shared git
+// worktree into the Basic Memory vault, a disposable non-git directory. This
+// decouples Basic Memory (which rewrites permalink frontmatter into indexed
+// files) from tracked history: only reflect writes shared, and the vault is a
+// throwaway copy. Extraneous product files are removed so supersessions and
+// deletions propagate.
+func (a *App) mirrorProductToVault() error {
+	if err := os.MkdirAll(a.Paths.Vault, 0o700); err != nil {
+		return err
+	}
+	for _, name := range []string{"memory", "Home.md", "Hourglass.canvas"} {
+		if err := os.RemoveAll(filepath.Join(a.Paths.Vault, name)); err != nil {
+			return err
+		}
+		src := filepath.Join(a.Paths.Shared, name)
+		if _, err := os.Stat(src); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		if err := copyTree(src, filepath.Join(a.Paths.Vault, name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyTree(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dst, data, 0o600)
+	}
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := copyTree(filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name())); err != nil {
+			return err
+		}
 	}
 	return nil
 }

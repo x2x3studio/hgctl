@@ -13,12 +13,10 @@ import (
 
 const basicMemoryMCPName = "hourglass-memory"
 
-var basicMemoryMCPEnv = map[string]string{
-	"BASIC_MEMORY_DEFAULT_SEARCH_TYPE":        "text",
-	"BASIC_MEMORY_DISABLE_PERMALINKS":         "true",
-	"BASIC_MEMORY_ENSURE_FRONTMATTER_ON_SYNC": "false",
-	"BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED":    "false",
-}
+// basicMemoryMCPEnv sets no crippling flags: recall uses Basic Memory's default
+// full-text + semantic + wikilink-graph retrieval. Read-only is enforced by the
+// client tool allowlist, not by disabling features here.
+var basicMemoryMCPEnv = map[string]string{}
 
 type mcpClient struct {
 	name       string
@@ -53,10 +51,16 @@ func (a *App) setupBasicMemoryMCP(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("inspect %s Basic Memory MCP: %w", client.name, err)
 		}
-		if exists && !matches {
-			return fmt.Errorf("%s MCP entry %q exists with an unmanaged configuration", client.name, basicMemoryMCPName)
-		}
 		managedPath := state.BasicMemoryMCP[client.name]
+		if exists && !matches {
+			// Adopt an entry that differs only in managed command/args/env by
+			// re-registering it rather than refusing (e.g. a hand-registered
+			// entry with different transport flags).
+			if err := removeBasicMemoryMCP(ctx, client); err != nil {
+				return fmt.Errorf("re-register %s Basic Memory MCP: %w", client.name, err)
+			}
+			exists = false
+		}
 		if !exists {
 			if err := addBasicMemoryMCP(ctx, client, binary); err != nil {
 				return fmt.Errorf("configure %s Basic Memory MCP: %w", client.name, err)
@@ -101,6 +105,15 @@ func addBasicMemoryMCP(ctx context.Context, client mcpClient, binary string) err
 		args = append(args, basicMemoryMCPName)
 	}
 	args = append(args, "--", binary, "mcp", "--project", ProjectName)
+	_, err := runCommand(ctx, "", client.executable, args...)
+	return err
+}
+
+func removeBasicMemoryMCP(ctx context.Context, client mcpClient) error {
+	args := []string{"mcp", "remove", basicMemoryMCPName}
+	if client.name == "claude" {
+		args = append(args, "--scope", "user")
+	}
 	_, err := runCommand(ctx, "", client.executable, args...)
 	return err
 }

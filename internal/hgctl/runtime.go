@@ -49,6 +49,7 @@ type Paths struct {
 	Quarantine    string
 	Pending       string
 	Vault         string
+	Shared        string
 	Bin           string
 	Versions      string
 	Identity      string
@@ -89,6 +90,7 @@ func DefaultPaths() (Paths, error) {
 		Quarantine:    filepath.Join(data, "quarantine"),
 		Pending:       filepath.Join(data, "pending"),
 		Vault:         vault,
+		Shared:        filepath.Join(data, "shared"),
 		Bin:           filepath.Join(home, ".local", "bin"),
 		Versions:      filepath.Join(home, ".local", "lib", "hgctl", "versions"),
 		Identity:      filepath.Join(data, "identity.json"),

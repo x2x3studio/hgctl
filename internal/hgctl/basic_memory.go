@@ -33,15 +33,15 @@ func (a *App) setupBasicMemory(ctx context.Context) error {
 	return nil
 }
 
-var basicMemoryReadOnlyEnv = []string{
-	"BASIC_MEMORY_ENSURE_FRONTMATTER_ON_SYNC=false",
-	"BASIC_MEMORY_DISABLE_PERMALINKS=true",
-	"BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=false",
-	"BASIC_MEMORY_DEFAULT_SEARCH_TYPE=text",
-}
+// basicMemoryReadOnlyEnv intentionally sets no crippling flags. Permalinks,
+// semantic search, and hybrid retrieval stay at Basic Memory's defaults so the
+// wikilink graph and semantic recall work. The vault is a disposable copy that
+// is decoupled from the git worktree, so permalink frontmatter writes there are
+// harmless and never dirty tracked history.
+var basicMemoryReadOnlyEnv []string
 
 func (a *App) reindexBasicMemory(ctx context.Context) error {
-	head, err := runCommand(ctx, a.Paths.Vault, "git", "rev-parse", "HEAD")
+	head, err := runCommand(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return err
 	}
@@ -71,22 +71,8 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 		return err
 	}
 	projectID = project.ExternalID
-	status, err := runCommand(ctx, a.Paths.Vault, "git", "status", "--porcelain")
-	if err != nil {
+	if _, err := runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "reindex", "--project", ProjectName); err != nil {
 		return err
-	}
-	if strings.TrimSpace(status) != "" {
-		return errors.New("shared worktree is dirty; refusing Basic Memory reindex")
-	}
-	if _, err := runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "reindex", "--search", "--project", ProjectName); err != nil {
-		return err
-	}
-	status, err = runCommand(ctx, a.Paths.Vault, "git", "status", "--porcelain")
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(status) != "" {
-		return errors.New("Basic Memory modified the shared worktree; index receipt withheld")
 	}
 	return a.saveBasicMemoryIndexReceipt(BasicMemoryIndexReceipt{
 		SharedSHA:         head,
@@ -157,7 +143,7 @@ func (a *App) resolveBasicMemoryProject(ctx context.Context) (basicMemoryProject
 }
 
 func (a *App) verifyBasicMemoryIndexReceipt(ctx context.Context, project basicMemoryProject) (string, error) {
-	head, err := runCommand(ctx, a.Paths.Vault, "git", "rev-parse", "HEAD")
+	head, err := runCommand(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("read shared revision: %w", err)
 	}
