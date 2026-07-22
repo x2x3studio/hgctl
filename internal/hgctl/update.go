@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,10 +18,17 @@ import (
 )
 
 const (
-	updateInterval           = 5 * time.Minute
+	updateInterval           = 1 * time.Hour
 	updateCheckSchemaVersion = 1
 	maxCandidateVersionBytes = 4 * 1024
 )
+
+// GitHub's REST API rejects requests without a User-Agent.
+const releaseUserAgent = "hgctl-updater"
+
+// releaseLatestURL is the unauthenticated GitHub REST endpoint for the latest
+// hgctl release. It is a variable so tests can point it at a local server.
+var releaseLatestURL = "https://api.github.com/repos/x2x3studio/hgctl/releases/latest"
 
 const (
 	maxReleaseBinaryBytes = 64 * 1024 * 1024
@@ -35,7 +43,7 @@ type release struct {
 
 type releaseAsset struct {
 	Name string `json:"name"`
-	URL  string `json:"url"`
+	URL  string `json:"browser_download_url"`
 }
 
 type updateCheck struct {
@@ -363,10 +371,7 @@ func managedVersionDirectory(entry os.DirEntry, dir string) bool {
 }
 
 func latestRelease(ctx context.Context) (release, error) {
-	if !commandExists("gh") {
-		return release{}, errors.New("private release update requires authenticated gh")
-	}
-	body, err := ghAPI(ctx, "application/vnd.github+json", "repos/x2x3studio/hgctl/releases/latest", maxReleaseJSONBytes)
+	body, err := httpGetLimited(ctx, releaseLatestURL, "application/vnd.github+json", maxReleaseJSONBytes)
 	if err != nil {
 		return release{}, err
 	}
@@ -378,35 +383,28 @@ func latestRelease(ctx context.Context) (release, error) {
 }
 
 func downloadAsset(ctx context.Context, url string, limit int64) ([]byte, error) {
-	return ghAPI(ctx, "application/octet-stream", url, limit)
+	return httpGetLimited(ctx, url, "application/octet-stream", limit)
 }
 
-func ghAPI(ctx context.Context, accept, endpoint string, limit int64) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "gh", "api", "--hostname", "github.com", "-H", "Accept: "+accept, endpoint)
-	stdout, err := cmd.StdoutPipe()
+// httpGetLimited fetches url over unauthenticated HTTPS and returns at most
+// limit bytes of the body. net/http follows the redirect that release assets
+// issue to the CDN by default. The context carries the update deadline.
+func httpGetLimited(ctx context.Context, url, accept string, limit int64) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	stderr := boundedCommandOutput{limit: 64 << 10}
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	request.Header.Set("Accept", accept)
+	request.Header.Set("User-Agent", releaseUserAgent)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
 		return nil, err
 	}
-	body, readErr := readLimited(stdout, limit)
-	if readErr != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s returned %s", url, response.Status)
 	}
-	waitErr := cmd.Wait()
-	if readErr != nil {
-		return nil, readErr
-	}
-	if stderr.truncated {
-		return nil, &commandRunError{class: "GitHub CLI", cause: errors.Join(waitErr, errCommandOutputLimit), outputLimit: stderr.limit}
-	}
-	if waitErr != nil {
-		return nil, &commandRunError{class: "GitHub CLI", cause: waitErr}
-	}
-	return body, nil
+	return readLimited(response.Body, limit)
 }
 
 func readLimited(reader io.Reader, limit int64) ([]byte, error) {

@@ -2,8 +2,12 @@ package hgctl
 
 import (
 	"bytes"
-	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -441,14 +445,11 @@ func TestUpdateReceiptDoesNotRewriteInstallState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bin := filepath.Join(app.Paths.Home, "fake-bin")
-	if err := os.MkdirAll(bin, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\nprintf '{\"tag_name\":\"\",\"assets\":[]}'\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"tag_name":"","assets":[]}`))
+	}))
+	defer server.Close()
+	withReleaseLatestURL(t, server.URL)
 	if err := app.update(testContext(t), true); err != nil {
 		t.Fatal(err)
 	}
@@ -471,24 +472,105 @@ func TestReadLimitedRejectsOversizeResponse(t *testing.T) {
 	}
 }
 
-func TestGitHubAPIPinsGitHubDotCom(t *testing.T) {
-	bin := t.TempDir()
-	logPath := filepath.Join(t.TempDir(), "gh.log")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$HGCTL_GH_LOG\"\nprintf '{}'\n"
-	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("HGCTL_GH_LOG", logPath)
-	if _, err := ghAPI(context.Background(), "application/vnd.github+json", "repos/x2x3studio/hgctl/releases/latest", 1024); err != nil {
-		t.Fatal(err)
-	}
-	content, err := os.ReadFile(logPath)
+func withReleaseLatestURL(t *testing.T, url string) {
+	t.Helper()
+	previous := releaseLatestURL
+	releaseLatestURL = url
+	t.Cleanup(func() { releaseLatestURL = previous })
+}
+
+func TestLatestReleaseParsesAssetsAndSendsHeaders(t *testing.T) {
+	var accept, agent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accept = r.Header.Get("Accept")
+		agent = r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte(`{"tag_name":"v0.3.0","assets":[{"name":"hgctl_linux_amd64","browser_download_url":"https://cdn.example/hgctl_linux_amd64","url":"https://api.example/ignored"}]}`))
+	}))
+	defer server.Close()
+	withReleaseLatestURL(t, server.URL)
+
+	rel, err := latestRelease(testContext(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "api --hostname github.com -H Accept: application/vnd.github+json repos/x2x3studio/hgctl/releases/latest\n"
-	if string(content) != want {
-		t.Fatalf("gh call = %q, want %q", content, want)
+	if rel.TagName != "v0.3.0" || len(rel.Assets) != 1 {
+		t.Fatalf("parsed release = %+v", rel)
+	}
+	if rel.Assets[0].Name != "hgctl_linux_amd64" || rel.Assets[0].URL != "https://cdn.example/hgctl_linux_amd64" {
+		t.Fatalf("asset = %+v, want browser_download_url", rel.Assets[0])
+	}
+	if accept != "application/vnd.github+json" {
+		t.Fatalf("Accept = %q", accept)
+	}
+	if agent == "" {
+		t.Fatal("GitHub API requires a non-empty User-Agent")
+	}
+}
+
+func TestUpdateInstallsReleaseOverHTTP(t *testing.T) {
+	app := testApp(t)
+	tag := "v0.3.0"
+	assetName := executableAssetName()
+	binary := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\n" + tag + "\\n'\n")
+	sum := sha256.Sum256(binary)
+	checksums := hex.EncodeToString(sum[:]) + "  " + assetName + "\n"
+
+	var base string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") == "" {
+			t.Error("release request missing User-Agent")
+		}
+		_, _ = fmt.Fprintf(w, `{"tag_name":%q,"assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+			tag, assetName, base+"/download/"+assetName, base+"/download/checksums.txt")
+	})
+	// Redirect the binary to a distinct path to prove net/http follows the CDN hop.
+	mux.HandleFunc("/download/"+assetName, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, base+"/cdn/"+assetName, http.StatusFound)
+	})
+	mux.HandleFunc("/cdn/"+assetName, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(binary) })
+	mux.HandleFunc("/download/checksums.txt", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(checksums)) })
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	base = server.URL
+	withReleaseLatestURL(t, server.URL+"/releases/latest")
+
+	if err := app.update(testContext(t), true); err != nil {
+		t.Fatal(err)
+	}
+	target, err := os.Readlink(filepath.Join(app.Paths.Bin, "hgctl"))
+	if err != nil {
+		t.Fatalf("stable symlink not created: %v", err)
+	}
+	if !strings.Contains(target, filepath.Join("versions", "0.3.0", "hgctl")) {
+		t.Fatalf("symlink target = %q, want the 0.3.0 version dir", target)
+	}
+}
+
+func TestUpdateRejectsChecksumMismatch(t *testing.T) {
+	app := testApp(t)
+	tag := "v0.3.0"
+	assetName := executableAssetName()
+	binary := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\n" + tag + "\\n'\n")
+	wrongChecksums := strings.Repeat("0", 64) + "  " + assetName + "\n"
+
+	var base string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"tag_name":%q,"assets":[{"name":%q,"browser_download_url":%q},{"name":"checksums.txt","browser_download_url":%q}]}`,
+			tag, assetName, base+"/download/"+assetName, base+"/download/checksums.txt")
+	})
+	mux.HandleFunc("/download/"+assetName, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(binary) })
+	mux.HandleFunc("/download/checksums.txt", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(wrongChecksums)) })
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	base = server.URL
+	withReleaseLatestURL(t, server.URL+"/releases/latest")
+
+	if err := app.update(testContext(t), true); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("update err = %v, want checksum mismatch", err)
+	}
+	if _, err := os.Lstat(filepath.Join(app.Paths.Bin, "hgctl")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a mismatched download must not install a binary: %v", err)
 	}
 }

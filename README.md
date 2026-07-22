@@ -118,13 +118,15 @@ checksums.txt
 ```
 
 Auto-update runs inside the scheduled `sync --update` (throttled to at most one
-check every five minutes): it fetches the latest release, verifies the checksum,
-and atomically retargets the stable `~/.local/bin/hgctl` symlink. `hgctl update`
+check per hour): it fetches the latest release, verifies the checksum, and
+atomically retargets the stable `~/.local/bin/hgctl` symlink. `hgctl update`
 forces a check now.
 
-This repository is currently private, so the updater uses authenticated `gh` to
-fetch releases. Going public and dropping the `gh` dependency is a planned
-formal-release step.
+This repository is public, so the self-update fetches the latest release and
+its assets over unauthenticated HTTPS with the Go standard library - no `gh`
+needed. `gh` is still used for the optional `repository_dispatch` that notifies
+the private hourglass data repo, and git transport uses SSH; only the `hgctl`
+self-update is gh-free.
 
 ## Development
 
