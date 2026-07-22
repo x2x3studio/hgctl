@@ -86,25 +86,29 @@ Per-session transcript ingest is the single intake path, for both live and
 historical sessions - there are no per-turn capture hooks. `hgctl ingest` and
 every scheduled `hgctl sync` read the local Claude Code and Codex transcripts on
 disk (`~/.claude/projects/**`, `~/.codex/sessions/**`), render one bounded event
-per session, and enqueue new sessions oldest-first stamped with their real
-historical time. An event is just a Markdown file with closed frontmatter
+carrying the full session-so-far, and enqueue it stamped with the session's
+latest-activity time. An event is just a Markdown file with closed frontmatter
 (`captured_at`, `client`, `machine`) and a free-form body - the intake protocol
 has no kinds or validation.
 
-A session is ingested only once its transcript file has been idle (unmodified)
-for `HG_INGEST_IDLE` (a Go duration, default 15 minutes), so an in-progress
-conversation is never ingested mid-flight while a completed or historical
-session is eligible by definition. A client-namespaced dedup ledger keeps
-re-runs idempotent, and a session that renders to an empty body is never
-enqueued.
+Intake is hot and cumulative: knowledge flows in while a session is live. A
+per-session ledger marker records the transcript byte size and time of the last
+snapshot; a session is re-snapshotted whenever its transcript has grown past that
+marker, throttled to at most once per `HG_INGEST_MIN_INTERVAL` (a Go duration,
+default 5 minutes) so a rapidly-growing live session does not churn. A session
+that stops growing simply produces no new snapshot - its last snapshot is the
+final complete one, so there is no idle or session-end handling. A historical
+session that is not growing ingests exactly once. Sessions that render to an
+empty body are never enqueued. The reflect step is idempotent, so re-processing a
+grown session hot-updates its note and the summary accumulates.
 
-`hgctl ingest` is the operator/bulk entry point: it drains the whole backlog in
-one batch and pushes once so it lands on origin before the command returns.
-`--client` selects the source (`all`, `claude`, or `codex`); `--limit` caps a
-run. Each scheduled `hgctl sync` folds in a small, bounded ingest of newly-idle
-sessions before it drains the outbox - filtering by the dedup ledger and file
-mtime first and capping how many it parses per run - so live sessions land
-per-session with no per-turn hooks.
+`hgctl ingest` is the operator/bulk entry point: it snapshots every new-or-grown
+session, drains the whole backlog in one batch, and pushes once so it lands on
+origin before the command returns. `--client` selects the source (`all`,
+`claude`, or `codex`); `--limit` caps a run. Each scheduled `hgctl sync` folds in
+a small, bounded re-ingest before it drains the outbox - filtering cheaply by the
+ledger marker and file size first, and capping how many it parses per run - so
+live sessions land per-session with no per-turn hooks.
 
 `hgctl sync` atomically drains the outbox, appends bounded queue commits, pushes
 only the machine branch, requests reconciliation, pulls `shared`, and reindexes

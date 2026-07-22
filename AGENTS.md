@@ -37,12 +37,15 @@ self-updates.
   user systemd timer with the same logical name). The scheduler runs
   `sync --update` about once a minute; neither needs a daemon.
 - Per-session transcript ingest is the single intake path (live + historical);
-  there are no per-turn capture hooks. Ingest is idle-gated (a transcript must be
-  unmodified for `HG_INGEST_IDLE`, default 15 minutes, before it is eligible),
-  bounded, oldest-first, and idempotent via a client-namespaced dedup ledger; a
-  session that renders empty is never enqueued. Install, background repair, and
-  uninstall prune any stale hgctl hook left in a client config; the `hook`
-  subcommand is a clean no-op kept only so a stale registration disrupts nothing.
+  there are no per-turn capture hooks. Intake is hot and cumulative: a per-session
+  ledger marker (last-ingested byte size + time) drives a re-snapshot of the full
+  session-so-far whenever the transcript grows past the marker, throttled to at
+  most once per `HG_INGEST_MIN_INTERVAL` (default 5 minutes). A session that stops
+  growing needs no idle/end handling - its last snapshot is the final one - and a
+  non-growing historical session ingests exactly once; empty-rendering sessions
+  are never enqueued. Install, background repair, and uninstall prune any stale
+  hgctl hook left in a client config; the `hook` subcommand is a clean no-op kept
+  only so a stale registration disrupts nothing.
 - Only `sync` writes Git. It appends to `queue/<machine-id>` and fast-forwards
   the local `shared` worktree; it never commits to `main` or `shared`.
 - A new machine's `queue/<machine-id>` is an ORPHAN root with no `main` or
@@ -62,11 +65,12 @@ An event is just a Markdown file with closed frontmatter (`captured_at`,
 `client`, `machine`) and a free-form body. There are no kinds, schema, or
 validation: intake is deliberately dumb and liberal (loose in, strict out) -
 all strictness lives in the one central reflect step, not at intake.
-`hgctl ingest [--client all|claude|codex]` is the operator/bulk entry point for
-per-session ingest; every scheduled `hgctl sync` folds in a small, bounded
-ingest of newly-idle sessions before draining the outbox. Both read the local
-Claude Code and Codex transcripts, stamp each session with its real historical
-time, and enqueue new ones oldest-first.
+`hgctl ingest [--client all|claude|codex]` is the operator/bulk entry point;
+every scheduled `hgctl sync` folds in a small, bounded re-ingest of new-or-grown
+sessions before draining the outbox. Each event carries the full session-so-far,
+stamped with the session's latest-activity time; the reflect step is idempotent,
+so re-processing a grown session accumulates into its note rather than
+duplicating it.
 
 ## Recall boundary
 
