@@ -233,7 +233,7 @@ func runCodexAppServerHelper() error {
 			}
 			hooks := fakeCodexHooks(stable, filepath.Join(home, ".codex", "hooks.json"), trusted)
 			if mode == "missing" {
-				hooks = hooks[:2]
+				hooks = hooks[:1]
 			}
 			if mode == "duplicate" {
 				hooks = append(hooks, hooks[0])

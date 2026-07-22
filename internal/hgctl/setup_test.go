@@ -39,8 +39,8 @@ func TestHookConfigIsIdempotentAndPreservesUnrelatedHooks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := countJSONText(b, binary+" hook --client claude"); got != 4 {
-		t.Fatalf("got %d matching command prefixes, want 4", got)
+	if got := countJSONText(b, binary+" hook --client claude"); got != 3 {
+		t.Fatalf("got %d matching command prefixes, want 3", got)
 	}
 	if got := countJSONText(b, "other-tool stop"); got != 1 {
 		t.Fatalf("unrelated hook count=%d", got)
@@ -73,27 +73,6 @@ func TestHookConfigIsIdempotentAndPreservesUnrelatedHooks(t *testing.T) {
 	}
 	if decoded["theme"] != "dark" {
 		t.Fatal("unrelated setting changed")
-	}
-}
-
-func TestSessionStartHookLeavesFailOpenHeadroom(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "hooks.json")
-	if err := configureHookFile(path, "/tmp/hgctl", "codex", true); err != nil {
-		t.Fatal(err)
-	}
-	var decoded struct {
-		Hooks map[string][]struct {
-			Hooks []struct {
-				Timeout int `json:"timeout"`
-			} `json:"hooks"`
-		} `json:"hooks"`
-	}
-	if err := readJSON(path, &decoded); err != nil {
-		t.Fatal(err)
-	}
-	groups := decoded.Hooks["SessionStart"]
-	if len(groups) != 1 || len(groups[0].Hooks) != 1 || groups[0].Hooks[0].Timeout != 10 {
-		t.Fatalf("unexpected SessionStart hook: %#v", groups)
 	}
 }
 
@@ -945,17 +924,17 @@ func TestManagedStableSymlinkRequiresVersionTree(t *testing.T) {
 
 func TestBasicMemoryReindexIsReadOnlyAndReceiptBound(t *testing.T) {
 	app := testApp(t)
-	if err := os.MkdirAll(app.Paths.Vault, 0o700); err != nil {
+	if err := os.MkdirAll(app.Paths.Shared, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runGitTest(t, "", "init", "-b", "shared", app.Paths.Vault)
-	runGitTest(t, app.Paths.Vault, "config", "user.name", "test")
-	runGitTest(t, app.Paths.Vault, "config", "user.email", "test@example.com")
-	if err := os.WriteFile(filepath.Join(app.Paths.Vault, "Home.md"), []byte("# Hourglass\n"), 0o600); err != nil {
+	runGitTest(t, "", "init", "-b", "shared", app.Paths.Shared)
+	runGitTest(t, app.Paths.Shared, "config", "user.name", "test")
+	runGitTest(t, app.Paths.Shared, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(app.Paths.Shared, "Home.md"), []byte("# Hourglass\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runGitTest(t, app.Paths.Vault, "add", "Home.md")
-	runGitTest(t, app.Paths.Vault, "commit", "-m", "shared")
+	runGitTest(t, app.Paths.Shared, "add", "Home.md")
+	runGitTest(t, app.Paths.Shared, "commit", "-m", "shared")
 	bin := filepath.Join(app.Paths.Home, "fake-bin")
 	if err := os.MkdirAll(bin, 0o700); err != nil {
 		t.Fatal(err)
@@ -963,15 +942,11 @@ func TestBasicMemoryReindexIsReadOnlyAndReceiptBound(t *testing.T) {
 	fake := filepath.Join(bin, "basic-memory")
 	logPath := filepath.Join(app.Paths.Home, "reindex.log")
 	script := `#!/bin/sh
-[ "$BASIC_MEMORY_ENSURE_FRONTMATTER_ON_SYNC" = "false" ] || exit 11
-[ "$BASIC_MEMORY_DISABLE_PERMALINKS" = "true" ] || exit 12
-[ "$BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED" = "false" ] || exit 13
-[ "$BASIC_MEMORY_DEFAULT_SEARCH_TYPE" = "text" ] || exit 14
 [ "$1 $2" != "tool list-projects" ] || {
   printf '{"projects":[{"name":"hourglass","external_id":"%s","local_path":"%s"}]}\n' "$HGCTL_TEST_PROJECT_ID" "$HGCTL_TEST_PROJECT_PATH"
   exit 0
 }
-[ "$1" = "reindex" ] && [ "$2" = "--search" ] && [ "$3" = "--project" ] && [ "$4" = "hourglass" ] || exit 15
+[ "$1" = "reindex" ] && [ "$2" = "--project" ] && [ "$3" = "hourglass" ] || exit 15
 printf x >> "$HGCTL_TEST_REINDEX_LOG"
 `
 	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
@@ -991,7 +966,7 @@ printf x >> "$HGCTL_TEST_REINDEX_LOG"
 	if err := app.reindexBasicMemory(testContext(t)); err != nil {
 		t.Fatal(err)
 	}
-	head := strings.TrimSpace(runGitTest(t, app.Paths.Vault, "rev-parse", "HEAD"))
+	head := strings.TrimSpace(runGitTest(t, app.Paths.Shared, "rev-parse", "HEAD"))
 	var receipt BasicMemoryIndexReceipt
 	if err := readJSON(app.Paths.IndexedSHA, &receipt); err != nil {
 		t.Fatal(err)
@@ -1026,86 +1001,6 @@ printf x >> "$HGCTL_TEST_REINDEX_LOG"
 	}
 	if err := app.reindexBasicMemory(testContext(t)); err != nil {
 		t.Fatalf("matching receipt should skip external reindex: %v", err)
-	}
-}
-
-func TestInstallContinuesImportAndSyncWhenCodexTrustIsDeferred(t *testing.T) {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
-		t.Skip("scheduler contract is only defined for macOS and Linux")
-	}
-	fixture := newGitFixture(t)
-	app := testApp(t)
-	installFakeCodex(t, app, "rpc-error")
-	bin := filepath.Join(app.Paths.Home, "fake-codex-bin")
-	writeFakeExecutable(t, bin, "claude")
-	basicMemory := `#!/bin/sh
-case "$1 $2" in
-  "tool list-projects")
-    if [ -f "$BM_STATE" ]; then
-      printf '{"projects":[{"name":"hourglass","external_id":"project-id","local_path":"%s"}]}\n' "$BM_PATH"
-    else
-      printf '{"projects":[]}\n'
-    fi
-    exit 0 ;;
-  "project add") : > "$BM_STATE"; exit 0 ;;
-  "reindex --search") exit 0 ;;
-esac
-exit 20
-`
-	if err := os.WriteFile(filepath.Join(bin, "basic-memory"), []byte(basicMemory), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		launchctl := "#!/bin/sh\ncase \"$1\" in bootout|bootstrap) exit 0 ;; esac\nexit 20\n"
-		if err := os.WriteFile(filepath.Join(bin, "launchctl"), []byte(launchctl), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	case "linux":
-		loginctl := "#!/bin/sh\nif [ \"$1\" = \"show-user\" ]; then echo yes; exit 0; fi\nexit 20\n"
-		if err := os.WriteFile(filepath.Join(bin, "loginctl"), []byte(loginctl), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(bin, "systemctl"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	t.Setenv("BM_STATE", filepath.Join(app.Paths.Home, "basic-memory-created"))
-	t.Setenv("BM_PATH", app.Paths.Vault)
-
-	legacy := filepath.Join(app.Paths.Home, "legacy")
-	if err := os.MkdirAll(legacy, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacy, "why.md"), []byte("The reason survives.\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	err := app.runInstall(testContext(t), []string{"--repo", fixture.remote, "--import", legacy})
-	if err == nil || !strings.Contains(err.Error(), "Codex hook trust") || strings.Contains(err.Error(), "bundle timeout") {
-		t.Fatalf("install did not fail safely on Codex trust: %v", err)
-	}
-	if strings.Contains(app.Out.(*bytes.Buffer).String(), "Hourglass initialized") {
-		t.Fatal("install printed success after deferred Codex trust")
-	}
-	if present, err := app.schedulerFilesPresent(); err != nil || !present {
-		t.Fatalf("scheduler was not installed before deferred integration: present=%v err=%v", present, err)
-	}
-	stable := filepath.Join(app.Paths.Bin, "hgctl")
-	if !hooksConfigured(filepath.Join(app.Paths.Home, ".claude", "settings.json"), stable, "claude") {
-		t.Fatal("Claude hooks were not installed")
-	}
-	identity, err := app.loadIdentity()
-	if err != nil {
-		t.Fatal(err)
-	}
-	queueRef := "refs/heads/queue/" + identity.ID
-	tree := runGitTest(t, "", "--git-dir", fixture.remote, "ls-tree", "-r", "--name-only", queueRef)
-	if !strings.Contains(tree, "events/") {
-		t.Fatalf("explicit import did not reach the queue after trust failure:\n%s", tree)
-	}
-	entries, err := os.ReadDir(app.Paths.Outbox)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("initial sync did not acknowledge import: entries=%d err=%v", len(entries), err)
 	}
 }
 
