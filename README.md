@@ -7,8 +7,8 @@ from shell scripts plus the official Claude Action, not from any tool here.
 ## Minimal loop
 
 ```text
-Claude Code / Codex
-  -> hgctl hooks and capture
+Claude Code / Codex             (sessions persist as transcripts on disk)
+  -> hgctl per-session ingest    (scheduler-driven; live + historical)
   -> queue/<machine-id>
   -> GitHub Action (reflect: official Claude + Basic Memory)
   -> shared
@@ -24,7 +24,6 @@ must not run Git automation.
 
 ```text
 hgctl install [--repo <git-url>]
-hgctl hook --client <claude|codex> --event <user-prompt|stop>
 hgctl sync [--update]
 hgctl ingest [--client all|claude|codex] [--limit N]
 hgctl update
@@ -33,8 +32,8 @@ hgctl uninstall
 hgctl version
 ```
 
-Hooks always return success to the client. Disk, Git, network, Basic Memory,
-and update failures are diagnostic and retried by the next sync.
+Intake, sync, and update failures are non-fatal: disk, Git, network, Basic
+Memory, and update errors are retried by the next scheduled sync.
 
 ## Install
 
@@ -65,36 +64,47 @@ Install creates:
   identity.json      stable random machine UUID
   state.json         repo URL + queue branch
   repo/              control clone (main, shared, queue/<machine-id>)
-  outbox/ queue/ pending/ shared/
+  outbox/ queue/ shared/
 
 ~/hourglass-vault/   Basic Memory project (recall mirror)
 ```
 
-It also installs one scheduler, managed Claude Code and Codex hooks, the Basic
-Memory project `hourglass`, and the `hourglass-memory` MCP server in every
-installed client. It verifies the exact MCP command, arguments, environment,
-project identity, and indexed `shared` revision. Run `hgctl doctor` until all
-managed checks pass.
+It also installs one scheduler, the Basic Memory project `hourglass`, and the
+`hourglass-memory` MCP server in every installed client, and prunes any stale
+hgctl capture hook left in a Claude Code or Codex config by an older version. It
+verifies the exact MCP command, arguments, environment, project identity, and
+indexed `shared` revision. Run `hgctl doctor` until all managed checks pass.
 
 On macOS the one scheduler label is `com.x2x3studio.hgctl.sync` (a LaunchAgent);
 Ubuntu uses a user systemd timer with the same logical name. Neither needs an
 application daemon or a Go/Python runtime. The scheduler runs `hgctl sync
 --update` about once a minute.
 
-## Capture, ingest, and sync
+## Ingest and sync
 
-Capture is automatic and hook-driven. `UserPromptSubmit` stages the bounded
-prompt; `Stop` pairs it with the bounded response and enqueues one turn event.
-An event is just a Markdown file with closed frontmatter (`captured_at`,
-`client`, `machine`) and a free-form body - the intake protocol has no kinds or
-validation.
+Per-session transcript ingest is the single intake path, for both live and
+historical sessions - there are no per-turn capture hooks. `hgctl ingest` and
+every scheduled `hgctl sync` read the local Claude Code and Codex transcripts on
+disk (`~/.claude/projects/**`, `~/.codex/sessions/**`), render one bounded event
+per session, and enqueue new sessions oldest-first stamped with their real
+historical time. An event is just a Markdown file with closed frontmatter
+(`captured_at`, `client`, `machine`) and a free-form body - the intake protocol
+has no kinds or validation.
 
-`hgctl ingest` is the one-time historical backlog counterpart to the Stop hook.
-It reads local Claude Code and Codex transcripts, stamps each session with its
-real historical time, and enqueues every new one oldest-first in one batch, then
-pushes once so the backlog lands on origin before the command returns. A dedup
-ledger keeps re-runs idempotent. `--client` selects the source (`all`, `claude`,
-or `codex`); `--limit` caps a run.
+A session is ingested only once its transcript file has been idle (unmodified)
+for `HG_INGEST_IDLE` (a Go duration, default 15 minutes), so an in-progress
+conversation is never ingested mid-flight while a completed or historical
+session is eligible by definition. A client-namespaced dedup ledger keeps
+re-runs idempotent, and a session that renders to an empty body is never
+enqueued.
+
+`hgctl ingest` is the operator/bulk entry point: it drains the whole backlog in
+one batch and pushes once so it lands on origin before the command returns.
+`--client` selects the source (`all`, `claude`, or `codex`); `--limit` caps a
+run. Each scheduled `hgctl sync` folds in a small, bounded ingest of newly-idle
+sessions before it drains the outbox - filtering by the dedup ledger and file
+mtime first and capping how many it parses per run - so live sessions land
+per-session with no per-turn hooks.
 
 `hgctl sync` atomically drains the outbox, appends bounded queue commits, pushes
 only the machine branch, requests reconciliation, pulls `shared`, and reindexes
