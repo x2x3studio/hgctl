@@ -19,26 +19,37 @@ const (
 	maxIngestBody     = 16 * 1024
 	maxIngestTurn     = 1500
 	minIngestUserText = 40
-	// defaultIngestIdle gates live ingest: a transcript whose file has not been
-	// modified for at least this long is treated as a completed session, so an
-	// in-progress conversation is never ingested mid-flight. Historical sessions
-	// are idle by definition. Override with HG_INGEST_IDLE (a Go duration).
-	defaultIngestIdle = 15 * time.Minute
-	// syncIngestLimit bounds how many newly-idle sessions one scheduler-driven
-	// sync ingests, so a sync stays within its context budget; the remainder is
+	// defaultIngestMinInterval throttles the hot re-ingest of a still-growing
+	// session: its full current content is re-snapshotted at most once per this
+	// interval. A session that stops growing simply produces no new snapshot, so
+	// its last snapshot is the final complete one - there is no idle/end handling.
+	// Override with HG_INGEST_MIN_INTERVAL (a Go duration).
+	defaultIngestMinInterval = 5 * time.Minute
+	// syncIngestLimit bounds how many grown sessions one scheduler-driven sync
+	// re-ingests, so a sync stays within its context budget; the remainder is
 	// picked up by the next run.
 	syncIngestLimit = 8
 )
 
-// ingestIdleThreshold is the minimum file-idle age before a session is eligible
-// for ingest, overridable with HG_INGEST_IDLE (a Go duration such as "10m").
-func ingestIdleThreshold() time.Duration {
-	if raw := os.Getenv("HG_INGEST_IDLE"); raw != "" {
+// ingestMinInterval is the smallest gap between two snapshots of the same growing
+// session, overridable with HG_INGEST_MIN_INTERVAL (a Go duration such as "3m").
+func ingestMinInterval() time.Duration {
+	if raw := os.Getenv("HG_INGEST_MIN_INTERVAL"); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
 			return d
 		}
 	}
-	return defaultIngestIdle
+	return defaultIngestMinInterval
+}
+
+// ingestMark records what was last ingested for one session: the transcript byte
+// size and when that snapshot was taken. Intake re-snapshots a session only once
+// its transcript has grown past Size (and not more often than the min interval),
+// so a session's knowledge flows in while it is live and a historical session
+// that is not growing ingests exactly once.
+type ingestMark struct {
+	Size       int64     `json:"size"`
+	IngestedAt time.Time `json:"ingested_at"`
 }
 
 var ingestWrappers = []*regexp.Regexp{
@@ -51,27 +62,31 @@ var ingestWrappers = []*regexp.Regexp{
 type ingestTurn struct{ role, text string }
 
 type ingestSession struct {
-	id, cwd, title, firstTS string
-	turns                   []ingestTurn
+	id, cwd, title, firstTS, lastTS string
+	turns                           []ingestTurn
 }
 
-// ingestCandidate is one extracted session ready to enqueue. It is tagged with
-// the client so its dedup key never collides across sources, and it carries the
-// real historical session time so the event filename orders the backlog by when
-// the work actually happened rather than by when ingest ran.
+// ingestCandidate is one extracted session snapshot ready to enqueue. It is
+// tagged with the client so its dedup key never collides across sources, carries
+// the session's latest-activity time so the event filename orders the backlog by
+// when the work happened, and records the transcript byte size so the ledger can
+// tell when the session next grows.
 type ingestCandidate struct {
 	client   string
 	id       string
 	captured time.Time
 	body     string
+	size     int64
 }
 
-// runIngest reads local agent session transcripts and publishes every new one as
-// a bounded raw event, oldest first, stamped with its real historical time. It is
-// the per-session intake path (live + historical): intake only, never a Basic
-// Memory write. Unlike the steady-state sync, it drains the whole outbox to the
-// machine queue branch in large batches and pushes once, so an operator-invoked
-// import lands on origin before the command returns.
+// runIngest reads local agent session transcripts and publishes each new-or-grown
+// one as a bounded raw event, oldest first, stamped with its latest-activity time.
+// It is the operator/bulk entry point for per-session intake (live + historical):
+// intake only, never a Basic Memory write. Unlike the steady-state sync, it drains
+// the whole outbox to the machine queue branch in large batches and pushes once,
+// so an operator-invoked import lands on origin before the command returns. It does
+// not throttle (minInterval 0): an explicit run always snapshots the current state
+// of any grown session, while the size marker keeps unchanged sessions idempotent.
 func (a *App) runIngest(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
@@ -88,12 +103,12 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	seen, err := a.loadIngestedSessions()
+	marks, err := a.loadIngestedSessions()
 	if err != nil {
 		return err
 	}
-	enqueued, ingestErr := a.ingestIdleSessions(id, seen, clients, *limit, 0, ingestIdleThreshold())
-	if err := a.saveIngestedSessions(seen); err != nil {
+	enqueued, ingestErr := a.ingestGrownSessions(id, marks, clients, *limit, 0, 0)
+	if err := a.saveIngestedSessions(marks); err != nil {
 		return errors.Join(ingestErr, err)
 	}
 	if ingestErr != nil {
@@ -101,30 +116,31 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 	}
 	delivered, derr := a.bulkPublishQueue(ctx)
 	if errors.Is(derr, os.ErrNotExist) {
-		_, err = fmt.Fprintf(a.Out, "ingested %d new session(s) into the outbox; run 'hgctl sync' to publish\n", enqueued)
+		_, err = fmt.Fprintf(a.Out, "ingested %d session snapshot(s) into the outbox; run 'hgctl sync' to publish\n", enqueued)
 		return err
 	}
 	if derr != nil {
 		return derr
 	}
-	_, err = fmt.Fprintf(a.Out, "ingested %d new session(s); published %d queued event(s) to queue/%s\n", enqueued, delivered, id.ID)
+	_, err = fmt.Fprintf(a.Out, "ingested %d session snapshot(s); published %d queued event(s) to queue/%s\n", enqueued, delivered, id.ID)
 	return err
 }
 
-// ingestIdleSessions gathers newly-idle, not-yet-ingested sessions across the
-// given clients, enqueues up to limit of them into the outbox oldest first (0 =
-// no cap), and records each in the dedup ledger. parseCap bounds how many
-// eligible transcripts each client parses per run (0 = no cap); the scheduler
-// path caps it so one sync stays within its context budget. It only writes
-// intake events; the caller publishes the outbox. seen is mutated in place so
-// the caller can persist the ledger even on a partial error.
-func (a *App) ingestIdleSessions(id Identity, seen map[string]bool, clients []string, limit, parseCap int, idle time.Duration) (int, error) {
+// ingestGrownSessions gathers new-or-grown sessions across the given clients,
+// enqueues up to limit of them into the outbox oldest first (0 = no cap), and
+// updates each session's marker in the ledger. parseCap bounds how many eligible
+// transcripts each client parses per run (0 = no cap); the scheduler path caps it
+// so one sync stays within its context budget. minInterval throttles re-snapshots
+// of a still-growing session (0 = no throttle). It only writes intake events; the
+// caller publishes the outbox. marks is mutated in place so the caller can persist
+// the ledger even on a partial error.
+func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clients []string, limit, parseCap int, minInterval time.Duration) (int, error) {
 	var (
 		candidates []ingestCandidate
 		errs       []error
 	)
 	for _, c := range clients {
-		got, err := a.gatherSessions(c, seen, idle, parseCap)
+		got, err := a.gatherSessions(c, marks, minInterval, parseCap)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -135,36 +151,38 @@ func (a *App) ingestIdleSessions(id Identity, seen map[string]bool, clients []st
 	if limit > 0 && len(candidates) > limit {
 		candidates = candidates[:limit]
 	}
+	now := a.Now().UTC()
 	enqueued := 0
 	for _, cand := range candidates {
-		// Dedup keys the event filename to the session so an interrupted re-run
-		// re-enqueues idempotently (overwrites the outbox file, collapses against
-		// an already-published queue event) rather than duplicating reflect work.
+		// Dedup keys the event filename to the session so an interrupted re-run of
+		// the SAME snapshot (marker not yet saved) overwrites its outbox file and
+		// collapses against an already-published queue event, while a later, grown
+		// snapshot lands as a distinct event via its newer captured time.
 		if err := a.enqueue(rawEvent{CapturedAt: cand.captured, Client: cand.client, Machine: id.ID, Hostname: id.Hostname, Body: cand.body, Dedup: ingestKey(cand.client, cand.id)}); err != nil {
 			errs = append(errs, err)
 			break
 		}
-		seen[ingestKey(cand.client, cand.id)] = true
+		marks[ingestKey(cand.client, cand.id)] = ingestMark{Size: cand.size, IngestedAt: now}
 		enqueued++
 	}
 	return enqueued, errors.Join(errs...)
 }
 
 // ingestForSync is the steady-state, scheduler-driven counterpart to runIngest:
-// each sync ingests up to syncIngestLimit newly-idle, not-yet-ingested sessions
-// into the outbox (the queue drain that follows publishes them). It is bounded so
-// a sync stays within its context budget; the remainder is picked up next run.
-// The cheap ledger + idle pre-filters in gatherSessions keep this from reparsing
-// the whole history every run.
+// each sync re-ingests up to syncIngestLimit new-or-grown sessions into the outbox
+// (the queue drain that follows publishes them). It is bounded so a sync stays
+// within its context budget; the remainder is picked up next run. The cheap
+// size-marker pre-filter in gatherSessions keeps this from reparsing unchanged
+// sessions, and the min interval throttles a rapidly-growing live session.
 func (a *App) ingestForSync(id Identity) error {
 	clients, _ := ingestClients("all")
-	seen, err := a.loadIngestedSessions()
+	marks, err := a.loadIngestedSessions()
 	if err != nil {
 		return err
 	}
-	enqueued, ingestErr := a.ingestIdleSessions(id, seen, clients, syncIngestLimit, syncIngestLimit, ingestIdleThreshold())
+	enqueued, ingestErr := a.ingestGrownSessions(id, marks, clients, syncIngestLimit, syncIngestLimit, ingestMinInterval())
 	if enqueued > 0 {
-		if err := a.saveIngestedSessions(seen); err != nil {
+		if err := a.saveIngestedSessions(marks); err != nil {
 			return errors.Join(ingestErr, err)
 		}
 	}
@@ -200,7 +218,7 @@ func sortIngestCandidates(candidates []ingestCandidate) {
 	})
 }
 
-func (a *App) gatherSessions(client string, seen map[string]bool, idle time.Duration, parseCap int) ([]ingestCandidate, error) {
+func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInterval time.Duration, parseCap int) ([]ingestCandidate, error) {
 	var (
 		files   []string
 		extract func(string) (ingestSession, bool)
@@ -220,27 +238,25 @@ func (a *App) gatherSessions(client string, seen map[string]bool, idle time.Dura
 		return nil, err
 	}
 	now := a.Now().UTC()
-	// Cheapest filters first: skip sessions already in the ledger (by the
-	// filename-derived id) and sessions still being written (idle gate) before
-	// opening and parsing the file, so a scheduler-driven sync only parses
-	// genuinely new, completed sessions.
-	type idleFile struct {
+	// Cheapest filter first: stat each transcript and, using the filename-derived
+	// session id, skip any that has not grown past its ledger marker (or was
+	// snapshotted within the min interval) before opening and parsing the file, so
+	// a scheduler-driven sync only parses genuinely new or grown sessions.
+	type grownFile struct {
 		path  string
+		size  int64
 		mtime time.Time
 	}
-	var eligible []idleFile
+	var eligible []grownFile
 	for _, f := range files {
-		if seen[ingestKey(client, pathSessionID(client, f))] {
-			continue
-		}
 		info, statErr := os.Stat(f)
 		if statErr != nil {
 			continue
 		}
-		if now.Sub(info.ModTime()) < idle {
+		if !shouldReingest(marks[ingestKey(client, pathSessionID(client, f))], info.Size(), now, minInterval) {
 			continue
 		}
-		eligible = append(eligible, idleFile{path: f, mtime: info.ModTime()})
+		eligible = append(eligible, grownFile{path: f, size: info.Size(), mtime: info.ModTime()})
 	}
 	// A bounded run (parseCap > 0, used by the scheduler-driven sync) parses only
 	// the oldest few by file mtime so one sync stays within its context budget; the
@@ -253,10 +269,13 @@ func (a *App) gatherSessions(client string, seen map[string]bool, idle time.Dura
 	var out []ingestCandidate
 	for _, ef := range eligible {
 		session, ok := extract(ef.path)
-		// The post-parse dedup uses the real session id (which the ledger is keyed
-		// on); it also catches the rare transcript whose filename id differs from
-		// its recorded id and slipped past the cheap pre-filter above.
-		if !ok || seen[ingestKey(client, session.id)] {
+		if !ok {
+			continue
+		}
+		// Re-check against the real session id (which the ledger is keyed on); this
+		// also catches the rare transcript whose filename id differs from its
+		// recorded id and slipped past the cheap pre-filter above.
+		if !shouldReingest(marks[ingestKey(client, session.id)], ef.size, now, minInterval) {
 			continue
 		}
 		body := session.render()
@@ -266,12 +285,30 @@ func (a *App) gatherSessions(client string, seen map[string]bool, idle time.Dura
 			continue
 		}
 		captured := now
-		if parsed, ok := parseIngestTime(session.firstTS); ok {
+		if parsed, ok := parseIngestTime(session.lastTS); ok {
+			captured = parsed
+		} else if parsed, ok := parseIngestTime(session.firstTS); ok {
 			captured = parsed
 		}
-		out = append(out, ingestCandidate{client: client, id: session.id, captured: captured, body: body})
+		out = append(out, ingestCandidate{client: client, id: session.id, captured: captured, body: body, size: ef.size})
 	}
 	return out, nil
+}
+
+// shouldReingest reports whether a transcript now at size should be (re)ingested
+// given its last marker. A session with no marker is new (ingest once); one whose
+// transcript has grown past the marker is re-snapshotted, unless it was already
+// snapshotted within minInterval (throttling a rapidly-growing live session). A
+// session that has not grown is skipped, so a historical transcript ingests once
+// and its last snapshot is its final complete one.
+func shouldReingest(mark ingestMark, size int64, now time.Time, minInterval time.Duration) bool {
+	if mark.IngestedAt.IsZero() {
+		return true
+	}
+	if size <= mark.Size {
+		return false
+	}
+	return now.Sub(mark.IngestedAt) >= minInterval
 }
 
 // pathSessionID recovers a session id from the transcript filename alone, so the
@@ -394,6 +431,9 @@ func extractClaudeSession(path string) (ingestSession, bool) {
 		}
 		role, _ := record["type"].(string)
 		session.turns = append(session.turns, ingestTurn{role: role, text: boundTurn(text)})
+		if ts, _ := record["timestamp"].(string); ts != "" {
+			session.lastTS = ts
+		}
 	}
 	if session.id == "" {
 		session.id = strings.TrimSuffix(filepath.Base(path), ".jsonl")
@@ -480,6 +520,9 @@ func extractCodexSession(path string) (ingestSession, bool) {
 			continue
 		}
 		session.turns = append(session.turns, ingestTurn{role: role, text: boundTurn(text)})
+		if record.Timestamp != "" {
+			session.lastTS = record.Timestamp
+		}
 	}
 	if session.id == "" {
 		session.id = codexIDFromPath(path)
@@ -552,19 +595,38 @@ func (a *App) ingestedSessionsPath() string {
 	return filepath.Join(a.Paths.Data, "ingested-sessions.json")
 }
 
-func (a *App) loadIngestedSessions() (map[string]bool, error) {
-	var ids []string
-	if err := readJSON(a.ingestedSessionsPath(), &ids); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return map[string]bool{}, nil
-		}
+// loadIngestedSessions reads the per-session marker ledger. It transparently
+// migrates the legacy format (a JSON array of ingested keys) to the marker map by
+// giving each key a zero-size marker, so a previously ingested session is
+// re-snapshotted once at its current size after upgrade.
+func (a *App) loadIngestedSessions() (map[string]ingestMark, error) {
+	content, err := os.ReadFile(a.ingestedSessionsPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]ingestMark{}, nil
+	}
+	if err != nil {
 		return nil, err
 	}
-	seen := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		seen[normalizeIngestKey(id)] = true
+	if len(strings.TrimSpace(string(content))) == 0 {
+		return map[string]ingestMark{}, nil
 	}
-	return seen, nil
+	var marks map[string]ingestMark
+	if err := json.Unmarshal(content, &marks); err == nil && marks != nil {
+		normalized := make(map[string]ingestMark, len(marks))
+		for key, mark := range marks {
+			normalized[normalizeIngestKey(key)] = mark
+		}
+		return normalized, nil
+	}
+	var ids []string
+	if err := json.Unmarshal(content, &ids); err != nil {
+		return nil, fmt.Errorf("parse ingest ledger %s: %w", a.ingestedSessionsPath(), err)
+	}
+	marks = make(map[string]ingestMark, len(ids))
+	for _, id := range ids {
+		marks[normalizeIngestKey(id)] = ingestMark{}
+	}
+	return marks, nil
 }
 
 // normalizeIngestKey migrates the pre-namespace ledger: bare UUIDs written before
@@ -576,11 +638,6 @@ func normalizeIngestKey(key string) string {
 	return ingestKey("claude", key)
 }
 
-func (a *App) saveIngestedSessions(seen map[string]bool) error {
-	ids := make([]string, 0, len(seen))
-	for id := range seen {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return writeJSONAtomic(a.ingestedSessionsPath(), ids, 0o600)
+func (a *App) saveIngestedSessions(marks map[string]ingestMark) error {
+	return writeJSONAtomic(a.ingestedSessionsPath(), marks, 0o600)
 }

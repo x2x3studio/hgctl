@@ -34,10 +34,13 @@ func TestExtractClaudeSessionUsesEarliestTimestamp(t *testing.T) {
 	if session.id != "claude-sess-1" {
 		t.Fatalf("id = %q", session.id)
 	}
-	// The earliest message timestamp, not the last, so the backlog orders by
-	// when the session began.
+	// The earliest message timestamp orders sessions in the backlog; the latest
+	// stamps each snapshot so a growing session's snapshots stay monotonic.
 	if session.firstTS != "2026-07-07T02:00:48.505Z" {
 		t.Fatalf("firstTS = %q, want the earliest message time", session.firstTS)
+	}
+	if session.lastTS != "2026-07-07T02:05:00.000Z" {
+		t.Fatalf("lastTS = %q, want the latest message time", session.lastTS)
 	}
 	if len(session.turns) != 3 {
 		t.Fatalf("turns = %d, want 3", len(session.turns))
@@ -69,6 +72,11 @@ func TestExtractCodexSessionMessageExtraction(t *testing.T) {
 	}
 	if session.firstTS != "2026-06-05T03:41:12.298Z" {
 		t.Fatalf("firstTS = %q, want the first line timestamp", session.firstTS)
+	}
+	// lastTS is the latest surviving turn (the assistant reply), not the trailing
+	// event_msg noise line.
+	if session.lastTS != "2026-06-05T03:42:53.021Z" {
+		t.Fatalf("lastTS = %q, want the last turn timestamp", session.lastTS)
 	}
 	// The environment_context user turn is boilerplate and drops out; only the
 	// real user input_text and the assistant output_text survive.
@@ -194,40 +202,55 @@ func TestLoadIngestedSessionsMigratesLegacyLedger(t *testing.T) {
 	if err := writeJSONAtomic(app.ingestedSessionsPath(), []string{"legacy-claude", "codex:known"}, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	seen, err := app.loadIngestedSessions()
+	marks, err := app.loadIngestedSessions()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !seen["claude:legacy-claude"] {
+	legacy, ok := marks["claude:legacy-claude"]
+	if !ok {
 		t.Fatal("legacy bare id was not migrated to the claude namespace")
 	}
-	if !seen["codex:known"] {
+	// A migrated legacy entry has a zero-size marker, so the session is
+	// re-snapshotted once at its current size after upgrade.
+	if legacy.Size != 0 || !legacy.IngestedAt.IsZero() {
+		t.Fatalf("legacy marker = %+v, want a zero marker", legacy)
+	}
+	if _, ok := marks["codex:known"]; !ok {
 		t.Fatal("namespaced codex id was lost on load")
 	}
 }
 
-// A scheduler-driven sync ingests at most syncIngestLimit newly-idle sessions,
-// leaving the remainder for the next run and never touching a still-live session.
-func TestIngestForSyncBoundsAndSkipsLiveSessions(t *testing.T) {
+func TestIngestedSessionsMarkerRoundTrips(t *testing.T) {
+	app := testApp(t)
+	want := map[string]ingestMark{
+		"claude:a": {Size: 4096, IngestedAt: time.Date(2026, 7, 7, 1, 2, 3, 0, time.UTC)},
+		"codex:b":  {Size: 128, IngestedAt: time.Date(2026, 7, 8, 4, 5, 6, 0, time.UTC)},
+	}
+	if err := app.saveIngestedSessions(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := app.loadIngestedSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got["claude:a"] != want["claude:a"] || got["codex:b"] != want["codex:b"] {
+		t.Fatalf("markers did not round-trip: got %+v want %+v", got, want)
+	}
+}
+
+// A scheduler-driven sync re-ingests at most syncIngestLimit new-or-grown
+// sessions, leaving the remainder for the next run; an unchanged session is not
+// re-ingested, and a grown one produces a fresh snapshot.
+func TestIngestForSyncBoundsAndReingestsOnGrowth(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	app := testApp(t)
-	old := app.Now().Add(-time.Hour)
 
 	total := syncIngestLimit + 2
+	paths := make([]string, total)
 	for i := 0; i < total; i++ {
-		p := filepath.Join(home, ".claude", "projects", "proj", fmt.Sprintf("done-%02d.jsonl", i))
-		writeSessionFile(t, p, fmt.Sprintf(`{"type":"user","sessionId":"done-%02d","timestamp":"2026-07-07T02:%02d:00.000Z","message":{"role":"user","content":"A completed question long enough to qualify for ingest number %02d."}}`+"\n", i, i, i))
-		if err := os.Chtimes(p, old, old); err != nil {
-			t.Fatal(err)
-		}
-	}
-	live := filepath.Join(home, ".claude", "projects", "proj", "live.jsonl")
-	writeSessionFile(t, live,
-		`{"type":"user","sessionId":"live","timestamp":"2026-07-07T05:00:00.000Z","message":{"role":"user","content":"A live question long enough to qualify for ingest here too now."}}`+"\n")
-	recent := app.Now().Add(-time.Minute)
-	if err := os.Chtimes(live, recent, recent); err != nil {
-		t.Fatal(err)
+		paths[i] = filepath.Join(home, ".claude", "projects", "proj", fmt.Sprintf("s-%02d.jsonl", i))
+		writeSessionFile(t, paths[i], fmt.Sprintf(`{"type":"user","sessionId":"s-%02d","timestamp":"2026-07-07T02:%02d:00.000Z","message":{"role":"user","content":"A question long enough to qualify for ingest number %02d here."}}`+"\n", i, i, i))
 	}
 
 	id, err := app.loadIdentity()
@@ -240,12 +263,40 @@ func TestIngestForSyncBoundsAndSkipsLiveSessions(t *testing.T) {
 	if got := countOutboxMD(t, app); got != syncIngestLimit {
 		t.Fatalf("first sync enqueued %d, want the bounded %d", got, syncIngestLimit)
 	}
-	// The remainder drains on the next run; the still-live session stays out.
+	// The remainder drains on the next run.
 	if err := app.ingestForSync(id); err != nil {
 		t.Fatal(err)
 	}
 	if got := countOutboxMD(t, app); got != total {
-		t.Fatalf("after two syncs enqueued %d, want all %d completed (live excluded)", got, total)
+		t.Fatalf("after two syncs enqueued %d, want all %d", got, total)
+	}
+	// A third sync re-ingests nothing: every session is unchanged since its marker.
+	if err := app.ingestForSync(id); err != nil {
+		t.Fatal(err)
+	}
+	if got := countOutboxMD(t, app); got != total {
+		t.Fatalf("unchanged sessions were re-ingested: %d, want %d", got, total)
+	}
+
+	// Grow one session past its marker and advance the clock past the min interval;
+	// it is re-snapshotted as a distinct event (new latest-activity time).
+	app.Now = func() time.Time {
+		return time.Date(2026, 7, 21, 1, 2, 3, 0, time.UTC).Add(2 * defaultIngestMinInterval)
+	}
+	grow := "\n" + `{"type":"user","sessionId":"s-00","timestamp":"2026-07-07T06:00:00.000Z","message":{"role":"user","content":"A follow-up question that grows this session well past its marker size."}}` + "\n"
+	f, err := os.OpenFile(paths[0], os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(grow); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := app.ingestForSync(id); err != nil {
+		t.Fatal(err)
+	}
+	if got := countOutboxMD(t, app); got != total+1 {
+		t.Fatalf("grown session did not produce a fresh snapshot: %d, want %d", got, total+1)
 	}
 }
 
@@ -279,7 +330,7 @@ func TestGatherSessionsParseCapSelectsOldestByMtime(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := app.gatherSessions("claude", map[string]bool{}, 15*time.Minute, 2)
+	got, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,76 +358,104 @@ func TestGatherSessionsIsClientNamespaced(t *testing.T) {
 		}, "\n")+"\n")
 
 	app := testApp(t)
-	// Make both transcripts idle relative to the app clock so the idle gate admits
-	// them (a live session's file would be too recently modified).
-	idleMTime := app.Now().Add(-time.Hour)
-	for _, p := range []string{claudePath, codexPath} {
-		if err := os.Chtimes(p, idleMTime, idleMTime); err != nil {
-			t.Fatal(err)
-		}
+	// The Claude session is already ingested at a size no smaller than its current
+	// one, so it is not re-ingested; the codex sibling shares the id string but has
+	// its own namespaced marker (absent) and must ingest.
+	marks := map[string]ingestMark{
+		ingestKey("claude", "shared-id"): {Size: 1 << 20, IngestedAt: app.Now().Add(-time.Hour)},
 	}
-	// Claude id already ingested; the codex sibling must not be treated as seen.
-	seen := map[string]bool{ingestKey("claude", "shared-id"): true}
 
-	claude, err := app.gatherSessions("claude", seen, 15*time.Minute, 0)
+	claude, err := app.gatherSessions("claude", marks, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(claude) != 0 {
-		t.Fatalf("claude sessions = %d, want 0 (already ingested)", len(claude))
+		t.Fatalf("claude sessions = %d, want 0 (already ingested, not grown)", len(claude))
 	}
-	codex, err := app.gatherSessions("codex", seen, 15*time.Minute, 0)
+	codex, err := app.gatherSessions("codex", marks, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(codex) != 1 || codex[0].client != "codex" || codex[0].id != "shared-id" {
 		t.Fatalf("codex sessions = %+v, want one un-deduped codex candidate", codex)
 	}
-	// Its captured time comes from the source line, not the ingest clock.
-	if !codex[0].captured.Equal(time.Date(2026, 7, 7, 2, 30, 0, 0, time.UTC)) {
-		t.Fatalf("codex captured = %s, want the session_meta timestamp", codex[0].captured)
+	// Its captured time is the latest turn's timestamp, not the ingest clock.
+	if !codex[0].captured.Equal(time.Date(2026, 7, 7, 2, 30, 1, 0, time.UTC)) {
+		t.Fatalf("codex captured = %s, want the last turn timestamp", codex[0].captured)
 	}
 }
 
-// The idle gate keeps an in-progress session (recently modified file) out of the
-// backlog while admitting a completed one, and a session whose content cleans to
-// nothing is never enqueued as a zero-content event.
-func TestGatherSessionsIdleGateAndSkipsEmpty(t *testing.T) {
+// A new session ingests regardless of recency; a session that has not grown past
+// its marker is skipped; one that renders empty is never enqueued.
+func TestGatherSessionsGrowthAndSkipsEmpty(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	app := testApp(t)
 
-	completed := filepath.Join(home, ".claude", "projects", "proj", "done.jsonl")
-	writeSessionFile(t, completed,
-		`{"type":"user","sessionId":"done","timestamp":"2026-07-07T02:00:00.000Z","message":{"role":"user","content":"A completed question long enough to qualify for ingest here."}}`+"\n")
-	live := filepath.Join(home, ".claude", "projects", "proj", "live.jsonl")
-	writeSessionFile(t, live,
-		`{"type":"user","sessionId":"live","timestamp":"2026-07-07T03:00:00.000Z","message":{"role":"user","content":"A live question long enough to qualify for ingest here too."}}`+"\n")
+	fresh := filepath.Join(home, ".claude", "projects", "proj", "fresh.jsonl")
+	writeSessionFile(t, fresh,
+		`{"type":"user","sessionId":"fresh","timestamp":"2026-07-07T02:00:00.000Z","message":{"role":"user","content":"A brand new question long enough to qualify for ingest here."}}`+"\n")
+	unchanged := filepath.Join(home, ".claude", "projects", "proj", "unchanged.jsonl")
+	writeSessionFile(t, unchanged,
+		`{"type":"user","sessionId":"unchanged","timestamp":"2026-07-07T03:00:00.000Z","message":{"role":"user","content":"An already ingested question long enough to qualify here."}}`+"\n")
 	// A session whose only user content is boilerplate cleans to nothing and must
 	// not qualify.
 	empty := filepath.Join(home, ".claude", "projects", "proj", "empty.jsonl")
 	writeSessionFile(t, empty,
 		`{"type":"user","sessionId":"empty","timestamp":"2026-07-07T04:00:00.000Z","message":{"role":"user","content":"<system-reminder>only boilerplate here, nothing real at all</system-reminder>"}}`+"\n")
 
-	old := app.Now().Add(-time.Hour)
-	recent := app.Now().Add(-time.Minute)
-	if err := os.Chtimes(completed, old, old); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chtimes(empty, old, old); err != nil {
-		t.Fatal(err)
-	}
-	// The live session was just written, so it is not yet idle.
-	if err := os.Chtimes(live, recent, recent); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := app.gatherSessions("claude", map[string]bool{}, 15*time.Minute, 0)
+	info, err := os.Stat(unchanged)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].id != "done" {
-		t.Fatalf("gathered = %+v, want only the completed idle non-empty session", got)
+	// "unchanged" is marked at exactly its current size, so it is not re-ingested.
+	marks := map[string]ingestMark{
+		ingestKey("claude", "unchanged"): {Size: info.Size(), IngestedAt: app.Now().Add(-time.Hour)},
+	}
+
+	got, err := app.gatherSessions("claude", marks, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].id != "fresh" {
+		t.Fatalf("gathered = %+v, want only the new non-empty session", got)
+	}
+	if got[0].size != mustStatSize(t, fresh) {
+		t.Fatalf("candidate size = %d, want the current transcript size", got[0].size)
+	}
+}
+
+func mustStatSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
+}
+
+func TestShouldReingest(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	interval := 5 * time.Minute
+	// No marker: a new session ingests once regardless of interval.
+	if !shouldReingest(ingestMark{}, 100, now, interval) {
+		t.Fatal("a new session should ingest")
+	}
+	// Not grown: skip.
+	if shouldReingest(ingestMark{Size: 100, IngestedAt: now.Add(-time.Hour)}, 100, now, interval) {
+		t.Fatal("an unchanged session should not re-ingest")
+	}
+	// Grown but within the min interval: throttled.
+	if shouldReingest(ingestMark{Size: 100, IngestedAt: now.Add(-time.Minute)}, 200, now, interval) {
+		t.Fatal("a grown session within the min interval should be throttled")
+	}
+	// Grown and past the min interval: re-ingest.
+	if !shouldReingest(ingestMark{Size: 100, IngestedAt: now.Add(-time.Hour)}, 200, now, interval) {
+		t.Fatal("a grown session past the min interval should re-ingest")
+	}
+	// Grown, with a zero interval (bulk ingest): re-ingest immediately.
+	if !shouldReingest(ingestMark{Size: 100, IngestedAt: now}, 200, now, 0) {
+		t.Fatal("a grown session with no throttle should re-ingest")
 	}
 }
 
