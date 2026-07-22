@@ -19,7 +19,27 @@ const (
 	maxIngestBody     = 16 * 1024
 	maxIngestTurn     = 1500
 	minIngestUserText = 40
+	// defaultIngestIdle gates live ingest: a transcript whose file has not been
+	// modified for at least this long is treated as a completed session, so an
+	// in-progress conversation is never ingested mid-flight. Historical sessions
+	// are idle by definition. Override with HG_INGEST_IDLE (a Go duration).
+	defaultIngestIdle = 15 * time.Minute
+	// syncIngestLimit bounds how many newly-idle sessions one scheduler-driven
+	// sync ingests, so a sync stays within its context budget; the remainder is
+	// picked up by the next run.
+	syncIngestLimit = 8
 )
+
+// ingestIdleThreshold is the minimum file-idle age before a session is eligible
+// for ingest, overridable with HG_INGEST_IDLE (a Go duration such as "10m").
+func ingestIdleThreshold() time.Duration {
+	if raw := os.Getenv("HG_INGEST_IDLE"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return defaultIngestIdle
+}
 
 var ingestWrappers = []*regexp.Regexp{
 	regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`),
@@ -48,10 +68,10 @@ type ingestCandidate struct {
 
 // runIngest reads local agent session transcripts and publishes every new one as
 // a bounded raw event, oldest first, stamped with its real historical time. It is
-// the one-time historical backlog counterpart to the automatic Stop-hook capture:
-// intake only, never a Basic Memory write. Unlike the steady-state sync, it drains
-// the whole outbox to the machine queue branch in large batches and pushes once,
-// so an operator-invoked import lands on origin before the command returns.
+// the per-session intake path (live + historical): intake only, never a Basic
+// Memory write. Unlike the steady-state sync, it drains the whole outbox to the
+// machine queue branch in large batches and pushes once, so an operator-invoked
+// import lands on origin before the command returns.
 func (a *App) runIngest(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
@@ -72,31 +92,12 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	var candidates []ingestCandidate
-	for _, c := range clients {
-		got, err := a.gatherSessions(c, seen)
-		if err != nil {
-			return err
-		}
-		candidates = append(candidates, got...)
-	}
-	sortIngestCandidates(candidates)
-	if *limit > 0 && len(candidates) > *limit {
-		candidates = candidates[:*limit]
-	}
-	enqueued := 0
-	for _, cand := range candidates {
-		// Dedup keys the event filename to the session so an interrupted re-run
-		// re-enqueues idempotently (overwrites the outbox file, collapses against
-		// an already-published queue event) rather than duplicating reflect work.
-		if err := a.enqueue(rawEvent{CapturedAt: cand.captured, Client: cand.client, Machine: id.ID, Hostname: id.Hostname, Body: cand.body, Dedup: ingestKey(cand.client, cand.id)}); err != nil {
-			return err
-		}
-		seen[ingestKey(cand.client, cand.id)] = true
-		enqueued++
-	}
+	enqueued, ingestErr := a.ingestIdleSessions(id, seen, clients, *limit, ingestIdleThreshold())
 	if err := a.saveIngestedSessions(seen); err != nil {
-		return err
+		return errors.Join(ingestErr, err)
+	}
+	if ingestErr != nil {
+		return ingestErr
 	}
 	delivered, derr := a.bulkPublishQueue(ctx)
 	if errors.Is(derr, os.ErrNotExist) {
@@ -108,6 +109,43 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 	}
 	_, err = fmt.Fprintf(a.Out, "ingested %d new session(s); published %d queued event(s) to queue/%s\n", enqueued, delivered, id.ID)
 	return err
+}
+
+// ingestIdleSessions gathers newly-idle, not-yet-ingested sessions across the
+// given clients, enqueues up to limit of them into the outbox oldest first (0 =
+// no cap), and records each in the dedup ledger. It only writes intake events;
+// the caller publishes the outbox. seen is mutated in place so the caller can
+// persist the ledger even on a partial error.
+func (a *App) ingestIdleSessions(id Identity, seen map[string]bool, clients []string, limit int, idle time.Duration) (int, error) {
+	var (
+		candidates []ingestCandidate
+		errs       []error
+	)
+	for _, c := range clients {
+		got, err := a.gatherSessions(c, seen, idle)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		candidates = append(candidates, got...)
+	}
+	sortIngestCandidates(candidates)
+	if limit > 0 && len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	enqueued := 0
+	for _, cand := range candidates {
+		// Dedup keys the event filename to the session so an interrupted re-run
+		// re-enqueues idempotently (overwrites the outbox file, collapses against
+		// an already-published queue event) rather than duplicating reflect work.
+		if err := a.enqueue(rawEvent{CapturedAt: cand.captured, Client: cand.client, Machine: id.ID, Hostname: id.Hostname, Body: cand.body, Dedup: ingestKey(cand.client, cand.id)}); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		seen[ingestKey(cand.client, cand.id)] = true
+		enqueued++
+	}
+	return enqueued, errors.Join(errs...)
 }
 
 func ingestClients(client string) ([]string, bool) {
@@ -139,7 +177,7 @@ func sortIngestCandidates(candidates []ingestCandidate) {
 	})
 }
 
-func (a *App) gatherSessions(client string, seen map[string]bool) ([]ingestCandidate, error) {
+func (a *App) gatherSessions(client string, seen map[string]bool, idle time.Duration) ([]ingestCandidate, error) {
 	var (
 		files   []string
 		extract func(string) (ingestSession, bool)
@@ -158,23 +196,55 @@ func (a *App) gatherSessions(client string, seen map[string]bool) ([]ingestCandi
 	if err != nil {
 		return nil, err
 	}
+	now := a.Now().UTC()
 	var out []ingestCandidate
 	for _, f := range files {
+		// Cheapest filters first: skip sessions already in the ledger (by the
+		// filename-derived id) and sessions still being written (idle gate) before
+		// opening and parsing the file, so a scheduler-driven sync only parses
+		// genuinely new, completed sessions.
+		if seen[ingestKey(client, pathSessionID(client, f))] {
+			continue
+		}
+		info, statErr := os.Stat(f)
+		if statErr != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) < idle {
+			continue
+		}
 		session, ok := extract(f)
+		// The post-parse dedup uses the real session id (which the ledger is keyed
+		// on); it also catches the rare transcript whose filename id differs from
+		// its recorded id and slipped past the cheap pre-filter above.
 		if !ok || seen[ingestKey(client, session.id)] {
 			continue
 		}
 		body := session.render()
+		// Never enqueue a zero-content event; render() is empty when a session has
+		// no surviving turns after boilerplate stripping.
 		if body == "" {
 			continue
 		}
-		captured := a.Now().UTC()
+		captured := now
 		if parsed, ok := parseIngestTime(session.firstTS); ok {
 			captured = parsed
 		}
 		out = append(out, ingestCandidate{client: client, id: session.id, captured: captured, body: body})
 	}
 	return out, nil
+}
+
+// pathSessionID recovers a session id from the transcript filename alone, so the
+// dedup ledger can skip an already-ingested session without parsing it. It equals
+// the parsed session id for well-formed transcripts (Claude names files by
+// sessionId; Codex names them rollout-<ts>-<uuid>); the post-parse dedup check
+// still uses the real id, so a rare filename/id mismatch only costs one reparse.
+func pathSessionID(client, path string) string {
+	if client == "codex" {
+		return codexIDFromPath(path)
+	}
+	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
 }
 
 func parseIngestTime(value string) (time.Time, bool) {

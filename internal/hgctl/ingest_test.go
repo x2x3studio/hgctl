@@ -209,26 +209,36 @@ func TestGatherSessionsIsClientNamespaced(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	// A Claude and a Codex session that happen to share the same id string.
-	writeSessionFile(t, filepath.Join(home, ".claude", "projects", "proj", "shared.jsonl"),
+	claudePath := filepath.Join(home, ".claude", "projects", "proj", "shared.jsonl")
+	writeSessionFile(t, claudePath,
 		`{"type":"user","sessionId":"shared-id","timestamp":"2026-07-07T02:00:00.000Z","message":{"role":"user","content":"A Claude question long enough to qualify for ingest here."}}`+"\n")
-	writeSessionFile(t, filepath.Join(home, ".codex", "sessions", "2026", "07", "07", "rollout-2026-07-07T10-00-00-shared.jsonl"),
+	codexPath := filepath.Join(home, ".codex", "sessions", "2026", "07", "07", "rollout-2026-07-07T10-00-00-shared.jsonl")
+	writeSessionFile(t, codexPath,
 		strings.Join([]string{
 			`{"timestamp":"2026-07-07T02:30:00.000Z","type":"session_meta","payload":{"id":"shared-id"}}`,
 			`{"timestamp":"2026-07-07T02:30:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"A Codex question long enough to qualify for ingest here."}]}}`,
 		}, "\n")+"\n")
 
 	app := testApp(t)
+	// Make both transcripts idle relative to the app clock so the idle gate admits
+	// them (a live session's file would be too recently modified).
+	idleMTime := app.Now().Add(-time.Hour)
+	for _, p := range []string{claudePath, codexPath} {
+		if err := os.Chtimes(p, idleMTime, idleMTime); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// Claude id already ingested; the codex sibling must not be treated as seen.
 	seen := map[string]bool{ingestKey("claude", "shared-id"): true}
 
-	claude, err := app.gatherSessions("claude", seen)
+	claude, err := app.gatherSessions("claude", seen, 15*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(claude) != 0 {
 		t.Fatalf("claude sessions = %d, want 0 (already ingested)", len(claude))
 	}
-	codex, err := app.gatherSessions("codex", seen)
+	codex, err := app.gatherSessions("codex", seen, 15*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,6 +248,48 @@ func TestGatherSessionsIsClientNamespaced(t *testing.T) {
 	// Its captured time comes from the source line, not the ingest clock.
 	if !codex[0].captured.Equal(time.Date(2026, 7, 7, 2, 30, 0, 0, time.UTC)) {
 		t.Fatalf("codex captured = %s, want the session_meta timestamp", codex[0].captured)
+	}
+}
+
+// The idle gate keeps an in-progress session (recently modified file) out of the
+// backlog while admitting a completed one, and a session whose content cleans to
+// nothing is never enqueued as a zero-content event.
+func TestGatherSessionsIdleGateAndSkipsEmpty(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	app := testApp(t)
+
+	completed := filepath.Join(home, ".claude", "projects", "proj", "done.jsonl")
+	writeSessionFile(t, completed,
+		`{"type":"user","sessionId":"done","timestamp":"2026-07-07T02:00:00.000Z","message":{"role":"user","content":"A completed question long enough to qualify for ingest here."}}`+"\n")
+	live := filepath.Join(home, ".claude", "projects", "proj", "live.jsonl")
+	writeSessionFile(t, live,
+		`{"type":"user","sessionId":"live","timestamp":"2026-07-07T03:00:00.000Z","message":{"role":"user","content":"A live question long enough to qualify for ingest here too."}}`+"\n")
+	// A session whose only user content is boilerplate cleans to nothing and must
+	// not qualify.
+	empty := filepath.Join(home, ".claude", "projects", "proj", "empty.jsonl")
+	writeSessionFile(t, empty,
+		`{"type":"user","sessionId":"empty","timestamp":"2026-07-07T04:00:00.000Z","message":{"role":"user","content":"<system-reminder>only boilerplate here, nothing real at all</system-reminder>"}}`+"\n")
+
+	old := app.Now().Add(-time.Hour)
+	recent := app.Now().Add(-time.Minute)
+	if err := os.Chtimes(completed, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(empty, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// The live session was just written, so it is not yet idle.
+	if err := os.Chtimes(live, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := app.gatherSessions("claude", map[string]bool{}, 15*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].id != "done" {
+		t.Fatalf("gathered = %+v, want only the completed idle non-empty session", got)
 	}
 }
 
