@@ -70,6 +70,9 @@ func (a *App) initGit(ctx context.Context, state State) error {
 	if err := a.ensureWorktree(ctx, a.Paths.Shared, "shared", "origin/shared"); err != nil {
 		return err
 	}
+	if err := a.ensureQueueBranch(ctx, state.QueueBranch); err != nil {
+		return err
+	}
 	if err := a.ensureWorktree(ctx, a.Paths.Queue, state.QueueBranch, queueStartRef(ctx, a.Paths.Control, state.QueueBranch)); err != nil {
 		return err
 	}
@@ -157,6 +160,64 @@ func queueStartRef(ctx context.Context, control, branch string) string {
 		return "origin/" + branch
 	}
 	return "origin/queue-template"
+}
+
+// ensureQueueBranch guarantees a local queue branch exists before the queue
+// worktree is created. It prefers an existing machine queue or the shared
+// queue-template (the unchanged onboarding path); on a fresh machine whose
+// remote carries neither, it self-seeds an orphan queue branch so onboarding
+// never depends on a server-side template.
+func (a *App) ensureQueueBranch(ctx context.Context, branch string) error {
+	if gitRefExists(ctx, a.Paths.Control, "refs/heads/"+branch) {
+		return nil
+	}
+	if gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+branch) {
+		return nil
+	}
+	if gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/queue-template") {
+		return nil
+	}
+	return a.seedOrphanQueueBranch(ctx, branch)
+}
+
+// seedOrphanQueueBranch creates the machine queue branch as a parentless (orphan)
+// root commit tracking an empty events/.gitkeep, then publishes it to origin. The
+// commit is built through a temporary index so the control worktree, index, and
+// HEAD stay untouched, and it preserves the queue orphan + append-only invariant:
+// the only tracked path lives under events/.
+func (a *App) seedOrphanQueueBranch(ctx context.Context, branch string) error {
+	scratch, err := os.MkdirTemp("", "hgctl-queue-seed")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(scratch)
+
+	placeholder := filepath.Join(scratch, "gitkeep")
+	if err := os.WriteFile(placeholder, nil, 0o600); err != nil {
+		return err
+	}
+	blob, err := runCommand(ctx, a.Paths.Control, "git", "hash-object", "-w", placeholder)
+	if err != nil {
+		return err
+	}
+	indexEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(scratch, "index")}
+	if _, err := runCommandEnv(ctx, a.Paths.Control, indexEnv, "git", "update-index", "--add",
+		"--cacheinfo", "100644,"+strings.TrimSpace(blob)+",events/.gitkeep"); err != nil {
+		return err
+	}
+	tree, err := runCommandEnv(ctx, a.Paths.Control, indexEnv, "git", "write-tree")
+	if err != nil {
+		return err
+	}
+	commit, err := runCommand(ctx, a.Paths.Control, "git", "commit-tree", strings.TrimSpace(tree), "-m", "Seed machine queue")
+	if err != nil {
+		return err
+	}
+	if _, err := runCommand(ctx, a.Paths.Control, "git", "update-ref", "refs/heads/"+branch, strings.TrimSpace(commit)); err != nil {
+		return err
+	}
+	_, err = runCommand(ctx, a.Paths.Control, "git", "push", "origin", "refs/heads/"+branch+":refs/heads/"+branch)
+	return err
 }
 
 func gitRefExists(ctx context.Context, dir, ref string) bool {

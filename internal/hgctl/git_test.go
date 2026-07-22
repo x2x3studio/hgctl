@@ -197,3 +197,36 @@ func runGitTest(t *testing.T, dir string, args ...string) string {
 	}
 	return string(out)
 }
+
+func TestSeedOrphanQueueBranchWithoutTemplate(t *testing.T) {
+	dir := t.TempDir()
+	origin := filepath.Join(dir, "origin.git")
+	runGitTest(t, "", "init", "--bare", origin)
+
+	app := testApp(t)
+	control := app.Paths.Control
+	runGitTest(t, "", "init", "-b", "main", control)
+	runGitTest(t, control, "config", "user.name", "chinaboard")
+	runGitTest(t, control, "config", "user.email", "chinaboard@gmail.com")
+	runGitTest(t, control, "remote", "add", "origin", origin)
+
+	branch := "queue/seed-machine"
+	if err := app.seedOrphanQueueBranch(testContext(t), branch); err != nil {
+		t.Fatalf("seed orphan queue: %v", err)
+	}
+
+	if !gitRefExists(testContext(t), control, "refs/heads/"+branch) {
+		t.Fatal("local queue branch was not created")
+	}
+	if parents := strings.Fields(runGitTest(t, control, "rev-list", "--parents", "-n", "1", branch)); len(parents) != 1 {
+		t.Fatalf("queue seed is not a parentless root commit: %v", parents)
+	}
+	if tracked := strings.TrimSpace(runGitTest(t, control, "ls-tree", "-r", "--name-only", branch)); tracked != "events/.gitkeep" {
+		t.Fatalf("orphan seed tracks %q, want only events/.gitkeep", tracked)
+	}
+	local := strings.TrimSpace(runGitTest(t, control, "rev-parse", "refs/heads/"+branch))
+	remote := strings.TrimSpace(runGitTest(t, origin, "rev-parse", "refs/heads/"+branch))
+	if local != remote {
+		t.Fatalf("origin did not receive the seeded branch: local=%s remote=%s", local, remote)
+	}
+}
