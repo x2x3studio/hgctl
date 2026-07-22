@@ -92,7 +92,7 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	enqueued, ingestErr := a.ingestIdleSessions(id, seen, clients, *limit, ingestIdleThreshold())
+	enqueued, ingestErr := a.ingestIdleSessions(id, seen, clients, *limit, 0, ingestIdleThreshold())
 	if err := a.saveIngestedSessions(seen); err != nil {
 		return errors.Join(ingestErr, err)
 	}
@@ -113,16 +113,18 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 
 // ingestIdleSessions gathers newly-idle, not-yet-ingested sessions across the
 // given clients, enqueues up to limit of them into the outbox oldest first (0 =
-// no cap), and records each in the dedup ledger. It only writes intake events;
-// the caller publishes the outbox. seen is mutated in place so the caller can
-// persist the ledger even on a partial error.
-func (a *App) ingestIdleSessions(id Identity, seen map[string]bool, clients []string, limit int, idle time.Duration) (int, error) {
+// no cap), and records each in the dedup ledger. parseCap bounds how many
+// eligible transcripts each client parses per run (0 = no cap); the scheduler
+// path caps it so one sync stays within its context budget. It only writes
+// intake events; the caller publishes the outbox. seen is mutated in place so
+// the caller can persist the ledger even on a partial error.
+func (a *App) ingestIdleSessions(id Identity, seen map[string]bool, clients []string, limit, parseCap int, idle time.Duration) (int, error) {
 	var (
 		candidates []ingestCandidate
 		errs       []error
 	)
 	for _, c := range clients {
-		got, err := a.gatherSessions(c, seen, idle)
+		got, err := a.gatherSessions(c, seen, idle, parseCap)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -160,7 +162,7 @@ func (a *App) ingestForSync(id Identity) error {
 	if err != nil {
 		return err
 	}
-	enqueued, ingestErr := a.ingestIdleSessions(id, seen, clients, syncIngestLimit, ingestIdleThreshold())
+	enqueued, ingestErr := a.ingestIdleSessions(id, seen, clients, syncIngestLimit, syncIngestLimit, ingestIdleThreshold())
 	if enqueued > 0 {
 		if err := a.saveIngestedSessions(seen); err != nil {
 			return errors.Join(ingestErr, err)
@@ -198,7 +200,7 @@ func sortIngestCandidates(candidates []ingestCandidate) {
 	})
 }
 
-func (a *App) gatherSessions(client string, seen map[string]bool, idle time.Duration) ([]ingestCandidate, error) {
+func (a *App) gatherSessions(client string, seen map[string]bool, idle time.Duration, parseCap int) ([]ingestCandidate, error) {
 	var (
 		files   []string
 		extract func(string) (ingestSession, bool)
@@ -218,12 +220,16 @@ func (a *App) gatherSessions(client string, seen map[string]bool, idle time.Dura
 		return nil, err
 	}
 	now := a.Now().UTC()
-	var out []ingestCandidate
+	// Cheapest filters first: skip sessions already in the ledger (by the
+	// filename-derived id) and sessions still being written (idle gate) before
+	// opening and parsing the file, so a scheduler-driven sync only parses
+	// genuinely new, completed sessions.
+	type idleFile struct {
+		path  string
+		mtime time.Time
+	}
+	var eligible []idleFile
 	for _, f := range files {
-		// Cheapest filters first: skip sessions already in the ledger (by the
-		// filename-derived id) and sessions still being written (idle gate) before
-		// opening and parsing the file, so a scheduler-driven sync only parses
-		// genuinely new, completed sessions.
 		if seen[ingestKey(client, pathSessionID(client, f))] {
 			continue
 		}
@@ -234,7 +240,19 @@ func (a *App) gatherSessions(client string, seen map[string]bool, idle time.Dura
 		if now.Sub(info.ModTime()) < idle {
 			continue
 		}
-		session, ok := extract(f)
+		eligible = append(eligible, idleFile{path: f, mtime: info.ModTime()})
+	}
+	// A bounded run (parseCap > 0, used by the scheduler-driven sync) parses only
+	// the oldest few by file mtime so one sync stays within its context budget; the
+	// remainder is picked up next run. The operator bulk ingest leaves parseCap 0
+	// and parses the whole eligible set.
+	if parseCap > 0 && len(eligible) > parseCap {
+		sort.SliceStable(eligible, func(i, j int) bool { return eligible[i].mtime.Before(eligible[j].mtime) })
+		eligible = eligible[:parseCap]
+	}
+	var out []ingestCandidate
+	for _, ef := range eligible {
+		session, ok := extract(ef.path)
 		// The post-parse dedup uses the real session id (which the ledger is keyed
 		// on); it also catches the rare transcript whose filename id differs from
 		// its recorded id and slipped past the cheap pre-filter above.

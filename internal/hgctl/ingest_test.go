@@ -264,6 +264,34 @@ func countOutboxMD(t *testing.T, app *App) int {
 	return count
 }
 
+// A bounded gather (parseCap > 0) parses only the oldest few eligible transcripts
+// by file mtime, so one scheduler-driven sync stays within its context budget.
+func TestGatherSessionsParseCapSelectsOldestByMtime(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	app := testApp(t)
+	for i := 0; i < 5; i++ {
+		p := filepath.Join(home, ".claude", "projects", "proj", fmt.Sprintf("s%02d.jsonl", i))
+		writeSessionFile(t, p, fmt.Sprintf(`{"type":"user","sessionId":"s%02d","timestamp":"2026-07-07T09:00:00.000Z","message":{"role":"user","content":"A completed question long enough to qualify for ingest number %02d."}}`+"\n", i, i))
+		// s00 is the oldest by mtime, s04 the newest; content time is identical.
+		mtime := app.Now().Add(-time.Duration(10-i) * time.Hour)
+		if err := os.Chtimes(p, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := app.gatherSessions("claude", map[string]bool{}, 15*time.Minute, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("parse cap not honored: got %d candidates, want 2", len(got))
+	}
+	ids := map[string]bool{got[0].id: true, got[1].id: true}
+	if !ids["s00"] || !ids["s01"] {
+		t.Fatalf("parse cap did not select the two oldest by mtime: got %+v", got)
+	}
+}
+
 func TestGatherSessionsIsClientNamespaced(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -290,14 +318,14 @@ func TestGatherSessionsIsClientNamespaced(t *testing.T) {
 	// Claude id already ingested; the codex sibling must not be treated as seen.
 	seen := map[string]bool{ingestKey("claude", "shared-id"): true}
 
-	claude, err := app.gatherSessions("claude", seen, 15*time.Minute)
+	claude, err := app.gatherSessions("claude", seen, 15*time.Minute, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(claude) != 0 {
 		t.Fatalf("claude sessions = %d, want 0 (already ingested)", len(claude))
 	}
-	codex, err := app.gatherSessions("codex", seen, 15*time.Minute)
+	codex, err := app.gatherSessions("codex", seen, 15*time.Minute, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +371,7 @@ func TestGatherSessionsIdleGateAndSkipsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := app.gatherSessions("claude", map[string]bool{}, 15*time.Minute)
+	got, err := app.gatherSessions("claude", map[string]bool{}, 15*time.Minute, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
