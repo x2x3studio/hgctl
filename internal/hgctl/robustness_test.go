@@ -10,81 +10,36 @@ import (
 	"testing"
 )
 
-func TestHookFailureIsSilentAndPersistedForDoctor(t *testing.T) {
-	app := testApp(t)
-	app.In = strings.NewReader(`{not-json`)
-	if code := app.Run(testContext(t), []string{"hook", "--client", "codex", "--event", "stop"}); code != 0 {
-		t.Fatalf("hook exit code=%d, want 0", code)
-	}
-	if output := app.Out.(*bytes.Buffer).String(); output != "" {
-		t.Fatalf("failed hook wrote stdout: %q", output)
-	}
-	if output := app.Err.(*bytes.Buffer).String(); output != "" {
-		t.Fatalf("failed hook wrote stderr: %q", output)
-	}
-
-	var diagnostic hookDiagnostic
-	if err := readJSON(app.hookDiagnosticPath(), &diagnostic); err != nil {
-		t.Fatal(err)
-	}
-	if diagnostic.SchemaVersion != hookDiagnosticSchemaVersion || diagnostic.Client != "codex" ||
-		diagnostic.Event != "stop" || diagnostic.Message == "" || len(diagnostic.Message) > maxHookDiagnosticBytes {
-		t.Fatalf("unexpected diagnostic: %+v", diagnostic)
-	}
-	check := app.hookDiagnosticDoctorCheck()
-	if check.ok || !strings.Contains(check.note, "codex/stop") {
-		t.Fatalf("doctor did not surface hook failure: %+v", check)
-	}
-
-	if err := app.recordHookDiagnostic("codex", "stop", errors.New(strings.Repeat("x", maxHookDiagnosticBytes*2))); err != nil {
-		t.Fatal(err)
-	}
-	if err := readJSON(app.hookDiagnosticPath(), &diagnostic); err != nil {
-		t.Fatal(err)
-	}
-	if len(diagnostic.Message) != maxHookDiagnosticBytes {
-		t.Fatalf("diagnostic message bytes=%d, want %d", len(diagnostic.Message), maxHookDiagnosticBytes)
-	}
-
-	app.In = strings.NewReader(`{}`)
-	if code := app.Run(testContext(t), []string{"hook", "--client", "codex", "--event", "stop"}); code != 0 {
-		t.Fatalf("recovered hook exit code=%d, want 0", code)
-	}
-	if _, err := os.Stat(app.hookDiagnosticPath()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("successful matching hook did not clear diagnostic: %v", err)
-	}
-}
-
-func TestUnknownHookEventNoOpsAndRecordsNoDiagnostic(t *testing.T) {
-	app := testApp(t)
-	app.In = strings.NewReader(`{"session_id":"s1","prompt":"hi","last_assistant_message":"yo"}`)
-	if code := app.Run(testContext(t), []string{"hook", "--client", "claude", "--event", "session-start"}); code != 0 {
-		t.Fatalf("unknown hook event exit code=%d, want 0", code)
-	}
-	if _, err := os.Stat(app.hookDiagnosticPath()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unknown hook event recorded a diagnostic: %v", err)
-	}
-	for _, dir := range []string{app.Paths.Pending, app.Paths.Outbox} {
-		entries, err := os.ReadDir(dir)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
+// The hook subcommand is a retired-capture no-op: whatever a stale client
+// registration feeds it, it exits clean and captures nothing.
+func TestHookCommandIsANoOp(t *testing.T) {
+	for _, in := range []string{`{not-json`, `{}`, `{"prompt":"hi","last_assistant_message":"yo"}`, ""} {
+		app := testApp(t)
+		app.In = strings.NewReader(in)
+		if code := app.Run(testContext(t), []string{"hook", "--client", "claude", "--event", "stop"}); code != 0 {
+			t.Fatalf("hook exit code=%d for input %q, want 0", code, in)
 		}
-		if err != nil {
+		if output := app.Out.(*bytes.Buffer).String(); output != "" {
+			t.Fatalf("hook wrote stdout: %q", output)
+		}
+		if output := app.Err.(*bytes.Buffer).String(); output != "" {
+			t.Fatalf("hook wrote stderr: %q", output)
+		}
+		if entries, err := os.ReadDir(app.Paths.Outbox); err == nil && len(entries) != 0 {
+			t.Fatalf("hook captured %d outbox files, want 0", len(entries))
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
 		}
-		if len(entries) != 0 {
-			t.Fatalf("unknown hook event captured %d files under %s, want 0", len(entries), dir)
-		}
 	}
 }
 
-func TestHookConfigPreservesRawRootValuesAndRetriesConcurrentChange(t *testing.T) {
+func TestPruneHookConfigPreservesRawRootValuesAndRetriesConcurrentChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	original := []byte(`{
   "precise": 9007199254740993,
   "nested": { "integer": 18446744073709551615, "escaped": "\u0061" },
   "flags": [true, null, 1.2300],
-  "hooks": {}
+  "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "/tmp/hgctl hook --client claude --event stop" } ] } ] }
 }
 `)
 	if err := os.WriteFile(path, original, 0o600); err != nil {
@@ -94,7 +49,7 @@ func TestHookConfigPreservesRawRootValuesAndRetriesConcurrentChange(t *testing.T
 	if err := json.Unmarshal(original, &before); err != nil {
 		t.Fatal(err)
 	}
-	if err := configureHookFile(path, "/tmp/hgctl", "claude", true); err != nil {
+	if err := pruneClientHookFile(path, "/tmp/hgctl", "claude"); err != nil {
 		t.Fatal(err)
 	}
 	content, err := os.ReadFile(path)
@@ -110,13 +65,17 @@ func TestHookConfigPreservesRawRootValuesAndRetriesConcurrentChange(t *testing.T
 			t.Fatalf("unrelated root value %q changed: before=%s after=%s", key, before[key], after[key])
 		}
 	}
+	if present, err := managedHooksPresent(path, "/tmp/hgctl", "claude"); err != nil || present {
+		t.Fatalf("managed hook was not pruned: present=%v err=%v", present, err)
+	}
 
-	concurrent := []byte(`{"precise":9007199254740993,"sentinel":"concurrent","hooks":{}}` + "\n")
-	if err := os.WriteFile(path, []byte(`{"sentinel":"initial","hooks":{}}`+"\n"), 0o600); err != nil {
+	seed := []byte(`{"sentinel":"initial","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/tmp/hgctl hook --client codex --event stop"}]}]}}` + "\n")
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	concurrent := []byte(`{"sentinel":"concurrent","precise":9007199254740993,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/tmp/hgctl hook --client codex --event stop"}]}]}}` + "\n")
 	mutations := 0
-	err = configureHookFileWithRetry(path, path, "/tmp/hgctl", "codex", true, func(attempt int) {
+	err = pruneClientHookFileWithRetry(path, path, "/tmp/hgctl", "codex", func(attempt int) {
 		if attempt == 0 {
 			mutations++
 			if err := os.WriteFile(path, concurrent, 0o600); err != nil {
@@ -127,8 +86,11 @@ func TestHookConfigPreservesRawRootValuesAndRetriesConcurrentChange(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mutations != 1 || !hooksConfigured(path, "/tmp/hgctl", "codex") {
-		t.Fatalf("concurrent retry did not install one exact hook set: mutations=%d", mutations)
+	if mutations != 1 {
+		t.Fatalf("concurrent change was not retried once: mutations=%d", mutations)
+	}
+	if present, err := managedHooksPresent(path, "/tmp/hgctl", "codex"); err != nil || present {
+		t.Fatalf("managed codex hook not pruned after retry: present=%v err=%v", present, err)
 	}
 	content, err = os.ReadFile(path)
 	if err != nil {

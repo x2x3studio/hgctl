@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -20,13 +21,11 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	case "install":
 		err = a.runInstall(ctx, args[1:])
 	case "hook":
-		client, eventName := hookDiagnosticScope(args[1:])
-		err = a.runHook(ctx, args[1:])
-		if err != nil {
-			_ = a.recordHookDiagnostic(client, eventName, err)
-			return 0
-		}
-		a.clearHookDiagnostic(client, eventName)
+		// Per-turn capture is retired; intake is per-session transcript ingest
+		// driven by the scheduler. A stale client hook registration may still
+		// invoke this during the prune window, so drain stdin and exit clean so
+		// no client session is disrupted.
+		_, _ = io.Copy(io.Discard, io.LimitReader(a.In, MaxEventBytes+1))
 	case "sync":
 		err = a.runSync(ctx, args[1:])
 	case "ingest":
@@ -104,7 +103,7 @@ func (a *App) install(ctx context.Context, repo string) error {
 	if err := a.setupBasicMemoryMCP(ctx); err != nil {
 		installErrs = append(installErrs, err)
 	}
-	if err := a.setupClientHooks(ctx); err != nil {
+	if err := a.pruneClientHooks(); err != nil {
 		installErrs = append(installErrs, err)
 	}
 	if err := a.sync(ctx); err != nil {

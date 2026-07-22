@@ -29,68 +29,66 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 	safeToRemoveBinary := true
 	cleanupErr := withFileLockWait(ctx, a.Paths.SyncLock, func() error {
 		return withFileLockWait(ctx, a.Paths.UpdateLock, func() error {
-			return withFileLockWait(ctx, a.Paths.CodexLock, func() error {
-				if err := a.removeManagedBasicMemoryMCP(ctx); err != nil {
-					errs = append(errs, err)
-					safeToRemoveBinary = false
+			if err := a.removeManagedBasicMemoryMCP(ctx); err != nil {
+				errs = append(errs, err)
+				safeToRemoveBinary = false
+			}
+			for _, item := range a.clientAdapters() {
+				present, err := managedHooksPresent(item.path, stable, item.client)
+				if errors.Is(err, os.ErrNotExist) || (err == nil && !present) {
+					continue
 				}
-				for _, item := range a.clientAdapters() {
-					present, err := managedHooksPresent(item.path, stable, item.client)
-					if errors.Is(err, os.ErrNotExist) || (err == nil && !present) {
-						continue
-					}
-					if err != nil {
-						errs = append(errs, fmt.Errorf("inspect %s hooks: %w", item.client, err))
-						safeToRemoveBinary = false
-						continue
-					}
-					if err := configureHookFile(item.path, stable, item.client, false); err != nil {
-						errs = append(errs, fmt.Errorf("remove %s hooks: %w", item.client, err))
-						safeToRemoveBinary = false
-						continue
-					}
-					remaining, err := managedHooksPresent(item.path, stable, item.client)
-					if err != nil && !errors.Is(err, os.ErrNotExist) {
-						errs = append(errs, fmt.Errorf("verify %s hooks: %w", item.client, err))
-						safeToRemoveBinary = false
-					} else if remaining {
-						errs = append(errs, fmt.Errorf("verify %s hooks: managed hooks remain", item.client))
-						safeToRemoveBinary = false
-					}
-				}
-
-				basicMemoryCleanup, err := a.managedBasicMemoryCleanupRequired()
 				if err != nil {
-					errs = append(errs, fmt.Errorf("inspect Basic Memory ownership: %w", err))
+					errs = append(errs, fmt.Errorf("inspect %s hooks: %w", item.client, err))
 					safeToRemoveBinary = false
-				} else if basicMemoryCleanup && !commandExists("basic-memory") {
-					errs = append(errs, errors.New("managed Basic Memory project cleanup requires the basic-memory command"))
-					safeToRemoveBinary = false
-				} else if err := a.removeManagedBasicMemoryProject(ctx); err != nil {
-					errs = append(errs, err)
-					safeToRemoveBinary = false
+					continue
 				}
-
-				if err := a.removeSchedulerFiles(ctx); err != nil {
-					errs = append(errs, err)
+				if err := pruneClientHookFile(item.path, stable, item.client); err != nil {
+					errs = append(errs, fmt.Errorf("remove %s hooks: %w", item.client, err))
 					safeToRemoveBinary = false
+					continue
 				}
-				if remaining, err := a.schedulerFilesPresent(); err != nil {
-					errs = append(errs, fmt.Errorf("verify scheduler files: %w", err))
+				remaining, err := managedHooksPresent(item.path, stable, item.client)
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
+					errs = append(errs, fmt.Errorf("verify %s hooks: %w", item.client, err))
 					safeToRemoveBinary = false
 				} else if remaining {
-					errs = append(errs, errors.New("verify scheduler files: managed scheduler files remain"))
+					errs = append(errs, fmt.Errorf("verify %s hooks: managed hooks remain", item.client))
 					safeToRemoveBinary = false
 				}
+			}
 
-				if safeToRemoveBinary && managedStableSymlink(stable, a.Paths.Versions) {
-					if err := os.Remove(stable); err != nil {
-						errs = append(errs, err)
-						safeToRemoveBinary = false
-					}
+			basicMemoryCleanup, err := a.managedBasicMemoryCleanupRequired()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("inspect Basic Memory ownership: %w", err))
+				safeToRemoveBinary = false
+			} else if basicMemoryCleanup && !commandExists("basic-memory") {
+				errs = append(errs, errors.New("managed Basic Memory project cleanup requires the basic-memory command"))
+				safeToRemoveBinary = false
+			} else if err := a.removeManagedBasicMemoryProject(ctx); err != nil {
+				errs = append(errs, err)
+				safeToRemoveBinary = false
+			}
+
+			if err := a.removeSchedulerFiles(ctx); err != nil {
+				errs = append(errs, err)
+				safeToRemoveBinary = false
+			}
+			if remaining, err := a.schedulerFilesPresent(); err != nil {
+				errs = append(errs, fmt.Errorf("verify scheduler files: %w", err))
+				safeToRemoveBinary = false
+			} else if remaining {
+				errs = append(errs, errors.New("verify scheduler files: managed scheduler files remain"))
+				safeToRemoveBinary = false
+			}
+
+			if safeToRemoveBinary && managedStableSymlink(stable, a.Paths.Versions) {
+				if err := os.Remove(stable); err != nil {
+					errs = append(errs, err)
+					safeToRemoveBinary = false
 				}
-				return nil
-			})
+			}
+			return nil
 		})
 	})
 	if cleanupErr != nil {

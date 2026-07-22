@@ -2,7 +2,6 @@ package hgctl
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,45 +12,6 @@ type doctorCheck struct {
 	name string
 	ok   bool
 	note string
-}
-
-func (a *App) hookDiagnosticDoctorCheck() doctorCheck {
-	var diagnostic hookDiagnostic
-	if err := readJSON(a.hookDiagnosticPath(), &diagnostic); errors.Is(err, os.ErrNotExist) {
-		return doctorCheck{"hook diagnostics", true, "none"}
-	} else if err != nil {
-		return doctorCheck{"hook diagnostics", false, boundString(err.Error(), 512)}
-	}
-	if diagnostic.SchemaVersion != hookDiagnosticSchemaVersion || diagnostic.Client == "" ||
-		diagnostic.Event == "" || diagnostic.Message == "" || diagnostic.OccurredAt.IsZero() {
-		return doctorCheck{"hook diagnostics", false, "invalid persisted hook diagnostic"}
-	}
-	note := fmt.Sprintf("%s/%s at %s: %s", diagnostic.Client, diagnostic.Event,
-		diagnostic.OccurredAt.UTC().Format(time.RFC3339), diagnostic.Message)
-	return doctorCheck{"hook diagnostics", false, boundString(note, 512)}
-}
-
-func (a *App) clientDoctorChecks(ctx context.Context) []doctorCheck {
-	stable := filepath.Join(a.Paths.Bin, "hgctl")
-	var checks []doctorCheck
-	for _, item := range a.clientAdapters() {
-		if !commandExists(item.executable) {
-			continue
-		}
-		ok := hooksConfigured(item.path, stable, item.client)
-		note := "user settings"
-		if item.client == "codex" {
-			note = "user hooks + app-server trust"
-			if ok {
-				if err := a.verifyCodexHooks(ctx); err != nil {
-					ok = false
-					note = boundString(err.Error(), 512)
-				}
-			}
-		}
-		checks = append(checks, doctorCheck{item.name + " hooks", ok, note})
-	}
-	return checks
 }
 
 func (a *App) doctor(ctx context.Context) error {
@@ -82,11 +42,9 @@ func (a *App) doctor(ctx context.Context) error {
 		{"queue worktree", isGitWorktree(a.Paths.Queue), a.Paths.Queue},
 		{"shared worktree", isGitWorktree(a.Paths.Shared), a.Paths.Shared},
 	}
-	checks = append(checks, a.clientDoctorChecks(ctx)...)
 	checks = append(checks, a.basicMemoryMCPDoctorChecks(ctx)...)
 	checks = append(checks,
 		doctorCheck{"scheduler", a.schedulerLoaded(ctx), LaunchLabel},
-		a.hookDiagnosticDoctorCheck(),
 	)
 	failed := 0
 	for _, item := range checks {

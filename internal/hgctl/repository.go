@@ -296,9 +296,6 @@ func (a *App) sync(ctx context.Context) error {
 			return fmt.Errorf("configured queue %q does not match machine identity %q", state.QueueBranch, identity.ID)
 		}
 		var errs []error
-		if err := a.prunePending(7 * 24 * time.Hour); err != nil {
-			errs = append(errs, fmt.Errorf("prune pending turns: %w", err))
-		}
 		if err := a.fetchEndpointRefs(syncCtx, state); err != nil {
 			errs = append(errs, err)
 			return errors.Join(errs...)

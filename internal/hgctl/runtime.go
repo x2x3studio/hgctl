@@ -46,7 +46,6 @@ type Paths struct {
 	Control       string
 	Queue         string
 	Outbox        string
-	Pending       string
 	Vault         string
 	Shared        string
 	Bin           string
@@ -58,8 +57,6 @@ type Paths struct {
 	LifecycleLock string
 	SyncLock      string
 	UpdateLock    string
-	CodexLock     string
-	CodexCheck    string
 }
 
 func DefaultPaths() (Paths, error) {
@@ -85,7 +82,6 @@ func DefaultPaths() (Paths, error) {
 		Control:       filepath.Join(data, "repo"),
 		Queue:         filepath.Join(data, "queue"),
 		Outbox:        filepath.Join(data, "outbox"),
-		Pending:       filepath.Join(data, "pending"),
 		Vault:         vault,
 		Shared:        filepath.Join(data, "shared"),
 		Bin:           filepath.Join(home, ".local", "bin"),
@@ -97,8 +93,6 @@ func DefaultPaths() (Paths, error) {
 		LifecycleLock: filepath.Join(data, "lifecycle.lock"),
 		SyncLock:      filepath.Join(data, "sync.lock"),
 		UpdateLock:    filepath.Join(data, "update.lock"),
-		CodexLock:     filepath.Join(data, "codex-trust.lock"),
-		CodexCheck:    filepath.Join(data, "codex-trust-check.json"),
 	}, nil
 }
 
@@ -195,7 +189,7 @@ func probeJSONSchema(path string, dst any, version *int, current int) (bool, err
 }
 
 func (a *App) ensureDataDirs() error {
-	for _, path := range []string{a.Paths.Data, a.Paths.Outbox, a.Paths.Pending} {
+	for _, path := range []string{a.Paths.Data, a.Paths.Outbox} {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return err
 		}

@@ -25,34 +25,17 @@ func (a *App) clientAdapters() []clientAdapter {
 	}
 }
 
-func (a *App) setupHookFiles() error {
+// pruneClientHooks removes any stale hgctl-managed hook registration from every
+// client config. Per-turn capture is retired: hgctl installs no hooks, so
+// install, repair, and uninstall all converge on pruning whatever still points
+// at the hgctl binary. Basic Memory MCP recall registration is separate and left
+// untouched. A missing client config is benign (nothing to prune).
+func (a *App) pruneClientHooks() error {
 	stable := filepath.Join(a.Paths.Bin, "hgctl")
 	var errs []error
 	for _, item := range a.clientAdapters() {
-		if !commandExists(item.executable) {
-			continue
-		}
-		if err := configureHookFile(item.path, stable, item.client, true); err != nil {
+		if err := pruneClientHookFile(item.path, stable, item.client); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, fmt.Errorf("%s hooks: %w", item.name, err))
-		} else if !hooksConfigured(item.path, stable, item.client) {
-			errs = append(errs, fmt.Errorf("%s hooks: installed hook set is incomplete or malformed", item.name))
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func (a *App) setupClientHooks(ctx context.Context) error {
-	var errs []error
-	if err := a.setupHookFiles(); err != nil {
-		errs = append(errs, err)
-	}
-	if commandExists("codex") {
-		codexHooks := filepath.Join(a.Paths.Home, ".codex", "hooks.json")
-		stable := filepath.Join(a.Paths.Bin, "hgctl")
-		if hooksConfigured(codexHooks, stable, "codex") {
-			if err := a.attemptCodexTrust(ctx); err != nil {
-				errs = append(errs, fmt.Errorf("Codex hook trust: %w", err))
-			}
 		}
 	}
 	return errors.Join(errs...)
@@ -67,16 +50,10 @@ func (a *App) repairClientHooks(ctx context.Context) {
 		if _, err := os.Stat(a.Paths.State); err != nil {
 			return nil
 		}
-		if err := a.setupHookFiles(); err != nil {
-			return err
-		}
-		if commandExists("codex") {
-			a.retryCodexTrust(ctx)
-		}
-		return nil
+		return a.pruneClientHooks()
 	})
 	if err != nil {
-		_, _ = fmt.Fprintln(a.Err, "hgctl: client hook repair deferred")
+		_, _ = fmt.Fprintln(a.Err, "hgctl: client hook prune deferred")
 	}
 }
 
@@ -87,28 +64,31 @@ type hookConfigSnapshot struct {
 	exists  bool
 }
 
-func configureHookFile(path, binary, client string, install bool) error {
+// pruneClientHookFile removes every hgctl-managed hook command for client from
+// the config at path, preserving user hooks and every other key. A missing file
+// is os.ErrNotExist (nothing to prune); callers treat that as benign.
+func pruneClientHookFile(path, binary, client string) error {
 	writePath, err := configFilePath(path)
 	if err != nil {
 		return err
 	}
-	return configureHookFileWithRetry(writePath, path, binary, client, install, nil)
+	return pruneClientHookFileWithRetry(writePath, path, binary, client, nil)
 }
 
-func configureHookFileWithRetry(writePath, displayPath, binary, client string, install bool, beforeVerify func(int)) error {
+func pruneClientHookFileWithRetry(writePath, displayPath, binary, client string, beforeVerify func(int)) error {
 	for attempt := 0; attempt < hookConfigWriteAttempts; attempt++ {
 		snapshot, err := readHookConfigSnapshot(writePath)
 		if err != nil {
 			return err
 		}
-		if !install && !snapshot.exists {
+		if !snapshot.exists {
 			return os.ErrNotExist
 		}
-		desired, write, err := mergeHookConfig(snapshot.content, snapshot.exists, displayPath, binary, client, install)
+		desired, changed, err := pruneHookConfig(snapshot.content, displayPath, binary, client)
 		if err != nil {
 			return err
 		}
-		if !write {
+		if !changed {
 			return nil
 		}
 		if beforeVerify != nil {
@@ -150,27 +130,28 @@ func sameHookConfigSnapshot(left, right hookConfigSnapshot) bool {
 	return left.exists == right.exists && bytes.Equal(left.content, right.content)
 }
 
-func mergeHookConfig(content []byte, existed bool, displayPath, binary, client string, install bool) ([]byte, bool, error) {
+// pruneHookConfig removes every hgctl-managed hook command for client from the
+// parsed config, dropping any hook group and event that empties out, and reports
+// whether anything changed. When nothing is pruned it reports changed=false so a
+// repair that runs every sync never churns an untouched file. Unrelated keys and
+// user hooks are preserved.
+func pruneHookConfig(content []byte, displayPath, binary, client string) ([]byte, bool, error) {
 	root := map[string]json.RawMessage{}
-	if existed {
-		if err := json.Unmarshal(content, &root); err != nil {
-			return nil, false, fmt.Errorf("parse %s: %w", displayPath, err)
-		}
-		if root == nil {
-			return nil, false, fmt.Errorf("parse %s: root must be an object", displayPath)
-		}
+	if err := json.Unmarshal(content, &root); err != nil {
+		return nil, false, fmt.Errorf("parse %s: %w", displayPath, err)
+	}
+	if root == nil {
+		return nil, false, fmt.Errorf("parse %s: root must be an object", displayPath)
 	}
 	rawHooks, hasHooks := root["hooks"]
 	if !hasHooks {
-		if !install {
-			return nil, false, nil
-		}
-		rawHooks = json.RawMessage(`{}`)
+		return nil, false, nil
 	}
 	var hooks map[string]json.RawMessage
 	if err := json.Unmarshal(rawHooks, &hooks); err != nil || hooks == nil {
 		return nil, false, fmt.Errorf("parse %s: hooks must be an object", displayPath)
 	}
+	pruned := false
 	for eventName, rawGroups := range hooks {
 		var groups []json.RawMessage
 		if err := json.Unmarshal(rawGroups, &groups); err != nil || groups == nil {
@@ -201,58 +182,42 @@ func mergeHookConfig(content []byte, existed bool, displayPath, binary, client s
 				}
 				var command string
 				_ = json.Unmarshal(handler["command"], &command)
-				if !hgctlManagedHookCommand(command, binary, client) {
-					kept = append(kept, rawHandler)
+				if hgctlManagedHookCommand(command, binary, client) {
+					pruned = true
+					continue
 				}
+				kept = append(kept, rawHandler)
 			}
-			if len(kept) > 0 {
-				encoded, err := json.Marshal(kept)
-				if err != nil {
-					return nil, false, err
-				}
-				group["hooks"] = encoded
-				encoded, err = json.Marshal(group)
-				if err != nil {
-					return nil, false, err
-				}
-				filtered = append(filtered, encoded)
+			if len(kept) == 0 {
+				continue
 			}
+			if len(kept) == len(handlers) {
+				filtered = append(filtered, rawGroup)
+				continue
+			}
+			encoded, err := json.Marshal(kept)
+			if err != nil {
+				return nil, false, err
+			}
+			group["hooks"] = encoded
+			encoded, err = json.Marshal(group)
+			if err != nil {
+				return nil, false, err
+			}
+			filtered = append(filtered, encoded)
 		}
 		if len(filtered) == 0 {
 			delete(hooks, eventName)
-		} else {
-			encoded, err := json.Marshal(filtered)
-			if err != nil {
-				return nil, false, err
-			}
-			hooks[eventName] = encoded
+			continue
 		}
+		encoded, err := json.Marshal(filtered)
+		if err != nil {
+			return nil, false, err
+		}
+		hooks[eventName] = encoded
 	}
-	if install {
-		for _, item := range hookFileSpecs() {
-			command := shellQuote(binary) + " hook --client " + client + " --event " + item.name
-			handler := map[string]any{"type": "command", "command": command, "timeout": item.timeout}
-			group := map[string]any{"hooks": []any{handler}}
-			if item.matcher != "" {
-				group["matcher"] = item.matcher
-			}
-			encodedGroup, err := json.Marshal(group)
-			if err != nil {
-				return nil, false, err
-			}
-			var groups []json.RawMessage
-			if rawGroups, ok := hooks[item.event]; ok {
-				if err := json.Unmarshal(rawGroups, &groups); err != nil {
-					return nil, false, err
-				}
-			}
-			groups = append(groups, encodedGroup)
-			encodedGroups, err := json.Marshal(groups)
-			if err != nil {
-				return nil, false, err
-			}
-			hooks[item.event] = encodedGroups
-		}
+	if !pruned {
+		return nil, false, nil
 	}
 	encodedHooks, err := json.Marshal(hooks)
 	if err != nil {
@@ -264,20 +229,6 @@ func mergeHookConfig(content []byte, existed bool, displayPath, binary, client s
 		return nil, false, err
 	}
 	return append(encoded, '\n'), true, nil
-}
-
-type hookFileSpec struct {
-	event   string
-	matcher string
-	name    string
-	timeout int
-}
-
-func hookFileSpecs() []hookFileSpec {
-	return []hookFileSpec{
-		{"UserPromptSubmit", "", "user-prompt", 3},
-		{"Stop", "", "stop", 5},
-	}
 }
 
 func configFilePath(path string) (string, error) {
@@ -308,21 +259,11 @@ func configFilePath(path string) (string, error) {
 	return path, nil
 }
 
-func managedHookCommand(command, binary, client string) bool {
-	prefix := shellQuote(binary) + " hook --client " + client + " --event "
-	for _, spec := range hookFileSpecs() {
-		if command == prefix+spec.name {
-			return true
-		}
-	}
-	return false
-}
-
 // hgctlManagedHookCommand reports whether command is an hgctl-installed hook
-// invocation for client, whatever event it targets. The prune step uses this so
-// a retired or future event (e.g. session-start) is removed on install/repair,
-// while a look-alike that merely shares the prefix but carries extra arguments
-// (a distinct, user-owned command) is left untouched.
+// invocation for client, whatever event it targets. Prune uses this so a retired
+// event (user-prompt, stop, session-start) is removed, while a look-alike that
+// merely shares the prefix but carries extra arguments (a distinct, user-owned
+// command) is left untouched.
 func hgctlManagedHookCommand(command, binary, client string) bool {
 	prefix := shellQuote(binary) + " hook --client " + client + " --event "
 	rest, ok := strings.CutPrefix(command, prefix)
@@ -354,102 +295,11 @@ func managedHooksPresent(path, binary, client string) (bool, error) {
 	for _, groups := range root.Hooks {
 		for _, group := range groups {
 			for _, hook := range group.Hooks {
-				if managedHookCommand(hook.Command, binary, client) {
+				if hgctlManagedHookCommand(hook.Command, binary, client) {
 					return true, nil
 				}
 			}
 		}
 	}
 	return false, nil
-}
-
-func hooksConfigured(path, binary, client string) bool {
-	readPath, err := configFilePath(path)
-	if err != nil {
-		return false
-	}
-	var root struct {
-		Hooks map[string]json.RawMessage `json:"hooks"`
-	}
-	if err := readJSON(readPath, &root); err != nil {
-		return false
-	}
-	prefix := shellQuote(binary) + " hook --client " + client + " --event "
-	specs := hookFileSpecs()
-	counts := make([]int, len(specs))
-	for eventName, rawGroups := range root.Hooks {
-		if bytes.Equal(bytes.TrimSpace(rawGroups), []byte("null")) {
-			return false
-		}
-		var groups []any
-		if err := json.Unmarshal(rawGroups, &groups); err != nil {
-			return false
-		}
-		for _, rawGroup := range groups {
-			group, ok := rawGroup.(map[string]any)
-			if !ok {
-				return false
-			}
-			rawHandlers, exists := group["hooks"]
-			if !exists {
-				return false
-			}
-			handlers, ok := rawHandlers.([]any)
-			if !ok {
-				return false
-			}
-			if matcher, exists := group["matcher"]; exists {
-				if _, ok := matcher.(string); !ok {
-					return false
-				}
-			}
-			for _, rawHandler := range handlers {
-				handler, ok := rawHandler.(map[string]any)
-				if !ok {
-					return false
-				}
-				handlerType, ok := handler["type"].(string)
-				if !ok || handlerType == "" {
-					return false
-				}
-				if handlerType == "command" {
-					if _, ok := handler["command"].(string); !ok {
-						return false
-					}
-				}
-				command, _ := handler["command"].(string)
-				matched := -1
-				for index, spec := range specs {
-					if command == prefix+spec.name {
-						matched = index
-						break
-					}
-				}
-				if matched < 0 {
-					continue
-				}
-				spec := specs[matched]
-				matcher, hasMatcher := group["matcher"]
-				matcherOK := !hasMatcher && spec.matcher == ""
-				if spec.matcher != "" {
-					value, ok := matcher.(string)
-					matcherOK = hasMatcher && ok && value == spec.matcher
-				}
-				timeout, timeoutOK := handler["timeout"].(float64)
-				if eventName != spec.event || !matcherOK || handlerType != "command" || !timeoutOK || timeout != float64(spec.timeout) {
-					return false
-				}
-				counts[matched]++
-				if counts[matched] != 1 {
-					return false
-				}
-			}
-		}
-	}
-	for _, count := range counts {
-		if count != 1 {
-			return false
-		}
-	}
-	return true
 }

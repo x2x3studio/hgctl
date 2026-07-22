@@ -11,8 +11,33 @@ import (
 	"testing"
 )
 
-func TestHookConfigIsIdempotentAndPreservesUnrelatedHooks(t *testing.T) {
+// writeManagedHookFile seeds a client config that carries one hgctl-managed hook
+// command for client alongside a preserved unrelated hook, so prune and uninstall
+// tests have something to prune now that hgctl installs no hooks itself.
+func writeManagedHookFile(t *testing.T, path, binary, client string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{
+		"theme": "dark",
+		"hooks": map[string]any{
+			"Stop": []any{map[string]any{
+				"hooks": []any{
+					map[string]any{"type": "command", "command": "other-tool stop"},
+					map[string]any{"type": "command", "command": binary + " hook --client " + client + " --event stop", "timeout": float64(5)},
+				},
+			}},
+		},
+	}
+	if err := writeJSONAtomic(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPruneClientHookFileRemovesOnlyManagedCommands(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
+	binary := "/Users/test/.local/bin/hgctl"
 	original := map[string]any{
 		"theme": "dark",
 		"hooks": map[string]any{
@@ -20,7 +45,9 @@ func TestHookConfigIsIdempotentAndPreservesUnrelatedHooks(t *testing.T) {
 				"hooks": []any{
 					map[string]any{"type": "command", "command": "other-tool stop"},
 					map[string]any{"type": "command", "command": "/opt/other/hgctl hook --client claude --event stop"},
-					map[string]any{"type": "command", "command": "/Users/test/.local/bin/hgctl hook --client claude --event stop --user-owned"},
+					map[string]any{"type": "command", "command": binary + " hook --client claude --event stop --user-owned"},
+					map[string]any{"type": "command", "command": binary + " hook --client claude --event stop"},
+					map[string]any{"type": "command", "command": binary + " hook --client claude --event user-prompt"},
 				},
 			}},
 		},
@@ -28,44 +55,30 @@ func TestHookConfigIsIdempotentAndPreservesUnrelatedHooks(t *testing.T) {
 	if err := writeJSONAtomic(path, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	binary := "/Users/test/.local/bin/hgctl"
-	if err := configureHookFile(path, binary, "claude", true); err != nil {
-		t.Fatal(err)
-	}
-	if err := configureHookFile(path, binary, "claude", true); err != nil {
+	if err := pruneClientHookFile(path, binary, "claude"); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := countJSONText(b, binary+" hook --client claude"); got != 3 {
-		t.Fatalf("got %d matching command prefixes, want 3", got)
+	// The two hgctl-managed commands for this binary+client are gone.
+	if got := countJSONText(b, binary+" hook --client claude --event stop\""); got != 0 {
+		t.Fatalf("managed stop hook was not pruned (count=%d):\n%s", got, b)
 	}
+	if got := countJSONText(b, "user-prompt"); got != 0 {
+		t.Fatalf("managed user-prompt hook was not pruned (count=%d):\n%s", got, b)
+	}
+	// Everything else is preserved: an unrelated tool, a same-prefix hook from a
+	// different binary, and a look-alike carrying an extra argument.
 	if got := countJSONText(b, "other-tool stop"); got != 1 {
 		t.Fatalf("unrelated hook count=%d", got)
 	}
 	if got := countJSONText(b, "/opt/other/hgctl"); got != 1 {
-		t.Fatalf("other hgctl hook count=%d", got)
+		t.Fatalf("other-binary hgctl hook count=%d", got)
 	}
 	if got := countJSONText(b, "--user-owned"); got != 1 {
-		t.Fatalf("lookalike hook count=%d", got)
-	}
-	if err := configureHookFile(path, binary, "claude", false); err != nil {
-		t.Fatal(err)
-	}
-	b, _ = os.ReadFile(path)
-	if got := countJSONText(b, binary+" hook --client claude"); got != 1 {
-		t.Fatalf("unexpected matching command prefixes remain: %d", got)
-	}
-	if got := countJSONText(b, "other-tool stop"); got != 1 {
-		t.Fatalf("unrelated hook was removed")
-	}
-	if got := countJSONText(b, "/opt/other/hgctl"); got != 1 {
-		t.Fatalf("other hgctl hook was removed")
-	}
-	if got := countJSONText(b, "--user-owned"); got != 1 {
-		t.Fatalf("lookalike hook was removed")
+		t.Fatalf("look-alike hook count=%d", got)
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(b, &decoded); err != nil {
@@ -76,14 +89,14 @@ func TestHookConfigIsIdempotentAndPreservesUnrelatedHooks(t *testing.T) {
 	}
 }
 
-func TestConfigureHookFilePrunesStaleSessionStart(t *testing.T) {
+func TestPruneClientHookFileDropsEmptiedEventGroup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	binary := "/Users/test/.local/bin/hgctl"
 	original := map[string]any{
 		"hooks": map[string]any{
-			"SessionStart": []any{map[string]any{
+			"UserPromptSubmit": []any{map[string]any{
 				"hooks": []any{
-					map[string]any{"type": "command", "command": binary + " hook --client claude --event session-start", "timeout": 3},
+					map[string]any{"type": "command", "command": binary + " hook --client claude --event user-prompt", "timeout": float64(3)},
 				},
 			}},
 			"Stop": []any{map[string]any{
@@ -96,21 +109,12 @@ func TestConfigureHookFilePrunesStaleSessionStart(t *testing.T) {
 	if err := writeJSONAtomic(path, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := configureHookFile(path, binary, "claude", true); err != nil {
+	if err := pruneClientHookFile(path, binary, "claude"); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := countJSONText(b, "session-start"); got != 0 {
-		t.Fatalf("stale SessionStart hook was not pruned (count=%d):\n%s", got, b)
-	}
-	if got := countJSONText(b, "--user-owned"); got != 1 {
-		t.Fatalf("user-owned look-alike hook was not preserved (count=%d):\n%s", got, b)
-	}
-	if !hooksConfigured(path, binary, "claude") {
-		t.Fatalf("installed hook set is not the exact managed set:\n%s", b)
 	}
 	var root struct {
 		Hooks map[string]json.RawMessage `json:"hooks"`
@@ -118,82 +122,78 @@ func TestConfigureHookFilePrunesStaleSessionStart(t *testing.T) {
 	if err := json.Unmarshal(b, &root); err != nil {
 		t.Fatal(err)
 	}
-	if _, exists := root.Hooks["SessionStart"]; exists {
-		t.Fatalf("empty SessionStart event group was left behind:\n%s", b)
+	if _, exists := root.Hooks["UserPromptSubmit"]; exists {
+		t.Fatalf("emptied UserPromptSubmit event group was left behind:\n%s", b)
+	}
+	if _, exists := root.Hooks["Stop"]; !exists {
+		t.Fatalf("user-owned Stop hook event was removed:\n%s", b)
+	}
+	if got := countJSONText(b, "--user-owned"); got != 1 {
+		t.Fatalf("user-owned look-alike hook was not preserved (count=%d):\n%s", got, b)
 	}
 }
 
-func TestSetupHookFilesConfiguresOnlyInstalledClients(t *testing.T) {
-	tests := []struct {
-		name       string
-		claude     bool
-		codex      bool
-		seedAbsent bool
-	}{
-		{name: "Claude only", claude: true},
-		{name: "Codex only", codex: true, seedAbsent: true},
-		{name: "both", claude: true, codex: true},
-		{name: "neither", seedAbsent: true},
+// A prune with nothing to remove must not rewrite the file, so the repair that
+// runs on every sync never churns an untouched config.
+func TestPruneClientHookFileIsNoOpWithoutManagedHooks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	original := []byte(`{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "other-tool stop",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  },
+  "theme": "dark"
+}
+`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			app := testApp(t)
-			bin := filepath.Join(app.Paths.Home, "client-bin")
-			if err := os.MkdirAll(bin, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if test.claude {
-				writeFakeExecutable(t, bin, "claude")
-			}
-			if test.codex {
-				writeFakeExecutable(t, bin, "codex")
-			}
-			t.Setenv("PATH", bin)
-
-			stable := filepath.Join(app.Paths.Bin, "hgctl")
-			for _, item := range app.clientAdapters() {
-				installed := (item.client == "claude" && test.claude) || (item.client == "codex" && test.codex)
-				if installed || test.seedAbsent {
-					if err := os.MkdirAll(filepath.Dir(item.path), 0o700); err != nil {
-						t.Fatal(err)
-					}
-					body := []byte("{\"sentinel\":\"" + item.client + "\"}\n")
-					if err := os.WriteFile(item.path, body, 0o600); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-
-			if err := app.setupHookFiles(); err != nil {
-				t.Fatal(err)
-			}
-			for _, item := range app.clientAdapters() {
-				installed := (item.client == "claude" && test.claude) || (item.client == "codex" && test.codex)
-				if installed {
-					if !hooksConfigured(item.path, stable, item.client) {
-						t.Fatalf("%s hooks were not configured", item.name)
-					}
-					content, err := os.ReadFile(item.path)
-					if err != nil || !bytes.Contains(content, []byte(`"sentinel"`)) {
-						t.Fatalf("%s unrelated config was not preserved: %q err=%v", item.name, content, err)
-					}
-					continue
-				}
-				content, err := os.ReadFile(item.path)
-				if test.seedAbsent {
-					want := "{\"sentinel\":\"" + item.client + "\"}\n"
-					if err != nil || string(content) != want {
-						t.Fatalf("absent %s config changed: %q err=%v", item.name, content, err)
-					}
-				} else if !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("absent %s config was created: %q err=%v", item.name, content, err)
-				}
-			}
-		})
+	if err := pruneClientHookFile(path, "/tmp/hgctl", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(original, after) {
+		t.Fatalf("prune churned a file with no managed hooks:\nbefore:\n%s\nafter:\n%s", original, after)
 	}
 }
 
-func TestBackgroundHookRepairIsIdempotentAndDefersCodexTrust(t *testing.T) {
+func TestPruneClientHooksPrunesPresentAndToleratesAbsent(t *testing.T) {
+	app := testApp(t)
+	stable := filepath.Join(app.Paths.Bin, "hgctl")
+	// The Claude config carries a stale managed hook; the Codex config is absent.
+	claudePath := filepath.Join(app.Paths.Home, ".claude", "settings.json")
+	writeManagedHookFile(t, claudePath, stable, "claude")
+
+	if err := app.pruneClientHooks(); err != nil {
+		t.Fatal(err)
+	}
+
+	present, err := managedHooksPresent(claudePath, stable, "claude")
+	if err != nil || present {
+		t.Fatalf("claude managed hook was not pruned: present=%v err=%v", present, err)
+	}
+	// The preserved unrelated hook keeps the file present.
+	if _, err := os.Stat(claudePath); err != nil {
+		t.Fatalf("claude config was removed: %v", err)
+	}
+	// An absent client config is benign and is not created.
+	if _, err := os.Stat(filepath.Join(app.Paths.Home, ".codex", "hooks.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("absent codex config was created: %v", err)
+	}
+}
+
+func TestBackgroundHookRepairPrunesStaleAndIsIdempotent(t *testing.T) {
 	prepareInstalledBinary := func(t *testing.T, app *App) {
 		t.Helper()
 		target := filepath.Join(app.Paths.Versions, "test", "hgctl")
@@ -213,22 +213,25 @@ func TestBackgroundHookRepairIsIdempotentAndDefersCodexTrust(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	t.Run("uninstalled", func(t *testing.T) {
+
+	t.Run("uninstalled is a no-op", func(t *testing.T) {
 		app := testApp(t)
-		bin := filepath.Join(app.Paths.Home, "client-bin")
-		writeFakeExecutable(t, bin, "claude")
-		t.Setenv("PATH", bin)
+		stable := filepath.Join(app.Paths.Bin, "hgctl")
+		path := filepath.Join(app.Paths.Home, ".claude", "settings.json")
+		writeManagedHookFile(t, path, stable, "claude")
+		// No managed stable symlink and no state, so repair must touch nothing.
 		app.repairClientHooks(testContext(t))
-		if _, err := os.Stat(filepath.Join(app.Paths.Home, ".claude", "settings.json")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("background repair configured an uninstalled endpoint: %v", err)
+		if present, err := managedHooksPresent(path, stable, "claude"); err != nil || !present {
+			t.Fatalf("repair pruned hooks on an uninstalled endpoint: present=%v err=%v", present, err)
 		}
 	})
-	t.Run("lifecycle busy", func(t *testing.T) {
+
+	t.Run("lifecycle busy is deferred", func(t *testing.T) {
 		app := testApp(t)
 		prepareInstalledBinary(t, app)
-		bin := filepath.Join(app.Paths.Home, "client-bin")
-		writeFakeExecutable(t, bin, "claude")
-		t.Setenv("PATH", bin)
+		stable := filepath.Join(app.Paths.Bin, "hgctl")
+		path := filepath.Join(app.Paths.Home, ".claude", "settings.json")
+		writeManagedHookFile(t, path, stable, "claude")
 		locked := make(chan struct{})
 		release := make(chan struct{})
 		done := make(chan error, 1)
@@ -246,19 +249,21 @@ func TestBackgroundHookRepairIsIdempotentAndDefersCodexTrust(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(filepath.Join(app.Paths.Home, ".claude", "settings.json")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("background repair raced a lifecycle transaction: %v", err)
+		if present, err := managedHooksPresent(path, stable, "claude"); err != nil || !present {
+			t.Fatalf("background repair raced a lifecycle transaction: present=%v err=%v", present, err)
 		}
 	})
 
-	t.Run("Claude", func(t *testing.T) {
+	t.Run("prunes then no-op", func(t *testing.T) {
 		app := testApp(t)
 		prepareInstalledBinary(t, app)
-		bin := filepath.Join(app.Paths.Home, "client-bin")
-		writeFakeExecutable(t, bin, "claude")
-		t.Setenv("PATH", bin)
-		app.repairClientHooks(testContext(t))
+		stable := filepath.Join(app.Paths.Bin, "hgctl")
 		path := filepath.Join(app.Paths.Home, ".claude", "settings.json")
+		writeManagedHookFile(t, path, stable, "claude")
+		app.repairClientHooks(testContext(t))
+		if present, err := managedHooksPresent(path, stable, "claude"); err != nil || present {
+			t.Fatalf("repair did not prune the stale managed hook: present=%v err=%v", present, err)
+		}
 		first, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -268,222 +273,28 @@ func TestBackgroundHookRepairIsIdempotentAndDefersCodexTrust(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(first, second) || !hooksConfigured(path, filepath.Join(app.Paths.Bin, "hgctl"), "claude") {
-			t.Fatal("background repair changed an already-correct Claude hook set")
-		}
-	})
-
-	t.Run("Codex", func(t *testing.T) {
-		app := testApp(t)
-		prepareInstalledBinary(t, app)
-		t.Setenv("PATH", t.TempDir())
-		installFakeCodex(t, app, "rpc-error")
-		app.repairClientHooks(testContext(t))
-		path := filepath.Join(app.Paths.Home, ".codex", "hooks.json")
-		if !hooksConfigured(path, filepath.Join(app.Paths.Bin, "hgctl"), "codex") {
-			t.Fatal("background repair did not restore Codex hooks")
-		}
-		if output := app.Err.(*bytes.Buffer).String(); !strings.Contains(output, "Codex hook trust deferred") {
-			t.Fatalf("temporary Codex trust failure was not deferred: %q", output)
+		if !bytes.Equal(first, second) {
+			t.Fatalf("a second repair churned an already-pruned file:\n%s\n%s", first, second)
 		}
 	})
 }
 
-func TestSetupClientHooksSupportsClaudeOnlyAndCodexOnly(t *testing.T) {
-	t.Run("Claude only", func(t *testing.T) {
-		app := testApp(t)
-		bin := filepath.Join(app.Paths.Home, "client-bin")
-		writeFakeExecutable(t, bin, "claude")
-		t.Setenv("PATH", bin)
-		if err := app.setupClientHooks(testContext(t)); err != nil {
-			t.Fatal(err)
-		}
-		if !hooksConfigured(filepath.Join(app.Paths.Home, ".claude", "settings.json"), filepath.Join(app.Paths.Bin, "hgctl"), "claude") {
-			t.Fatal("Claude hooks were not configured")
-		}
-		if _, err := os.Stat(filepath.Join(app.Paths.Home, ".codex", "hooks.json")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("Codex config was touched on a Claude-only endpoint: %v", err)
-		}
-	})
-
-	t.Run("Codex only", func(t *testing.T) {
-		app := testApp(t)
-		t.Setenv("PATH", t.TempDir())
-		trustFile, _ := installFakeCodex(t, app, "success")
-		if err := app.setupClientHooks(testContext(t)); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := os.Stat(trustFile); err != nil {
-			t.Fatalf("Codex hooks were not trusted: %v", err)
-		}
-		if _, err := os.Stat(filepath.Join(app.Paths.Home, ".claude", "settings.json")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("Claude config was touched on a Codex-only endpoint: %v", err)
-		}
-	})
-}
-
-func TestClientDoctorChecksSkipAbsentAndRequireInstalledClients(t *testing.T) {
-	t.Run("absent clients", func(t *testing.T) {
-		app := testApp(t)
-		t.Setenv("PATH", t.TempDir())
-		for _, item := range app.clientAdapters() {
-			if err := os.MkdirAll(filepath.Dir(item.path), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(item.path, []byte("not json\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if checks := app.clientDoctorChecks(testContext(t)); len(checks) != 0 {
-			t.Fatalf("doctor checked absent clients: %+v", checks)
-		}
-		for _, item := range app.clientAdapters() {
-			content, err := os.ReadFile(item.path)
-			if err != nil || string(content) != "not json\n" {
-				t.Fatalf("doctor modified absent %s config: %q err=%v", item.name, content, err)
-			}
-		}
-	})
-
-	t.Run("Claude strict", func(t *testing.T) {
-		app := testApp(t)
-		bin := filepath.Join(app.Paths.Home, "client-bin")
-		writeFakeExecutable(t, bin, "claude")
-		t.Setenv("PATH", bin)
-		checks := app.clientDoctorChecks(testContext(t))
-		if len(checks) != 1 || checks[0].name != "Claude hooks" || checks[0].ok {
-			t.Fatalf("missing Claude hooks were not unhealthy: %+v", checks)
-		}
-		if err := app.setupHookFiles(); err != nil {
-			t.Fatal(err)
-		}
-		checks = app.clientDoctorChecks(testContext(t))
-		if len(checks) != 1 || !checks[0].ok {
-			t.Fatalf("configured Claude hooks were not healthy: %+v", checks)
-		}
-	})
-
-	t.Run("Codex strict", func(t *testing.T) {
-		app := testApp(t)
-		t.Setenv("PATH", t.TempDir())
-		installFakeCodex(t, app, "success")
-		if err := app.setupClientHooks(testContext(t)); err != nil {
-			t.Fatal(err)
-		}
-		checks := app.clientDoctorChecks(testContext(t))
-		if len(checks) != 1 || checks[0].name != "Codex hooks" || !checks[0].ok {
-			t.Fatalf("trusted Codex hooks were not healthy: %+v", checks)
-		}
-	})
-}
-
-func TestHooksConfiguredRequiresOneExactCompleteSet(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "hooks.json")
-	binary := "/Users/test/.local/bin/hgctl"
-	if err := configureHookFile(path, binary, "codex", true); err != nil {
-		t.Fatal(err)
-	}
-	base, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !hooksConfigured(path, binary, "codex") {
-		t.Fatal("freshly configured hook set was not recognized")
-	}
-
-	mutations := map[string]func(map[string]any){
-		"partial": func(root map[string]any) {
-			delete(root["hooks"].(map[string]any), "Stop")
-		},
-		"duplicate": func(root map[string]any) {
-			hooks := root["hooks"].(map[string]any)
-			groups := hooks["Stop"].([]any)
-			hooks["Stop"] = append(groups, groups[0])
-		},
-		"wrong timeout": func(root map[string]any) {
-			hooks := root["hooks"].(map[string]any)
-			group := hooks["Stop"].([]any)[0].(map[string]any)
-			group["hooks"].([]any)[0].(map[string]any)["timeout"] = float64(30)
-		},
-		"wrong matcher": func(root map[string]any) {
-			hooks := root["hooks"].(map[string]any)
-			hooks["Stop"].([]any)[0].(map[string]any)["matcher"] = "unexpected"
-		},
-		"wrong handler type": func(root map[string]any) {
-			hooks := root["hooks"].(map[string]any)
-			group := hooks["Stop"].([]any)[0].(map[string]any)
-			group["hooks"].([]any)[0].(map[string]any)["type"] = "prompt"
-		},
-		"wrong event": func(root map[string]any) {
-			hooks := root["hooks"].(map[string]any)
-			hooks["Other"] = hooks["Stop"]
-			delete(hooks, "Stop")
-		},
-		"unrelated non-object group": func(root map[string]any) {
-			root["hooks"].(map[string]any)["Other"] = []any{"invalid"}
-		},
-		"unrelated group missing hooks": func(root map[string]any) {
-			root["hooks"].(map[string]any)["Other"] = []any{map[string]any{"matcher": "value"}}
-		},
-		"unrelated non-object handler": func(root map[string]any) {
-			root["hooks"].(map[string]any)["Other"] = []any{map[string]any{"hooks": []any{"invalid"}}}
-		},
-		"unrelated handler missing type": func(root map[string]any) {
-			root["hooks"].(map[string]any)["Other"] = []any{map[string]any{"hooks": []any{map[string]any{"command": "other-tool"}}}}
-		},
-		"unrelated null event": func(root map[string]any) {
-			root["hooks"].(map[string]any)["Other"] = nil
-		},
-	}
-	for name, mutate := range mutations {
-		t.Run(name, func(t *testing.T) {
-			var root map[string]any
-			if err := json.Unmarshal(base, &root); err != nil {
-				t.Fatal(err)
-			}
-			mutate(root)
-			if err := writeJSONAtomic(path, root, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if hooksConfigured(path, binary, "codex") {
-				t.Fatal("invalid hook set was accepted")
-			}
-		})
-	}
-
-	var root map[string]any
-	if err := json.Unmarshal(base, &root); err != nil {
-		t.Fatal(err)
-	}
-	hooks := root["hooks"].(map[string]any)
-	hooks["Stop"] = append(hooks["Stop"].([]any), map[string]any{
-		"hooks": []any{map[string]any{"type": "command", "command": "other-tool stop", "timeout": float64(1)}},
-	})
-	if err := writeJSONAtomic(path, root, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if !hooksConfigured(path, binary, "codex") {
-		t.Fatal("unrelated hook made the exact managed set unhealthy")
-	}
-}
-
-func TestHookConfigPreservesDotfileSymlink(t *testing.T) {
+func TestPruneClientHookFilePreservesDotfileSymlink(t *testing.T) {
 	root := t.TempDir()
+	binary := "/tmp/hgctl"
 	target := filepath.Join(root, "dotfiles", "claude-settings.json")
 	link := filepath.Join(root, ".claude", "settings.json")
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(target, []byte("{\"theme\":\"dark\"}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeManagedHookFile(t, target, binary, "claude")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := configureHookFile(link, "/tmp/hgctl", "claude", true); err != nil {
+	if present, err := managedHooksPresent(link, binary, "claude"); err != nil || !present {
+		t.Fatalf("managed hooks missing through symlink: present=%v err=%v", present, err)
+	}
+	if err := pruneClientHookFile(link, binary, "claude"); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Lstat(link)
@@ -491,21 +302,10 @@ func TestHookConfigPreservesDotfileSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("config symlink was replaced: mode=%v", info.Mode())
+		t.Fatalf("config symlink was replaced during prune: mode=%v", info.Mode())
 	}
-	present, err := managedHooksPresent(link, "/tmp/hgctl", "claude")
-	if err != nil || !present {
-		t.Fatalf("managed hooks missing through symlink: present=%v err=%v", present, err)
-	}
-	if err := configureHookFile(link, "/tmp/hgctl", "claude", false); err != nil {
-		t.Fatal(err)
-	}
-	info, err = os.Lstat(link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("config symlink was replaced during uninstall: mode=%v", info.Mode())
+	if present, err := managedHooksPresent(link, binary, "claude"); err != nil || present {
+		t.Fatalf("managed hooks remain through symlink after prune: present=%v err=%v", present, err)
 	}
 }
 
@@ -702,12 +502,8 @@ func TestUninstallRemovesManagedIntegrationAfterSchedulerStops(t *testing.T) {
 	if commandExists("claude") || commandExists("codex") {
 		t.Fatal("client executables unexpectedly remain in the uninstall fixture")
 	}
-	if err := configureHookFile(filepath.Join(app.Paths.Home, ".claude", "settings.json"), stable, "claude", true); err != nil {
-		t.Fatal(err)
-	}
-	if err := configureHookFile(filepath.Join(app.Paths.Home, ".codex", "hooks.json"), stable, "codex", true); err != nil {
-		t.Fatal(err)
-	}
+	writeManagedHookFile(t, filepath.Join(app.Paths.Home, ".claude", "settings.json"), stable, "claude")
+	writeManagedHookFile(t, filepath.Join(app.Paths.Home, ".codex", "hooks.json"), stable, "codex")
 	if err := app.uninstall(testContext(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -750,9 +546,7 @@ func TestUninstallPreservesBinaryWhenHookOrSchedulerCleanupFails(t *testing.T) {
 	t.Run("scheduler cleanup fails", func(t *testing.T) {
 		app := testApp(t)
 		stable := prepareUninstallFixture(t, app, true)
-		if err := configureHookFile(filepath.Join(app.Paths.Home, ".claude", "settings.json"), stable, "claude", true); err != nil {
-			t.Fatal(err)
-		}
+		writeManagedHookFile(t, filepath.Join(app.Paths.Home, ".claude", "settings.json"), stable, "claude")
 		if err := app.uninstall(testContext(t)); err == nil {
 			t.Fatal("uninstall succeeded with an unremovable scheduler artifact")
 		}
@@ -1048,16 +842,6 @@ printf x >> "$HGCTL_TEST_REINDEX_LOG"
 	}
 	if err := app.reindexBasicMemory(testContext(t)); err != nil {
 		t.Fatalf("matching receipt should skip external reindex: %v", err)
-	}
-}
-
-func writeFakeExecutable(t *testing.T, dir, name string) {
-	t.Helper()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
-		t.Fatal(err)
 	}
 }
 
