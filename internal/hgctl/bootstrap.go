@@ -20,28 +20,16 @@ type repositoryBootstrapOperations struct {
 }
 
 func (a *App) ensureRepositoryBranches(ctx context.Context, remote string) error {
-	bootstrapCtx, cancel := context.WithTimeout(ctx, repositoryBootstrapTimeout)
+	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	operations := repositoryBootstrapOperations{
-		branchExists: func(checkCtx context.Context) (bool, error) {
-			for _, branch := range []string{"shared", "queue-template"} {
-				exists, err := remoteBranchExists(checkCtx, a.Paths.Control, branch)
-				if err != nil || !exists {
-					return false, err
-				}
-			}
-			return true, nil
-		},
-		trigger: func(triggerCtx context.Context) error {
-			return triggerRepositoryBootstrap(triggerCtx, remote)
-		},
-		wait: waitForRepositoryBootstrap,
+	exists, err := remoteBranchExists(checkCtx, a.Paths.Control, "shared")
+	if err != nil {
+		return fmt.Errorf("check shared branch: %w", err)
 	}
-	err := ensureRepositoryBranchesWith(bootstrapCtx, operations)
-	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-		return fmt.Errorf("repository bootstrap did not publish within %s", repositoryBootstrapTimeout)
+	if !exists {
+		return errors.New("remote branch shared does not exist; publish shared before installing an endpoint")
 	}
-	return err
+	return nil
 }
 
 func ensureRepositoryBranchesWith(ctx context.Context, operations repositoryBootstrapOperations) error {
