@@ -148,6 +148,27 @@ func (a *App) ingestIdleSessions(id Identity, seen map[string]bool, clients []st
 	return enqueued, errors.Join(errs...)
 }
 
+// ingestForSync is the steady-state, scheduler-driven counterpart to runIngest:
+// each sync ingests up to syncIngestLimit newly-idle, not-yet-ingested sessions
+// into the outbox (the queue drain that follows publishes them). It is bounded so
+// a sync stays within its context budget; the remainder is picked up next run.
+// The cheap ledger + idle pre-filters in gatherSessions keep this from reparsing
+// the whole history every run.
+func (a *App) ingestForSync(id Identity) error {
+	clients, _ := ingestClients("all")
+	seen, err := a.loadIngestedSessions()
+	if err != nil {
+		return err
+	}
+	enqueued, ingestErr := a.ingestIdleSessions(id, seen, clients, syncIngestLimit, ingestIdleThreshold())
+	if enqueued > 0 {
+		if err := a.saveIngestedSessions(seen); err != nil {
+			return errors.Join(ingestErr, err)
+		}
+	}
+	return ingestErr
+}
+
 func ingestClients(client string) ([]string, bool) {
 	switch client {
 	case "all":

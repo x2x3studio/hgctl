@@ -1,6 +1,7 @@
 package hgctl
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -203,6 +204,64 @@ func TestLoadIngestedSessionsMigratesLegacyLedger(t *testing.T) {
 	if !seen["codex:known"] {
 		t.Fatal("namespaced codex id was lost on load")
 	}
+}
+
+// A scheduler-driven sync ingests at most syncIngestLimit newly-idle sessions,
+// leaving the remainder for the next run and never touching a still-live session.
+func TestIngestForSyncBoundsAndSkipsLiveSessions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	app := testApp(t)
+	old := app.Now().Add(-time.Hour)
+
+	total := syncIngestLimit + 2
+	for i := 0; i < total; i++ {
+		p := filepath.Join(home, ".claude", "projects", "proj", fmt.Sprintf("done-%02d.jsonl", i))
+		writeSessionFile(t, p, fmt.Sprintf(`{"type":"user","sessionId":"done-%02d","timestamp":"2026-07-07T02:%02d:00.000Z","message":{"role":"user","content":"A completed question long enough to qualify for ingest number %02d."}}`+"\n", i, i, i))
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live := filepath.Join(home, ".claude", "projects", "proj", "live.jsonl")
+	writeSessionFile(t, live,
+		`{"type":"user","sessionId":"live","timestamp":"2026-07-07T05:00:00.000Z","message":{"role":"user","content":"A live question long enough to qualify for ingest here too now."}}`+"\n")
+	recent := app.Now().Add(-time.Minute)
+	if err := os.Chtimes(live, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := app.loadIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.ingestForSync(id); err != nil {
+		t.Fatal(err)
+	}
+	if got := countOutboxMD(t, app); got != syncIngestLimit {
+		t.Fatalf("first sync enqueued %d, want the bounded %d", got, syncIngestLimit)
+	}
+	// The remainder drains on the next run; the still-live session stays out.
+	if err := app.ingestForSync(id); err != nil {
+		t.Fatal(err)
+	}
+	if got := countOutboxMD(t, app); got != total {
+		t.Fatalf("after two syncs enqueued %d, want all %d completed (live excluded)", got, total)
+	}
+}
+
+func countOutboxMD(t *testing.T, app *App) int {
+	t.Helper()
+	entries, err := os.ReadDir(app.Paths.Outbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".md") {
+			count++
+		}
+	}
+	return count
 }
 
 func TestGatherSessionsIsClientNamespaced(t *testing.T) {

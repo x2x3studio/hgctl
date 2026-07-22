@@ -303,6 +303,13 @@ func (a *App) sync(ctx context.Context) error {
 			errs = append(errs, err)
 			return errors.Join(errs...)
 		}
+		// Per-session transcript ingest is the single intake path: fold a bounded
+		// idle-complete ingest in before the queue drain so live sessions land in
+		// the outbox per-session with no per-turn hooks. Non-fatal: still drain and
+		// publish whatever is already queued.
+		if err := a.ingestForSync(identity); err != nil {
+			errs = append(errs, fmt.Errorf("session ingest: %w", err))
+		}
 		if err := a.syncQueueUnlocked(syncCtx, state); err != nil {
 			errs = append(errs, fmt.Errorf("queue sync: %w", err))
 		}
