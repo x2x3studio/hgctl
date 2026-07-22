@@ -147,3 +147,69 @@ func compactJSON(t *testing.T, content []byte) []byte {
 	}
 	return compact.Bytes()
 }
+
+// When a backlog replay rewrites origin/shared to a fresh orphan, an endpoint
+// still on the old history is diverged (its HEAD is not an ancestor of the new
+// origin/shared). Because shared is product-only and the vault is a disposable
+// mirror, syncSharedUnlocked must hard-reset onto origin/shared and re-mirror
+// rather than error forever.
+func TestSyncSharedUnlockedRecoversFromDivergedOrigin(t *testing.T) {
+	app := testApp(t)
+	dir := t.TempDir()
+	origin := filepath.Join(dir, "origin.git")
+	runGitTest(t, "", "init", "--bare", origin)
+
+	shared := app.Paths.Shared
+	runGitTest(t, "", "init", "-b", "shared", shared)
+	runGitTest(t, shared, "config", "user.name", "test")
+	runGitTest(t, shared, "config", "user.email", "test@example.com")
+	runGitTest(t, shared, "remote", "add", "origin", origin)
+	if err := os.MkdirAll(filepath.Join(shared, "memory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shared, "memory", "old.md"), []byte("old product\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, shared, "add", ".")
+	runGitTest(t, shared, "commit", "-m", "history A")
+	runGitTest(t, shared, "push", "origin", "shared")
+	runGitTest(t, shared, "fetch", "origin")
+
+	// A backlog replay force-pushes a brand-new orphan history to origin/shared.
+	rewrite := filepath.Join(dir, "rewrite")
+	runGitTest(t, "", "init", "-b", "shared", rewrite)
+	runGitTest(t, rewrite, "config", "user.name", "test")
+	runGitTest(t, rewrite, "config", "user.email", "test@example.com")
+	runGitTest(t, rewrite, "remote", "add", "origin", origin)
+	if err := os.MkdirAll(filepath.Join(rewrite, "memory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rewrite, "memory", "new.md"), []byte("new product\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rewrite, "Home.md"), []byte("# new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, rewrite, "add", ".")
+	runGitTest(t, rewrite, "commit", "-m", "history B orphan")
+	runGitTest(t, rewrite, "push", "-f", "origin", "shared")
+
+	// The endpoint fetches the rewritten origin/shared; its HEAD (A) is now
+	// diverged from origin/shared (B).
+	runGitTest(t, shared, "fetch", "origin")
+	if err := app.syncSharedUnlocked(testContext(t)); err != nil {
+		t.Fatalf("diverged shared did not self-heal: %v", err)
+	}
+
+	head := strings.TrimSpace(runGitTest(t, shared, "rev-parse", "HEAD"))
+	remote := strings.TrimSpace(runGitTest(t, shared, "rev-parse", "origin/shared"))
+	if head != remote {
+		t.Fatalf("shared not reset onto origin/shared: head=%s remote=%s", head, remote)
+	}
+	if _, err := os.Stat(filepath.Join(app.Paths.Vault, "memory", "new.md")); err != nil {
+		t.Fatalf("vault missing new product after reset: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(app.Paths.Vault, "memory", "old.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("vault kept stale product after reset: %v", err)
+	}
+}

@@ -325,27 +325,6 @@ func (a *App) sync(ctx context.Context) error {
 	return coreErr
 }
 
-func (a *App) syncShared(ctx context.Context) error {
-	state, err := a.loadState()
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	return withFileLock(a.Paths.SyncLock, func() error {
-		if err := a.verifyControlCheckout(ctx, state.RepoURL); err != nil {
-			return err
-		}
-		if _, err := runCommand(ctx, a.Paths.Control, "git", "fetch", "origin", "+refs/heads/shared:refs/remotes/origin/shared"); err != nil {
-			return err
-		}
-		return a.syncSharedUnlocked(ctx)
-	})
-}
-
 func (a *App) syncSharedUnlocked(ctx context.Context) error {
 	if _, err := os.Stat(filepath.Join(a.Paths.Shared, ".git")); err != nil {
 		return nil
@@ -365,11 +344,20 @@ func (a *App) syncSharedUnlocked(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !ancestor {
-		return errors.New("shared worktree is ahead of or diverged from origin/shared")
-	}
-	if _, err := runCommand(ctx, a.Paths.Shared, "git", "merge", "--ff-only", "origin/shared"); err != nil {
-		return err
+	if ancestor {
+		if _, err := runCommand(ctx, a.Paths.Shared, "git", "merge", "--ff-only", "origin/shared"); err != nil {
+			return err
+		}
+	} else {
+		// origin/shared history was rewritten (e.g. a backlog replay reset it to a
+		// new orphan), so local shared is ahead of or diverged from it. Shared is
+		// product-only and the vault is a disposable mirror, so hard-reset onto
+		// origin/shared instead of wedging every future sync (which would freeze
+		// reindex and leave recall permanently stale). The dirty guard above still
+		// protects any local uncommitted changes from being discarded.
+		if _, err := runCommand(ctx, a.Paths.Shared, "git", "reset", "--hard", "origin/shared"); err != nil {
+			return err
+		}
 	}
 	head, err := runCommand(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
 	if err != nil {

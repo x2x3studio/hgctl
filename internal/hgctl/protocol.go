@@ -2,6 +2,7 @@ package hgctl
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -27,11 +28,24 @@ type rawEvent struct {
 	Machine    string
 	Hostname   string
 	Body       string
+	// Dedup, when non-empty, makes filename() deterministic so re-enqueuing the
+	// same logical event (e.g. an interrupted historical ingest re-run) overwrites
+	// its outbox file and collapses against an already-published queue event via
+	// byte-equality, instead of publishing a duplicate under a fresh random name.
+	// Steady-state captures leave it empty and keep a random suffix, since they
+	// have no stable identity and many can share one second.
+	Dedup string
 }
 
-// filename is timestamp-ordered and collision-free.
+// filename is timestamp-ordered and collision-free. The suffix is random for
+// steady-state captures but deterministic when Dedup is set (see rawEvent.Dedup).
 func (e rawEvent) filename() string {
-	return e.CapturedAt.UTC().Format("20060102T150405Z") + "-" + randHex(4) + ".md"
+	suffix := randHex(4)
+	if e.Dedup != "" {
+		sum := sha256.Sum256([]byte(e.Dedup))
+		suffix = hex.EncodeToString(sum[:4])
+	}
+	return e.CapturedAt.UTC().Format("20060102T150405Z") + "-" + suffix + ".md"
 }
 
 // marshal renders the event as a Markdown file.
@@ -108,12 +122,4 @@ func validMachineID(value string) bool {
 		return false
 	}
 	return validLowerHex(value[:8]+value[9:13]+value[14:18]+value[19:23]+value[24:], 32)
-}
-
-func validRequiredString(value string, limit int) bool {
-	return value != "" && validOptionalString(value, limit)
-}
-
-func validOptionalString(value string, limit int) bool {
-	return utf8.ValidString(value) && len(value) <= limit
 }

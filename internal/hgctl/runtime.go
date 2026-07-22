@@ -46,7 +46,6 @@ type Paths struct {
 	Control       string
 	Queue         string
 	Outbox        string
-	Quarantine    string
 	Pending       string
 	Vault         string
 	Shared        string
@@ -54,7 +53,6 @@ type Paths struct {
 	Versions      string
 	Identity      string
 	State         string
-	Delivered     string
 	IndexedSHA    string
 	UpdateCheck   string
 	LifecycleLock string
@@ -87,7 +85,6 @@ func DefaultPaths() (Paths, error) {
 		Control:       filepath.Join(data, "repo"),
 		Queue:         filepath.Join(data, "queue"),
 		Outbox:        filepath.Join(data, "outbox"),
-		Quarantine:    filepath.Join(data, "quarantine"),
 		Pending:       filepath.Join(data, "pending"),
 		Vault:         vault,
 		Shared:        filepath.Join(data, "shared"),
@@ -95,7 +92,6 @@ func DefaultPaths() (Paths, error) {
 		Versions:      filepath.Join(home, ".local", "lib", "hgctl", "versions"),
 		Identity:      filepath.Join(data, "identity.json"),
 		State:         filepath.Join(data, "state.json"),
-		Delivered:     filepath.Join(data, "delivered"),
 		IndexedSHA:    filepath.Join(data, "indexed-shared"),
 		UpdateCheck:   filepath.Join(data, "update-check.json"),
 		LifecycleLock: filepath.Join(data, "lifecycle.lock"),
@@ -199,7 +195,7 @@ func probeJSONSchema(path string, dst any, version *int, current int) (bool, err
 }
 
 func (a *App) ensureDataDirs() error {
-	for _, path := range []string{a.Paths.Data, a.Paths.Outbox, a.Paths.Quarantine, a.Paths.Pending} {
+	for _, path := range []string{a.Paths.Data, a.Paths.Outbox, a.Paths.Pending} {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return err
 		}

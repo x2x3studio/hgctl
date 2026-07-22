@@ -439,7 +439,6 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 		return queueBatch{}, nil
 	}
 	var batch queueBatch
-	total := 0
 	var staged []string
 	for _, record := range strings.Split(status, "\x00") {
 		if record == "" {
@@ -469,7 +468,6 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 		}
 		batch.OutboxPaths = append(batch.OutboxPaths, outboxPath)
 		batch.EventPaths = append(batch.EventPaths, clean)
-		total += len(queued)
 		if code == "A " {
 			staged = append(staged, clean)
 		}
@@ -480,9 +478,11 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 			return queueBatch{}, err
 		}
 	}
-	if len(batch.EventPaths) > MaxSyncEvents || total > MaxSyncBytes {
-		return queueBatch{}, errors.New("interrupted queue stage exceeds endpoint commit limits")
-	}
+	// No MaxSyncEvents/MaxSyncBytes cap here: bulk ingest (drainOutboxToQueue)
+	// stages up to bulkQueueCommitChunk events per commit, so an interrupted bulk
+	// batch legitimately exceeds the steady-state capture bounds. The recovered
+	// files are byte-validated against their outbox source and restricted to
+	// events/*.md, so the caller commits the whole batch as one local commit.
 	return batch, nil
 }
 

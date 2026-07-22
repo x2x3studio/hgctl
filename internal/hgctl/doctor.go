@@ -72,12 +72,6 @@ func (a *App) doctor(ctx context.Context) error {
 		projectNote = boundString(projectErr.Error(), 512)
 	}
 	cancel()
-	quarantineEmpty := true
-	if entries, err := os.ReadDir(a.Paths.Quarantine); err == nil {
-		quarantineEmpty = len(entries) == 0
-	} else if !errors.Is(err, os.ErrNotExist) {
-		quarantineEmpty = false
-	}
 	checks := []doctorCheck{
 		{"git", commandExists("git"), "required transport"},
 		{"basic-memory", commandExists("basic-memory"), "required MCP-backed memory helper"},
@@ -92,7 +86,6 @@ func (a *App) doctor(ctx context.Context) error {
 	checks = append(checks, a.basicMemoryMCPDoctorChecks(ctx)...)
 	checks = append(checks,
 		doctorCheck{"scheduler", a.schedulerLoaded(ctx), LaunchLabel},
-		doctorCheck{"quarantine", quarantineEmpty, a.Paths.Quarantine},
 		a.hookDiagnosticDoctorCheck(),
 	)
 	failed := 0

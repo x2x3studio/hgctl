@@ -145,6 +145,49 @@ func TestIngestKeyIsClientNamespaced(t *testing.T) {
 	}
 }
 
+// A mid-loop interruption in runIngest re-processes already-enqueued sessions on
+// the next run. With a session-derived deterministic filename, re-enqueue must
+// overwrite the same outbox file rather than pile up duplicates under fresh
+// random names (which would waste reflect compute downstream).
+func TestReenqueueWithDedupCollapsesInsteadOfDuplicating(t *testing.T) {
+	app := testApp(t)
+	if err := os.MkdirAll(app.Paths.Outbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	captured := time.Date(2026, 6, 5, 3, 41, 12, 0, time.UTC)
+	ev := rawEvent{CapturedAt: captured, Client: "claude", Machine: "m", Body: "session body", Dedup: ingestKey("claude", "sess-1")}
+	for i := 0; i < 3; i++ {
+		if err := app.enqueue(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	md := 0
+	entries, err := os.ReadDir(app.Paths.Outbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".md") {
+			md++
+		}
+	}
+	if md != 1 {
+		t.Fatalf("re-enqueue left %d outbox files, want 1 (deterministic dedup)", md)
+	}
+
+	// Same session id + client at the same second is stable; a different session
+	// at that second gets a distinct suffix; steady-state (no Dedup) stays random.
+	if ev.filename() != (rawEvent{CapturedAt: captured, Body: "grown body", Dedup: ingestKey("claude", "sess-1")}).filename() {
+		t.Fatal("same session produced different filenames")
+	}
+	if ev.filename() == (rawEvent{CapturedAt: captured, Dedup: ingestKey("claude", "sess-2")}).filename() {
+		t.Fatal("distinct sessions collided on filename")
+	}
+	if (rawEvent{CapturedAt: captured}).filename() == (rawEvent{CapturedAt: captured}).filename() {
+		t.Fatal("expected a random suffix for a capture without Dedup")
+	}
+}
+
 func TestLoadIngestedSessionsMigratesLegacyLedger(t *testing.T) {
 	app := testApp(t)
 	if err := writeJSONAtomic(app.ingestedSessionsPath(), []string{"legacy-claude", "codex:known"}, 0o600); err != nil {
@@ -316,5 +359,43 @@ func TestBulkPublishQueueRejectsForeignBranch(t *testing.T) {
 	}
 	if _, err := app.bulkPublishQueue(testContext(t)); err == nil {
 		t.Fatal("expected a branch/identity mismatch error")
+	}
+}
+
+// A bulk ingest stages up to bulkQueueCommitChunk events before committing, so an
+// interruption after copy/stage but before commit leaves more than MaxSyncEvents
+// events in the queue worktree. Recovery must fold the whole validated batch, not
+// wedge on the steady-state caps.
+func TestRecoverInterruptedQueueBatchExceedsSteadyStateCaps(t *testing.T) {
+	app, _, _ := setupBulkQueue(t)
+
+	const events = 9 // more than MaxSyncEvents
+	for i := 0; i < events; i++ {
+		captured := time.Date(2026, 6, 5, 0, 0, i, 0, time.UTC)
+		if err := app.enqueue(rawEvent{CapturedAt: captured, Client: "codex", Machine: "m", Body: "interrupted batch body"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Copy and stage the batch into the worktree, then stop short of the commit to
+	// simulate a crash mid-bulk-ingest.
+	batch, err := app.copyOutboxBatch(bulkQueueCommitChunk, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.EventPaths) != events {
+		t.Fatalf("staged %d events, want %d", len(batch.EventPaths), events)
+	}
+	runGitTest(t, app.Paths.Queue, append([]string{"add", "--"}, batch.EventPaths...)...)
+
+	recovered, err := app.recoverInterruptedQueueBatch(testContext(t))
+	if err != nil {
+		t.Fatalf("recovery of a >MaxSyncEvents interrupted batch failed: %v", err)
+	}
+	if len(recovered.EventPaths) != events {
+		t.Fatalf("recovered %d events, want the full %d", len(recovered.EventPaths), events)
+	}
+	if len(recovered.OutboxPaths) != events {
+		t.Fatalf("recovered %d outbox paths, want %d", len(recovered.OutboxPaths), events)
 	}
 }

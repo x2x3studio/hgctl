@@ -86,7 +86,10 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 	}
 	enqueued := 0
 	for _, cand := range candidates {
-		if err := a.enqueue(rawEvent{CapturedAt: cand.captured, Client: cand.client, Machine: id.ID, Hostname: id.Hostname, Body: cand.body}); err != nil {
+		// Dedup keys the event filename to the session so an interrupted re-run
+		// re-enqueues idempotently (overwrites the outbox file, collapses against
+		// an already-published queue event) rather than duplicating reflect work.
+		if err := a.enqueue(rawEvent{CapturedAt: cand.captured, Client: cand.client, Machine: id.ID, Hostname: id.Hostname, Body: cand.body, Dedup: ingestKey(cand.client, cand.id)}); err != nil {
 			return err
 		}
 		seen[ingestKey(cand.client, cand.id)] = true

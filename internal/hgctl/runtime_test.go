@@ -18,11 +18,10 @@ func testApp(t *testing.T) *App {
 	paths := Paths{
 		Home: home, Data: data,
 		Control: filepath.Join(data, "repo"), Queue: filepath.Join(data, "queue"),
-		Outbox: filepath.Join(data, "outbox"), Quarantine: filepath.Join(data, "quarantine"), Pending: filepath.Join(data, "pending"),
+		Outbox: filepath.Join(data, "outbox"), Pending: filepath.Join(data, "pending"),
 		Vault: filepath.Join(home, "hourglass-vault"), Shared: filepath.Join(data, "shared"), Bin: filepath.Join(home, ".local", "bin"),
 		Versions: filepath.Join(home, ".local", "lib", "hgctl", "versions"),
 		Identity: filepath.Join(data, "identity.json"), State: filepath.Join(data, "state.json"),
-		Delivered:     filepath.Join(data, "delivered"),
 		IndexedSHA:    filepath.Join(data, "indexed-shared"),
 		UpdateCheck:   filepath.Join(data, "update-check.json"),
 		LifecycleLock: filepath.Join(data, "lifecycle.lock"),
