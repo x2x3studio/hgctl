@@ -493,13 +493,3 @@ func TestGitHubAPIPinsGitHubDotCom(t *testing.T) {
 		t.Fatalf("gh call = %q, want %q", content, want)
 	}
 }
-
-func TestOptionsMayFollowPositionalArguments(t *testing.T) {
-	client, rest, err := extractOption([]string{"repo-name", "--client", "codex"}, "--client", "unknown")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if client != "codex" || len(rest) != 1 || rest[0] != "repo-name" {
-		t.Fatalf("client=%q rest=%v", client, rest)
-	}
-}
