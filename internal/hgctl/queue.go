@@ -128,10 +128,20 @@ type queueBatch struct {
 	EventPaths  []string
 }
 
-// copyOutboxToQueue moves up to a bounded batch of raw outbox events into the
-// queue worktree under events/. Events are opaque Markdown; there is no decode,
-// canonicalization, admission, or quarantine.
+// copyOutboxToQueue moves up to a bounded steady-state batch of raw outbox events
+// into the queue worktree. The MaxSyncEvents/MaxSyncBytes bounds keep automatic
+// Stop-hook syncs small; the operator-invoked bulk import deliberately bypasses
+// them via copyOutboxBatch (see drainOutboxToQueue).
 func (a *App) copyOutboxToQueue() (queueBatch, error) {
+	return a.copyOutboxBatch(MaxSyncEvents, MaxSyncBytes)
+}
+
+// copyOutboxBatch moves outbox events into the queue worktree under events/,
+// oldest first (filenames are timestamp-ordered). Events are opaque Markdown;
+// there is no decode, canonicalization, admission, or quarantine. maxEvents and
+// maxBytes cap the batch; a non-positive bound disables that cap. The per-event
+// MaxEventBytes ceiling always applies.
+func (a *App) copyOutboxBatch(maxEvents, maxBytes int) (queueBatch, error) {
 	entries, err := os.ReadDir(a.Paths.Outbox)
 	if err != nil {
 		return queueBatch{}, err
@@ -151,7 +161,7 @@ func (a *App) copyOutboxToQueue() (queueBatch, error) {
 			}
 			return queueBatch{}, err
 		}
-		if len(batch.EventPaths) == MaxSyncEvents || (selectedBytes > 0 && selectedBytes+len(content) > MaxSyncBytes) {
+		if (maxEvents > 0 && len(batch.EventPaths) == maxEvents) || (maxBytes > 0 && selectedBytes > 0 && selectedBytes+len(content) > maxBytes) {
 			break
 		}
 		rel := filepath.ToSlash(filepath.Join("events", entry.Name()))
@@ -177,6 +187,148 @@ func (a *App) copyOutboxToQueue() (queueBatch, error) {
 		selectedBytes += len(content)
 	}
 	return batch, nil
+}
+
+// bulkQueueCommitChunk bounds how many events land in one ingest commit so the
+// git argument list stays sane for very large historical backlogs; the whole set
+// is still published to origin in a single push.
+const bulkQueueCommitChunk = 500
+
+// bulkPublishQueue drains the entire outbox to the machine queue branch in large
+// chronological commits and pushes once, so an operator-invoked historical import
+// lands on origin/queue/<machine> before the command returns. It reuses every
+// steady-state queue guard (orphan/append-only, events/ path, per-event byte
+// ceiling) but deliberately bypasses the MaxSyncEvents/MaxSyncBytes capture bounds
+// that keep automatic Stop-hook syncs small. It waits for, rather than skips, a
+// held sync lock so the operator's import is never silently dropped.
+func (a *App) bulkPublishQueue(ctx context.Context) (int, error) {
+	state, err := a.loadState()
+	if err != nil {
+		return 0, err
+	}
+	identity, err := a.loadIdentity()
+	if err != nil {
+		return 0, err
+	}
+	if expected := "queue/" + identity.ID; state.QueueBranch != expected {
+		return 0, fmt.Errorf("configured queue %q does not match machine identity %q", state.QueueBranch, identity.ID)
+	}
+	lockCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	var delivered int
+	err = withFileLockWait(lockCtx, a.Paths.SyncLock, func() error {
+		if err := a.verifyControlCheckout(lockCtx, state.RepoURL); err != nil {
+			return err
+		}
+		if err := a.fetchEndpointRefs(lockCtx, state); err != nil {
+			return err
+		}
+		delivered, err = a.drainOutboxToQueue(lockCtx, state)
+		return err
+	})
+	return delivered, err
+}
+
+// drainOutboxToQueue commits every outbox event to the queue worktree in
+// bulkQueueCommitChunk-sized commits and pushes once. It mirrors the proven
+// syncQueueUnlocked preamble (temp cleanup, interrupted-batch recovery, clean
+// check, fast-forward) and per-batch guards, differing only in that it loops
+// until the outbox is empty instead of stopping at one bounded batch.
+func (a *App) drainOutboxToQueue(ctx context.Context, state State) (int, error) {
+	if err := cleanupQueueTemps(a.Paths.Queue); err != nil {
+		return 0, err
+	}
+	recovered, err := a.recoverInterruptedQueueBatch(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if err := requireQueueTrackedClean(ctx, a.Paths.Queue); err != nil {
+		return 0, err
+	}
+	if gitRefExists(ctx, a.Paths.Queue, "refs/remotes/origin/"+state.QueueBranch) {
+		if _, err := runCommand(ctx, a.Paths.Queue, "git", "merge", "--ff-only", "origin/"+state.QueueBranch); err != nil {
+			return 0, err
+		}
+	}
+	delivered := 0
+	commit := func(batch queueBatch) error {
+		if len(batch.EventPaths) == 0 {
+			return nil
+		}
+		if err := a.stageAndCommitQueueBatch(ctx, state, batch); err != nil {
+			return err
+		}
+		if err := removeOutboxPaths(batch.OutboxPaths); err != nil {
+			return err
+		}
+		delivered += len(batch.EventPaths)
+		return nil
+	}
+	// Fold any interrupted steady-state batch first; recoverInterruptedQueueBatch
+	// already verified its worktree files against the outbox.
+	if err := commit(recovered); err != nil {
+		return delivered, err
+	}
+	for {
+		batch, err := a.copyOutboxBatch(bulkQueueCommitChunk, 0)
+		if err != nil {
+			return delivered, err
+		}
+		if len(batch.EventPaths) == 0 {
+			break
+		}
+		if err := commit(batch); err != nil {
+			return delivered, err
+		}
+	}
+	if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, nil, false); err != nil {
+		return delivered, err
+	}
+	needsPush, err := queueNeedsPush(ctx, a.Paths.Queue, state.QueueBranch)
+	if err != nil {
+		return delivered, err
+	}
+	if needsPush {
+		if _, err := runCommand(ctx, a.Paths.Queue, "git", "push", "origin", "HEAD:refs/heads/"+state.QueueBranch); err != nil {
+			return delivered, err
+		}
+		if err := notifyDream(ctx, state.RepoURL); err != nil {
+			_, _ = fmt.Fprintln(a.Err, "hgctl: Dream notification deferred:", err)
+		}
+	}
+	return delivered, nil
+}
+
+// stageAndCommitQueueBatch stages and commits one already-copied batch, enforcing
+// the events/ path guard before and after staging. A batch of only already-present
+// duplicates stages nothing and is skipped.
+func (a *App) stageAndCommitQueueBatch(ctx context.Context, state State, batch queueBatch) error {
+	if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, batch.EventPaths, false); err != nil {
+		return err
+	}
+	args := append([]string{"add", "--"}, batch.EventPaths...)
+	if _, err := runCommand(ctx, a.Paths.Queue, "git", args...); err != nil {
+		return err
+	}
+	if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, batch.EventPaths, true); err != nil {
+		return err
+	}
+	staged, err := gitHasStagedChanges(ctx, a.Paths.Queue)
+	if err != nil || !staged {
+		return err
+	}
+	message := fmt.Sprintf("queue(%s): ingest %d event(s)", shortMachine(state.QueueBranch), len(batch.EventPaths))
+	_, err = runCommand(ctx, a.Paths.Queue, "git", "commit", "-m", message)
+	return err
+}
+
+func removeOutboxPaths(paths []string) error {
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func ensureQueueTargetDirectory(queue, relative string) error {
