@@ -46,4 +46,3 @@ jobs:
           GOOS=darwin GOARCH=arm64 go build -o "$RUNNER_TEMP/hgctl_darwin_arm64" ./cmd/hgctl
           GOOS=linux GOARCH=amd64 go build -o "$RUNNER_TEMP/hgctl_linux_amd64" ./cmd/hgctl
           GOOS=linux GOARCH=arm64 go build -o "$RUNNER_TEMP/hgctl_linux_arm64" ./cmd/hgctl
-          GOOS=linux GOARCH=amd64 go build -o "$RUNNER_TEMP/dreamctl_linux_amd64" ./cmd/dreamctl
