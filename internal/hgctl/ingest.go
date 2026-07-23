@@ -16,14 +16,18 @@ import (
 )
 
 const (
-	maxIngestBody     = 16 * 1024
-	maxIngestTurn     = 1500
 	minIngestUserText = 40
+	// ingestChunkBytes bounds one chunk-event body. A session's delta (its new,
+	// complete turns) is split into ordered chunks so no single event is unbounded;
+	// whole turns are never split, so a single turn larger than this is its own
+	// chunk emitted whole. The bound sits well under the protocol's MaxTextBytes so
+	// a normal multi-turn chunk is never clamped downstream.
+	ingestChunkBytes = 48 * 1024
 	// defaultIngestMinInterval throttles the hot re-ingest of a still-growing
-	// session: its full current content is re-snapshotted at most once per this
-	// interval. A session that stops growing simply produces no new snapshot, so
-	// its last snapshot is the final complete one - there is no idle/end handling.
-	// Override with HG_INGEST_MIN_INTERVAL (a Go duration).
+	// session: its new turns are emitted at most once per this interval. A session
+	// that stops growing simply produces no new delta, so its emitted turns are the
+	// complete conversation - there is no idle/end handling. Override with
+	// HG_INGEST_MIN_INTERVAL (a Go duration).
 	defaultIngestMinInterval = 5 * time.Minute
 	// syncIngestLimit bounds how many grown sessions one scheduler-driven sync
 	// re-ingests, so a sync stays within its context budget; the remainder is
@@ -31,7 +35,7 @@ const (
 	syncIngestLimit = 8
 )
 
-// ingestMinInterval is the smallest gap between two snapshots of the same growing
+// ingestMinInterval is the smallest gap between two ingests of the same growing
 // session, overridable with HG_INGEST_MIN_INTERVAL (a Go duration such as "3m").
 func ingestMinInterval() time.Duration {
 	if raw := os.Getenv("HG_INGEST_MIN_INTERVAL"); raw != "" {
@@ -43,12 +47,15 @@ func ingestMinInterval() time.Duration {
 }
 
 // ingestMark records what was last ingested for one session: the transcript byte
-// size and when that snapshot was taken. Intake re-snapshots a session only once
-// its transcript has grown past Size (and not more often than the min interval),
-// so a session's knowledge flows in while it is live and a historical session
-// that is not growing ingests exactly once.
+// size, the number of turns already emitted (the delta cursor), and when that
+// ingest ran. Intake re-parses a session only once its transcript has grown past
+// Size (and not more often than the min interval), then emits only turns[Turns:]
+// - the new, complete turns - and advances Turns to the parsed turn count. An old
+// mark written before the delta model has no turns field, so Turns defaults to 0
+// and the whole conversation is re-emitted once (a complete backfill).
 type ingestMark struct {
 	Size       int64     `json:"size"`
+	Turns      int       `json:"turns"`
 	IngestedAt time.Time `json:"ingested_at"`
 }
 
@@ -59,34 +66,45 @@ var ingestWrappers = []*regexp.Regexp{
 	regexp.MustCompile(`(?s)<environment_context>.*?</environment_context>`),
 }
 
-type ingestTurn struct{ role, text string }
+// ingestTurn is one surviving conversation turn. ts is the turn's own timestamp so
+// a chunk can be stamped with its last turn's time for backlog ordering.
+type ingestTurn struct{ role, text, ts string }
 
 type ingestSession struct {
 	id, cwd, title, firstTS, lastTS string
 	turns                           []ingestTurn
 }
 
-// ingestCandidate is one extracted session snapshot ready to enqueue. It is
-// tagged with the client so its dedup key never collides across sources, carries
-// the session's latest-activity time so the event filename orders the backlog by
-// when the work happened, and records the transcript byte size so the ledger can
-// tell when the session next grows.
+// ingestCandidate is one new-or-grown session ready to chunk and enqueue. It
+// carries the fully parsed session, the delta cursor (prevTurns = how many turns
+// were already emitted), the current transcript byte size for the ledger, and a
+// session-level ordering time so the backlog sorts oldest session first.
 type ingestCandidate struct {
-	client   string
-	id       string
-	captured time.Time
-	body     string
-	size     int64
+	client    string
+	session   ingestSession
+	prevTurns int
+	size      int64
+	captured  time.Time
 }
 
-// runIngest reads local agent session transcripts and publishes each new-or-grown
-// one as a bounded raw event, oldest first, stamped with its latest-activity time.
-// It is the operator/bulk entry point for per-session intake (live + historical):
-// intake only, never a Basic Memory write. Unlike the steady-state sync, it drains
-// the whole outbox to the machine queue branch in large batches and pushes once,
-// so an operator-invoked import lands on origin before the command returns. It does
-// not throttle (minInterval 0): an explicit run always snapshots the current state
-// of any grown session, while the size marker keeps unchanged sessions idempotent.
+// ingestChunk is one ordered slice of a session's delta: the half-open [start,end)
+// turn range (0-based, absolute within the session), the rendered body, and the
+// captured time derived from the chunk's last turn.
+type ingestChunk struct {
+	start, end int
+	body       string
+	lastTS     string
+	captured   time.Time
+}
+
+// runIngest reads local agent session transcripts and publishes each session's new
+// turns as complete, chunked delta events, oldest first, stamped with their turn
+// times. It is the operator/bulk entry point for per-session intake (live +
+// historical): intake only, never a Basic Memory write. Unlike the steady-state
+// sync, it drains the whole outbox to the machine queue branch in large batches and
+// pushes once, so an operator-invoked import lands on origin before the command
+// returns. It does not throttle (minInterval 0): an explicit run always emits any
+// pending delta, while the size+turn markers keep unchanged sessions idempotent.
 func (a *App) runIngest(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
@@ -107,7 +125,7 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	enqueued, ingestErr := a.ingestGrownSessions(id, marks, clients, *limit, 0, 0)
+	enqueued, _, ingestErr := a.ingestGrownSessions(id, marks, clients, *limit, 0, 0)
 	if err := a.saveIngestedSessions(marks); err != nil {
 		return errors.Join(ingestErr, err)
 	}
@@ -116,25 +134,26 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 	}
 	delivered, derr := a.bulkPublishQueue(ctx)
 	if errors.Is(derr, os.ErrNotExist) {
-		_, err = fmt.Fprintf(a.Out, "ingested %d session snapshot(s) into the outbox; run 'hgctl sync' to publish\n", enqueued)
+		_, err = fmt.Fprintf(a.Out, "ingested %d session event(s) into the outbox; run 'hgctl sync' to publish\n", enqueued)
 		return err
 	}
 	if derr != nil {
 		return derr
 	}
-	_, err = fmt.Fprintf(a.Out, "ingested %d session snapshot(s); published %d queued event(s) to queue/%s\n", enqueued, delivered, id.ID)
+	_, err = fmt.Fprintf(a.Out, "ingested %d session event(s); published %d queued event(s) to queue/%s\n", enqueued, delivered, id.ID)
 	return err
 }
 
 // ingestGrownSessions gathers new-or-grown sessions across the given clients,
-// enqueues up to limit of them into the outbox oldest first (0 = no cap), and
-// updates each session's marker in the ledger. parseCap bounds how many eligible
-// transcripts each client parses per run (0 = no cap); the scheduler path caps it
-// so one sync stays within its context budget. minInterval throttles re-snapshots
-// of a still-growing session (0 = no throttle). It only writes intake events; the
-// caller publishes the outbox. marks is mutated in place so the caller can persist
-// the ledger even on a partial error.
-func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clients []string, limit, parseCap int, minInterval time.Duration) (int, error) {
+// processes up to limit of them oldest first (0 = no cap), emitting each session's
+// delta (turns[Turns:]) as ordered chunk-events into the outbox and advancing that
+// session's marker once. parseCap bounds how many eligible transcripts each client
+// parses per run (0 = no cap); the scheduler path caps it so one sync stays within
+// its context budget. minInterval throttles re-ingest of a still-growing session (0
+// = no throttle). It only writes intake events; the caller publishes the outbox.
+// marks is mutated in place so the caller can persist the ledger even on a partial
+// error; the returned bool reports whether any marker changed.
+func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clients []string, limit, parseCap int, minInterval time.Duration) (int, bool, error) {
 	var (
 		candidates []ingestCandidate
 		errs       []error
@@ -153,19 +172,55 @@ func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clie
 	}
 	now := a.Now().UTC()
 	enqueued := 0
+	changed := false
 	for _, cand := range candidates {
-		// Dedup keys the event filename to the session so an interrupted re-run of
-		// the SAME snapshot (marker not yet saved) overwrites its outbox file and
-		// collapses against an already-published queue event, while a later, grown
-		// snapshot lands as a distinct event via its newer captured time.
-		if err := a.enqueue(rawEvent{CapturedAt: cand.captured, Client: cand.client, Machine: id.ID, Hostname: id.Hostname, Body: cand.body, Dedup: ingestKey(cand.client, cand.id)}); err != nil {
-			errs = append(errs, err)
+		key := ingestKey(cand.client, cand.session.id)
+		n := len(cand.session.turns)
+		start := cand.prevTurns
+		if start > n {
+			// The transcript shrank/was rewritten below the cursor; resync down to
+			// the current turn count rather than re-emitting from the top.
+			start = n
+		}
+		if start == n {
+			// Grew in bytes but produced no new complete turns (e.g. only tool
+			// I/O). Emit nothing, but advance Size so it is not reparsed forever.
+			marks[key] = ingestMark{Size: cand.size, Turns: start, IngestedAt: now}
+			changed = true
+			continue
+		}
+		header := sessionHeader(cand.session)
+		chunks := chunkDeltaTurns(header, start, cand.session.turns[start:n], ingestChunkBytes)
+		assignChunkCaptured(chunks, cand.captured)
+		failed := false
+		for _, ch := range chunks {
+			ev := rawEvent{
+				CapturedAt: ch.captured,
+				Client:     cand.client,
+				Machine:    id.ID,
+				Hostname:   id.Hostname,
+				Session:    cand.session.id,
+				Project:    cand.session.cwd,
+				Title:      cand.session.title,
+				TurnStart:  ch.start,
+				TurnEnd:    ch.end,
+				Body:       ch.body,
+				Dedup:      fmt.Sprintf("%s:%d-%d", key, ch.start, ch.end),
+			}
+			if err := a.enqueue(ev); err != nil {
+				errs = append(errs, err)
+				failed = true
+				break
+			}
+			enqueued++
+		}
+		if failed {
 			break
 		}
-		marks[ingestKey(cand.client, cand.id)] = ingestMark{Size: cand.size, IngestedAt: now}
-		enqueued++
+		marks[key] = ingestMark{Size: cand.size, Turns: n, IngestedAt: now}
+		changed = true
 	}
-	return enqueued, errors.Join(errs...)
+	return enqueued, changed, errors.Join(errs...)
 }
 
 // ingestForSync is the steady-state, scheduler-driven counterpart to runIngest:
@@ -180,8 +235,8 @@ func (a *App) ingestForSync(id Identity) error {
 	if err != nil {
 		return err
 	}
-	enqueued, ingestErr := a.ingestGrownSessions(id, marks, clients, syncIngestLimit, syncIngestLimit, ingestMinInterval())
-	if enqueued > 0 {
+	_, changed, ingestErr := a.ingestGrownSessions(id, marks, clients, syncIngestLimit, syncIngestLimit, ingestMinInterval())
+	if changed {
 		if err := a.saveIngestedSessions(marks); err != nil {
 			return errors.Join(ingestErr, err)
 		}
@@ -203,9 +258,9 @@ func ingestKey(client, id string) string {
 	return client + ":" + id
 }
 
-// sortIngestCandidates orders the backlog oldest first, with a stable, source
-// deterministic tie-break so a fixed set of sessions always ingests in the same
-// order regardless of filesystem enumeration.
+// sortIngestCandidates orders the backlog oldest session first, with a stable,
+// source-deterministic tie-break so a fixed set of sessions always ingests in the
+// same order regardless of filesystem enumeration.
 func sortIngestCandidates(candidates []ingestCandidate) {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if !candidates[i].captured.Equal(candidates[j].captured) {
@@ -214,7 +269,7 @@ func sortIngestCandidates(candidates []ingestCandidate) {
 		if candidates[i].client != candidates[j].client {
 			return candidates[i].client < candidates[j].client
 		}
-		return candidates[i].id < candidates[j].id
+		return candidates[i].session.id < candidates[j].session.id
 	})
 }
 
@@ -240,8 +295,8 @@ func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInte
 	now := a.Now().UTC()
 	// Cheapest filter first: stat each transcript and, using the filename-derived
 	// session id, skip any that has not grown past its ledger marker (or was
-	// snapshotted within the min interval) before opening and parsing the file, so
-	// a scheduler-driven sync only parses genuinely new or grown sessions.
+	// ingested within the min interval) before opening and parsing the file, so a
+	// scheduler-driven sync only parses genuinely new or grown sessions.
 	type grownFile struct {
 		path  string
 		size  int64
@@ -275,32 +330,30 @@ func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInte
 		// Re-check against the real session id (which the ledger is keyed on); this
 		// also catches the rare transcript whose filename id differs from its
 		// recorded id and slipped past the cheap pre-filter above.
-		if !shouldReingest(marks[ingestKey(client, session.id)], ef.size, now, minInterval) {
+		mark := marks[ingestKey(client, session.id)]
+		if !shouldReingest(mark, ef.size, now, minInterval) {
 			continue
 		}
-		body := session.render()
-		// Never enqueue a zero-content event; render() is empty when a session has
-		// no surviving turns after boilerplate stripping.
-		if body == "" {
-			continue
-		}
+		// Session-level ordering time: the latest turn's time when known, else the
+		// first, else the ingest clock. Each chunk is stamped from its own last turn
+		// (see assignChunkCaptured); this only orders the session in the backlog and
+		// serves as the fallback base.
 		captured := now
 		if parsed, ok := parseIngestTime(session.lastTS); ok {
 			captured = parsed
 		} else if parsed, ok := parseIngestTime(session.firstTS); ok {
 			captured = parsed
 		}
-		out = append(out, ingestCandidate{client: client, id: session.id, captured: captured, body: body, size: ef.size})
+		out = append(out, ingestCandidate{client: client, session: session, prevTurns: mark.Turns, size: ef.size, captured: captured})
 	}
 	return out, nil
 }
 
 // shouldReingest reports whether a transcript now at size should be (re)ingested
 // given its last marker. A session with no marker is new (ingest once); one whose
-// transcript has grown past the marker is re-snapshotted, unless it was already
-// snapshotted within minInterval (throttling a rapidly-growing live session). A
-// session that has not grown is skipped, so a historical transcript ingests once
-// and its last snapshot is its final complete one.
+// transcript has grown past the marker is re-parsed for its delta, unless it was
+// already ingested within minInterval (throttling a rapidly-growing live session).
+// A session that has not grown is skipped.
 func shouldReingest(mark ingestMark, size int64, now time.Time, minInterval time.Duration) bool {
 	if mark.IngestedAt.IsZero() {
 		return true
@@ -430,8 +483,9 @@ func extractClaudeSession(path string) (ingestSession, bool) {
 			continue
 		}
 		role, _ := record["type"].(string)
-		session.turns = append(session.turns, ingestTurn{role: role, text: boundTurn(text)})
-		if ts, _ := record["timestamp"].(string); ts != "" {
+		ts, _ := record["timestamp"].(string)
+		session.turns = append(session.turns, ingestTurn{role: role, text: text, ts: ts})
+		if ts != "" {
 			session.lastTS = ts
 		}
 	}
@@ -519,7 +573,7 @@ func extractCodexSession(path string) (ingestSession, bool) {
 		if text == "" {
 			continue
 		}
-		session.turns = append(session.turns, ingestTurn{role: role, text: boundTurn(text)})
+		session.turns = append(session.turns, ingestTurn{role: role, text: text, ts: record.Timestamp})
 		if record.Timestamp != "" {
 			session.lastTS = record.Timestamp
 		}
@@ -545,13 +599,10 @@ func codexIDFromPath(path string) string {
 	return base
 }
 
-func boundTurn(text string) string {
-	if len(text) > maxIngestTurn {
-		return text[:maxIngestTurn] + " ...[truncated]"
-	}
-	return text
-}
-
+// ingestSessionQualifies gates a session on FIRST ingest: a session must carry at
+// least minIngestUserText characters of real user text to ever enter intake, so a
+// trivial session never does. A session's user text only grows, so an
+// already-qualified session stays qualified and its later deltas always pass.
 func ingestSessionQualifies(session ingestSession) bool {
 	if len(session.turns) == 0 {
 		return false
@@ -565,7 +616,9 @@ func ingestSessionQualifies(session ingestSession) bool {
 	return userChars >= minIngestUserText
 }
 
-func (s ingestSession) render() string {
+// sessionHeader renders the optional "Session title / Project" preamble that leads
+// each chunk body. It is empty when the session has neither.
+func sessionHeader(s ingestSession) string {
 	var b strings.Builder
 	if s.title != "" {
 		fmt.Fprintf(&b, "Session title: %s\n", s.title)
@@ -576,19 +629,110 @@ func (s ingestSession) render() string {
 	if b.Len() > 0 {
 		b.WriteString("\n")
 	}
-	for _, turn := range s.turns {
-		label := "USER"
-		if turn.role == "assistant" {
-			label = "ASSISTANT"
-		}
-		entry := label + ": " + turn.text + "\n\n"
-		if b.Len()+len(entry) > maxIngestBody {
-			b.WriteString("...[session truncated for length]\n")
-			break
-		}
-		b.WriteString(entry)
+	return b.String()
+}
+
+// turnLabel is the body prefix for a turn.
+func turnLabel(role string) string {
+	if role == "assistant" {
+		return "ASSISTANT"
+	}
+	return "USER"
+}
+
+// turnEntryLen is the byte length a turn contributes to a chunk body:
+// "<LABEL>: <text>\n\n".
+func turnEntryLen(t ingestTurn) int {
+	return len(turnLabel(t.role)) + len(": ") + len(t.text) + len("\n\n")
+}
+
+// renderTurns renders a run of turns beneath header as the complete human body,
+// with trailing whitespace trimmed. No turn text is ever truncated.
+func renderTurns(header string, turns []ingestTurn) string {
+	var b strings.Builder
+	b.WriteString(header)
+	for _, t := range turns {
+		b.WriteString(turnLabel(t.role))
+		b.WriteString(": ")
+		b.WriteString(t.text)
+		b.WriteString("\n\n")
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// render returns the complete session body (header + every turn, no truncation).
+// It is the whole-session view; intake emits per-chunk bodies via chunkDeltaTurns.
+func (s ingestSession) render() string {
+	return renderTurns(sessionHeader(s), s.turns)
+}
+
+// chunkDeltaTurns splits delta (the session's new turns, whose first element is at
+// absolute index base) into ordered chunks whose rendered body stays within bound
+// bytes. Whole turns are accumulated into a chunk; when the next turn would push
+// the body past bound, the chunk is flushed and a new one begins. A single turn
+// larger than bound is its own chunk, emitted whole (never truncated).
+func chunkDeltaTurns(header string, base int, delta []ingestTurn, bound int) []ingestChunk {
+	var chunks []ingestChunk
+	headerLen := len(header)
+	start := 0
+	size := headerLen
+	flush := func(lo, hi int) {
+		turns := delta[lo:hi]
+		chunks = append(chunks, ingestChunk{
+			start:  base + lo,
+			end:    base + hi,
+			body:   renderTurns(header, turns),
+			lastTS: lastTurnTS(turns),
+		})
+	}
+	for i, t := range delta {
+		entry := turnEntryLen(t)
+		if i > start && size+entry > bound {
+			flush(start, i)
+			start = i
+			size = headerLen
+		}
+		size += entry
+	}
+	if start < len(delta) {
+		flush(start, len(delta))
+	}
+	return chunks
+}
+
+// lastTurnTS returns the last non-empty turn timestamp in a chunk, or "" when none
+// of its turns carry a parseable time.
+func lastTurnTS(turns []ingestTurn) string {
+	for i := len(turns) - 1; i >= 0; i-- {
+		if turns[i].ts != "" {
+			return turns[i].ts
+		}
+	}
+	return ""
+}
+
+// assignChunkCaptured stamps each chunk with a captured time so the chunk events of
+// one delta sort in chunk order by their filename. A chunk takes its last turn's
+// time; when that is missing it falls back to the session base. Because the event
+// filename encodes time only to the second, later chunks are nudged to a strictly
+// greater second whenever they would otherwise collide with or precede an earlier
+// chunk, so the string sort of the filenames preserves chunk order.
+func assignChunkCaptured(chunks []ingestChunk, sessionBase time.Time) {
+	var prev time.Time
+	for i := range chunks {
+		c := sessionBase
+		if ts, ok := parseIngestTime(chunks[i].lastTS); ok {
+			c = ts
+		}
+		if i > 0 {
+			floor := prev.Truncate(time.Second).Add(time.Second)
+			if c.Before(floor) {
+				c = floor
+			}
+		}
+		chunks[i].captured = c
+		prev = c
+	}
 }
 
 func (a *App) ingestedSessionsPath() string {
@@ -597,8 +741,9 @@ func (a *App) ingestedSessionsPath() string {
 
 // loadIngestedSessions reads the per-session marker ledger. It transparently
 // migrates the legacy format (a JSON array of ingested keys) to the marker map by
-// giving each key a zero-size marker, so a previously ingested session is
-// re-snapshotted once at its current size after upgrade.
+// giving each key a zero marker. An old marker written before the delta model has
+// no turns field, so Turns unmarshals to 0 and the session's whole conversation is
+// re-emitted once as a complete backfill on the next ingest.
 func (a *App) loadIngestedSessions() (map[string]ingestMark, error) {
 	content, err := os.ReadFile(a.ingestedSessionsPath())
 	if errors.Is(err, os.ErrNotExist) {

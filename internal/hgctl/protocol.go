@@ -17,17 +17,32 @@ const (
 	MaxSyncBytes       = 512 * 1024
 	MaxClient          = 64
 	MaxMachineHostname = 255
+	// MaxMetaField bounds the session/project/title frontmatter values so a long
+	// cwd or title cannot bloat the closed frontmatter; the body keeps the full
+	// header regardless.
+	MaxMetaField = 1024
 )
 
 // rawEvent is one captured intake item. The thin protocol has no schema, kinds,
 // canonical identity, or validation: an event is a Markdown file with closed
 // frontmatter (captured_at, client, machine[, hostname]) and a free-form body.
+// Session-intake chunks additionally carry the session identity (session, project,
+// title) and the half-open turn range this chunk covers within the session (turns);
+// steady-state captures leave those zero and emit only the base frontmatter.
 type rawEvent struct {
 	CapturedAt time.Time
 	Client     string
 	Machine    string
 	Hostname   string
 	Body       string
+	// Session, Project, Title and TurnStart/TurnEnd describe a session-delta chunk
+	// (see ingest.go). Session/Project/Title are omitted from the frontmatter when
+	// empty; the turns line is emitted only for a real chunk (TurnEnd > TurnStart).
+	Session   string
+	Project   string
+	Title     string
+	TurnStart int
+	TurnEnd   int
 	// Dedup, when non-empty, makes filename() deterministic so re-enqueuing the
 	// same logical event (e.g. an interrupted historical ingest re-run) overwrites
 	// its outbox file and collapses against an already-published queue event via
@@ -58,10 +73,30 @@ func (e rawEvent) marshal() []byte {
 	if e.Hostname != "" {
 		fmt.Fprintf(&b, "hostname: %s\n", boundString(e.Hostname, MaxMachineHostname))
 	}
+	if e.Session != "" {
+		fmt.Fprintf(&b, "session: %s\n", frontmatterValue(e.Session, MaxMetaField))
+	}
+	if e.Project != "" {
+		fmt.Fprintf(&b, "project: %s\n", frontmatterValue(e.Project, MaxMetaField))
+	}
+	if e.Title != "" {
+		fmt.Fprintf(&b, "title: %s\n", frontmatterValue(e.Title, MaxMetaField))
+	}
+	if e.TurnEnd > e.TurnStart {
+		fmt.Fprintf(&b, "turns: %d-%d\n", e.TurnStart, e.TurnEnd)
+	}
 	b.WriteString("---\n\n")
 	b.WriteString(boundText(e.Body))
 	b.WriteString("\n")
 	return []byte(b.String())
+}
+
+// frontmatterValue keeps a value on a single line so it cannot break the closed
+// frontmatter, then bounds its length.
+func frontmatterValue(value string, limit int) string {
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\n", " ")
+	return boundString(strings.TrimSpace(value), limit)
 }
 
 func randHex(n int) string {
