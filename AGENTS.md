@@ -50,7 +50,8 @@ self-updates.
   `queue/<machine-id>`'s `events/` and fast-forwards its local `shared` and
   `queue` worktrees; it never commits to `main` or `shared`, and never archives.
   The reflect Action owns archiving a queue branch's CONSUMED events (moving
-  `events/` into `archive/<YYYY-MM>/`, fast-forward-only); the endpoint only
+  `events/` into `archive/<YYYY-MM>/` - or `archive/poison/<YYYY-MM>/` for a
+  skipped, never-distilled slice - fast-forward-only); the endpoint only
   fast-forwards through those archive commits. If a local committed-but-unpushed
   append races an archive and the branches diverge, `sync` self-heals by
   resetting onto the remote and replaying the event from the outbox (retained
