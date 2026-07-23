@@ -175,3 +175,154 @@ func TestSyncSharedUnlockedRecoversFromDivergedOrigin(t *testing.T) {
 		t.Fatalf("vault kept stale product after reset: %v", err)
 	}
 }
+
+// initQueueTestRepo makes a standalone queue worktree at app.Paths.Queue on
+// branch, wired to a bare origin, seeded with one committed+pushed event. It
+// returns the origin path.
+func initQueueTestRepo(t *testing.T, app *App, branch, seedEvent string) string {
+	t.Helper()
+	origin := filepath.Join(t.TempDir(), "queue-origin.git")
+	runGitTest(t, "", "init", "--bare", origin)
+	queue := app.Paths.Queue
+	runGitTest(t, "", "init", "-b", branch, queue)
+	runGitTest(t, queue, "config", "user.name", "chinaboard")
+	runGitTest(t, queue, "config", "user.email", "chinaboard@gmail.com")
+	runGitTest(t, queue, "remote", "add", "origin", origin)
+	if err := os.MkdirAll(filepath.Join(queue, "events"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(queue, "events", seedEvent), []byte("seed "+seedEvent+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, queue, "add", ".")
+	runGitTest(t, queue, "commit", "-m", "seed")
+	runGitTest(t, queue, "push", "origin", "HEAD:refs/heads/"+branch)
+	runGitTest(t, queue, "fetch", "origin", "+refs/heads/"+branch+":refs/remotes/origin/"+branch)
+	return origin
+}
+
+// pushArchiveCommit clones origin at branch into a scratch worktree and pushes an
+// Action-style archive commit: it moves consumedEvent out of events/ into
+// archive/<month>/, fast-forward over the current tip, mirroring archive.sh.
+func pushArchiveCommit(t *testing.T, origin, branch, consumedEvent, month string) {
+	t.Helper()
+	work := t.TempDir()
+	runGitTest(t, "", "init", "-b", branch, work)
+	runGitTest(t, work, "config", "user.name", "chinaboard")
+	runGitTest(t, work, "config", "user.email", "chinaboard@gmail.com")
+	runGitTest(t, work, "remote", "add", "origin", origin)
+	runGitTest(t, work, "fetch", "origin", branch)
+	runGitTest(t, work, "reset", "--hard", "FETCH_HEAD")
+	if err := os.MkdirAll(filepath.Join(work, "archive", month), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(work, "events", consumedEvent), filepath.Join(work, "archive", month, consumedEvent)); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, work, "add", "-A")
+	runGitTest(t, work, "commit", "-m", "reflect: archive 1 consumed event(s)")
+	runGitTest(t, work, "push", "origin", "HEAD:refs/heads/"+branch)
+}
+
+// The common offline path: the endpoint has no local commits and origin advanced
+// only via an Action archive (consumed events moved to archive/<YYYY-MM>/). The
+// queue must fast-forward cleanly through the archive commit, and the archive/
+// files - clean committed additions outside events/ - must not trip the queue
+// guards.
+func TestSyncQueueFastForwardsThroughArchiveCommit(t *testing.T) {
+	app := testApp(t)
+	branch := "queue/testmachine"
+	consumed := "20260301T120000Z-aaaaaaaa.md"
+	origin := initQueueTestRepo(t, app, branch, consumed)
+	if err := os.MkdirAll(app.Paths.Outbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	pushArchiveCommit(t, origin, branch, consumed, "2026-03")
+	runGitTest(t, app.Paths.Queue, "fetch", "origin", "+refs/heads/"+branch+":refs/remotes/origin/"+branch)
+
+	state := State{QueueBranch: branch, RepoURL: origin}
+	if err := app.syncQueueUnlocked(testContext(t), state); err != nil {
+		t.Fatalf("clean archive fast-forward failed: %v", err)
+	}
+
+	head := strings.TrimSpace(runGitTest(t, app.Paths.Queue, "rev-parse", "HEAD"))
+	remote := strings.TrimSpace(runGitTest(t, app.Paths.Queue, "rev-parse", "origin/"+branch))
+	if head != remote {
+		t.Fatalf("queue did not fast-forward onto origin: head=%s remote=%s", head, remote)
+	}
+	tree := strings.Fields(runGitTest(t, app.Paths.Queue, "ls-tree", "-r", "--name-only", "HEAD"))
+	if !contains(tree, "archive/2026-03/"+consumed) || contains(tree, "events/"+consumed) {
+		t.Fatalf("archive commit not adopted: tree=%v", tree)
+	}
+}
+
+// The divergence path: a local committed-but-unpushed append races an Action
+// archive that advanced origin. merge --ff-only cannot reconcile the two, so the
+// self-heal hard-resets onto origin (adopting the archive commit) and replays the
+// un-pushed event from the retained outbox. No captured event is lost and the
+// branch ends fast-forwardable (local == origin).
+func TestSyncQueueSelfHealsDivergedRemoteViaOutboxReplay(t *testing.T) {
+	app := testApp(t)
+	branch := "queue/testmachine"
+	consumed := "20260301T120000Z-aaaaaaaa.md"
+	origin := initQueueTestRepo(t, app, branch, consumed)
+
+	// A captured-but-unpushed local append: committed to the local queue AND still
+	// present in the outbox (a real sync clears the outbox only after a push).
+	appendEvent := "20260722T010203Z-deadbeef.md"
+	appendBody := []byte("second event\n")
+	if err := os.MkdirAll(app.Paths.Outbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app.Paths.Outbox, appendEvent), appendBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app.Paths.Queue, "events", appendEvent), appendBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, app.Paths.Queue, "add", ".")
+	runGitTest(t, app.Paths.Queue, "commit", "-m", "local unpushed append")
+
+	// Origin advances via an Action archive; the endpoint fetches, and now local
+	// (seed<-append) and origin (seed<-archive) share no fast-forward.
+	pushArchiveCommit(t, origin, branch, consumed, "2026-03")
+	runGitTest(t, app.Paths.Queue, "fetch", "origin", "+refs/heads/"+branch+":refs/remotes/origin/"+branch)
+
+	state := State{QueueBranch: branch, RepoURL: origin}
+	if err := app.syncQueueUnlocked(testContext(t), state); err != nil {
+		t.Fatalf("diverged queue did not self-heal: %v", err)
+	}
+
+	// Converged onto origin (fast-forwardable), the archive commit adopted, and the
+	// un-pushed event replayed from the outbox with no data loss.
+	head := strings.TrimSpace(runGitTest(t, app.Paths.Queue, "rev-parse", "HEAD"))
+	remote := strings.TrimSpace(runGitTest(t, app.Paths.Queue, "rev-parse", "origin/"+branch))
+	if head != remote {
+		t.Fatalf("queue did not converge onto origin: head=%s remote=%s", head, remote)
+	}
+	tree := strings.Fields(runGitTest(t, app.Paths.Queue, "ls-tree", "-r", "--name-only", "HEAD"))
+	if !contains(tree, "archive/2026-03/"+consumed) {
+		t.Fatalf("archive commit was lost by the self-heal: tree=%v", tree)
+	}
+	if !contains(tree, "events/"+appendEvent) {
+		t.Fatalf("un-pushed append was lost by the self-heal: tree=%v", tree)
+	}
+	if body := runGitTest(t, app.Paths.Queue, "show", "HEAD:events/"+appendEvent); body != string(appendBody) {
+		t.Fatalf("replayed append body = %q, want %q", body, appendBody)
+	}
+	if entries, err := os.ReadDir(app.Paths.Outbox); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("outbox not drained after successful push: %d left", len(entries))
+	}
+}
+
+func contains(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}

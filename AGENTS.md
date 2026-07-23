@@ -46,8 +46,15 @@ self-updates.
   are never enqueued. Install, background repair, and uninstall prune any stale
   hgctl hook left in a client config; the `hook` subcommand is a clean no-op kept
   only so a stale registration disrupts nothing.
-- Only `sync` writes Git. It appends to `queue/<machine-id>` and fast-forwards
-  the local `shared` worktree; it never commits to `main` or `shared`.
+- On the endpoint, only `sync` writes Git: it APPENDS raw events to
+  `queue/<machine-id>`'s `events/` and fast-forwards its local `shared` and
+  `queue` worktrees; it never commits to `main` or `shared`, and never archives.
+  The reflect Action owns archiving a queue branch's CONSUMED events (moving
+  `events/` into `archive/<YYYY-MM>/`, fast-forward-only); the endpoint only
+  fast-forwards through those archive commits. If a local committed-but-unpushed
+  append races an archive and the branches diverge, `sync` self-heals by
+  resetting onto the remote and replaying the event from the outbox (retained
+  until a successful push), so no event is lost.
 - A new machine's `queue/<machine-id>` is an ORPHAN root with no `main` or
   `shared` history: self-seeded locally when the remote carries no
   `queue-template`, or adopted from `queue-template` when one exists. All later

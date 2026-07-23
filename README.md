@@ -114,8 +114,12 @@ live sessions land per-session with no per-turn hooks.
 only the machine branch, requests reconciliation, pulls `shared`, and reindexes
 Basic Memory only after a fast-forward. A new machine's queue branch is
 self-seeded as an orphan root (or adopted from an existing `queue-template` when
-the remote carries one), never inheriting `main` or `shared`; all later commits
-are append-only events.
+the remote carries one), never inheriting `main` or `shared`; all later endpoint
+commits are append-only events. The reflect Action separately archives a queue
+branch's consumed events into `archive/<YYYY-MM>/` (fast-forward-only); `hgctl
+sync` fast-forwards through those archive commits, and self-heals a divergence (a
+local unpushed append that raced an archive) by resetting onto the remote and
+replaying the event from the retained outbox.
 
 ## Releases and updates
 

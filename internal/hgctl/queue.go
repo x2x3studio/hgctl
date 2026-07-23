@@ -26,7 +26,7 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 		return err
 	}
 	if gitRefExists(ctx, a.Paths.Queue, "refs/remotes/origin/"+state.QueueBranch) {
-		if _, err := runCommand(ctx, a.Paths.Queue, "git", "merge", "--ff-only", "origin/"+state.QueueBranch); err != nil {
+		if err := reconcileQueueWithRemote(ctx, a.Paths.Queue, state.QueueBranch); err != nil {
 			return err
 		}
 	}
@@ -82,6 +82,49 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 		}
 	}
 	return nil
+}
+
+// reconcileQueueWithRemote fast-forwards the local queue branch onto its remote
+// before new events are staged. The COMMON path (this machine was offline and
+// made no local commits) is a clean fast-forward over the reflect Action's
+// archive commits, which move consumed events/ into archive/<YYYY-MM>/. Those
+// arrive as clean committed files, so the events/-scoped queue guards do not see
+// them.
+//
+// The ONE divergence case is a local committed-but-unpushed append while origin
+// advanced via an Action archive: the two branches share no fast-forward. This
+// mirrors the shared self-heal (see syncSharedUnlocked): hard-reset onto the
+// remote to adopt the archive commits, then let the caller's copyOutboxToQueue
+// replay the un-pushed events from the OUTBOX, which is retained until a
+// successful push - so no captured event is lost. Unlike shared (which is
+// product-only and never legitimately ahead), a queue branch that is strictly
+// AHEAD of its remote is a normal not-yet-pushed append; that is left untouched
+// so the subsequent push publishes it rather than discarding it.
+func reconcileQueueWithRemote(ctx context.Context, queue, branch string) error {
+	remote := "origin/" + branch
+	behind, err := gitIsAncestor(ctx, queue, "HEAD", remote)
+	if err != nil {
+		return err
+	}
+	if behind {
+		// HEAD is an ancestor of the remote: a clean fast-forward (or already equal).
+		_, err := runCommand(ctx, queue, "git", "merge", "--ff-only", remote)
+		return err
+	}
+	ahead, err := gitIsAncestor(ctx, queue, remote, "HEAD")
+	if err != nil {
+		return err
+	}
+	if ahead {
+		// HEAD holds an un-pushed local append and the remote is contained in it;
+		// leave it so the later push publishes the append.
+		return nil
+	}
+	// Diverged: origin advanced via an Action archive while a local append was
+	// committed but not pushed. Adopt the remote; the outbox replay re-stages the
+	// un-pushed events on top.
+	_, err = runCommand(ctx, queue, "git", "reset", "--hard", remote)
+	return err
 }
 
 func notifyDream(ctx context.Context, remote string) error {
@@ -246,7 +289,7 @@ func (a *App) drainOutboxToQueue(ctx context.Context, state State) (int, error) 
 		return 0, err
 	}
 	if gitRefExists(ctx, a.Paths.Queue, "refs/remotes/origin/"+state.QueueBranch) {
-		if _, err := runCommand(ctx, a.Paths.Queue, "git", "merge", "--ff-only", "origin/"+state.QueueBranch); err != nil {
+		if err := reconcileQueueWithRemote(ctx, a.Paths.Queue, state.QueueBranch); err != nil {
 			return 0, err
 		}
 	}
