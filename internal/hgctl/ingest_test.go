@@ -363,9 +363,11 @@ func TestGatherSessionsIsClientNamespaced(t *testing.T) {
 	app := testApp(t)
 	// The Claude session is already ingested at a size no smaller than its current
 	// one, so it is not re-ingested; the codex sibling shares the id string but has
-	// its own namespaced marker (absent) and must ingest.
+	// its own namespaced marker (absent) and must ingest. The ledger unit is the
+	// file (relative path for Claude, rollout id for Codex), so mark the Claude file
+	// by its own key.
 	marks := map[string]ingestMark{
-		ingestKey("claude", "shared-id"): {Size: 1 << 20, IngestedAt: app.Now().Add(-time.Hour)},
+		ingestUnitKey("claude", claudePath): {Size: 1 << 20, IngestedAt: app.Now().Add(-time.Hour)},
 	}
 
 	claude, err := app.gatherSessions("claude", marks, 0, 0)
@@ -412,8 +414,9 @@ func TestGatherSessionsGrowthAndSkipsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	// "unchanged" is marked at exactly its current size, so it is not re-ingested.
+	// The ledger unit is the file, so mark it by its per-file key.
 	marks := map[string]ingestMark{
-		ingestKey("claude", "unchanged"): {Size: info.Size(), IngestedAt: app.Now().Add(-time.Hour)},
+		ingestUnitKey("claude", unchanged): {Size: info.Size(), IngestedAt: app.Now().Add(-time.Hour)},
 	}
 
 	got, err := app.gatherSessions("claude", marks, 0, 0)
@@ -435,6 +438,108 @@ func mustStatSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return info.Size()
+}
+
+// A sub-agent transcript is nested deeper than a top-level session and its records
+// carry the PARENT's sessionId. It must still be discovered and gathered as its OWN
+// ingest unit (a distinct per-file key), so all sub-agent work reaches the queue and
+// its cursor never collides with the parent session.
+func TestGatherSessionsIngestsNestedSubagentAsOwnUnit(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	app := testApp(t)
+
+	const parent = "parent-sess-id"
+	top := filepath.Join(home, ".claude", "projects", "proj", parent+".jsonl")
+	writeSessionFile(t, top,
+		`{"type":"user","sessionId":"`+parent+`","cwd":"/tmp/p","timestamp":"2026-07-07T02:00:00.000Z","message":{"role":"user","content":"A top-level question long enough to qualify for ingest here."}}`+"\n")
+	// A sub-agent transcript nested several levels deeper, whose records carry the
+	// PARENT sessionId (isSidechain).
+	sub := filepath.Join(home, ".claude", "projects", "proj", parent, "subagents", "workflows", "reflect.jsonl")
+	writeSessionFile(t, sub,
+		`{"type":"user","sessionId":"`+parent+`","isSidechain":true,"cwd":"/tmp/p","timestamp":"2026-07-07T03:00:00.000Z","message":{"role":"user","content":"A sub-agent question long enough to qualify for ingest here too."}}`+"\n")
+
+	got, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("gathered %d candidates, want 2 (top-level + nested sub-agent)", len(got))
+	}
+	keys := map[string]bool{}
+	for _, c := range got {
+		// Both files parse to the parent sessionId - that is the frontmatter session,
+		// which lets reflect group a session's work - but their ledger units differ.
+		if c.session.id != parent {
+			t.Fatalf("candidate session.id = %q, want the parent %q", c.session.id, parent)
+		}
+		keys[c.key] = true
+	}
+	if !keys[ingestUnitKey("claude", top)] || !keys[ingestUnitKey("claude", sub)] {
+		t.Fatalf("candidates did not get distinct per-file keys: %v", keys)
+	}
+}
+
+// Two sub-agent transcripts with the same basename under different parent sessions
+// must get distinct keys (a basename-only key would collide) and both ingest.
+func TestGatherSessionsSameBasenameDifferentParentsDistinctKeys(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	app := testApp(t)
+
+	a := filepath.Join(home, ".claude", "projects", "proj", "parent-A", "subagents", "foo.jsonl")
+	writeSessionFile(t, a,
+		`{"type":"user","sessionId":"parent-A","timestamp":"2026-07-07T02:00:00.000Z","message":{"role":"user","content":"Sub-agent A question long enough to qualify for ingest here."}}`+"\n")
+	b := filepath.Join(home, ".claude", "projects", "proj", "parent-B", "subagents", "foo.jsonl")
+	writeSessionFile(t, b,
+		`{"type":"user","sessionId":"parent-B","timestamp":"2026-07-07T02:30:00.000Z","message":{"role":"user","content":"Sub-agent B question long enough to qualify for ingest here."}}`+"\n")
+
+	got, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("gathered %d candidates, want both same-basename sub-agent files", len(got))
+	}
+	if got[0].key == got[1].key {
+		t.Fatalf("same-basename sub-agent files collided on key %q", got[0].key)
+	}
+}
+
+// End to end: a nested sub-agent transcript ingests as its own unit - it produces its
+// own event whose `session:` frontmatter is the CONTENT (parent) sessionId, and its
+// cursor is stored under the per-file key, never colliding with the parent session.
+func TestIngestNestedSubagentEndToEnd(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	app := testApp(t)
+
+	const parent = "parent-xyz"
+	sub := filepath.Join(home, ".claude", "projects", "proj", parent, "subagents", "workflows", "reflect.jsonl")
+	writeSessionFile(t, sub,
+		`{"type":"user","sessionId":"`+parent+`","isSidechain":true,"cwd":"/tmp/p","timestamp":"2026-07-07T03:00:00.000Z","message":{"role":"user","content":"A sub-agent workflow question long enough to qualify for ingest here."}}`+"\n")
+
+	id, err := app.loadIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.ingestForSync(id); err != nil {
+		t.Fatal(err)
+	}
+	evs := readOutboxEvents(t, app)
+	if len(evs) != 1 {
+		t.Fatalf("sub-agent transcript produced %d events, want 1", len(evs))
+	}
+	if evs[0].meta["session"] != parent {
+		t.Fatalf("event session = %q, want the content (parent) sessionId %q", evs[0].meta["session"], parent)
+	}
+	marks, _ := app.loadIngestedSessions()
+	if marks[ingestUnitKey("claude", sub)].Turns == 0 {
+		t.Fatal("sub-agent cursor was not stored under its per-file key")
+	}
+	if _, ok := marks[ingestKey("claude", parent)]; ok {
+		t.Fatal("sub-agent cursor collided with the parent sessionId key")
+	}
 }
 
 func TestShouldReingest(t *testing.T) {
@@ -877,6 +982,8 @@ func TestIngestEmitsOnlyDeltaOnGrowth(t *testing.T) {
 		"A first real question that is long enough to qualify for ingest here.",
 		"A first assistant reply.",
 	})
+	// The turn cursor lives under the per-file key, not the content sessionId.
+	fileKey := ingestUnitKey("claude", path)
 
 	id, err := app.loadIdentity()
 	if err != nil {
@@ -891,8 +998,12 @@ func TestIngestEmitsOnlyDeltaOnGrowth(t *testing.T) {
 	if evs := readOutboxEvents(t, app); evs[0].meta["turns"] != "0-2" {
 		t.Fatalf("first event turns = %q, want 0-2", evs[0].meta["turns"])
 	}
-	if marks, _ := app.loadIngestedSessions(); marks["claude:grow-sess"].Turns != 2 {
-		t.Fatalf("cursor after first ingest = %d, want 2", marks["claude:grow-sess"].Turns)
+	marks, _ := app.loadIngestedSessions()
+	if marks[fileKey].Turns != 2 {
+		t.Fatalf("cursor after first ingest = %d, want 2", marks[fileKey].Turns)
+	}
+	if _, ok := marks[ingestKey("claude", "grow-sess")]; ok {
+		t.Fatal("cursor stored under the content sessionId instead of the per-file key")
 	}
 
 	// Grow by two turns and advance past the min interval; only the new turns emit.
@@ -926,8 +1037,8 @@ func TestIngestEmitsOnlyDeltaOnGrowth(t *testing.T) {
 	if !strings.Contains(delta.body, "follow-up question") {
 		t.Fatal("delta event is missing the new turn")
 	}
-	if marks, _ := app.loadIngestedSessions(); marks["claude:grow-sess"].Turns != 4 {
-		t.Fatalf("cursor after growth = %d, want 4", marks["claude:grow-sess"].Turns)
+	if marks, _ := app.loadIngestedSessions(); marks[fileKey].Turns != 4 {
+		t.Fatalf("cursor after growth = %d, want 4", marks[fileKey].Turns)
 	}
 
 	// A run with no growth emits nothing more.

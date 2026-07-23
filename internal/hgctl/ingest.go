@@ -75,12 +75,17 @@ type ingestSession struct {
 	turns                           []ingestTurn
 }
 
-// ingestCandidate is one new-or-grown session ready to chunk and enqueue. It
-// carries the fully parsed session, the delta cursor (prevTurns = how many turns
-// were already emitted), the current transcript byte size for the ledger, and a
-// session-level ordering time so the backlog sorts oldest session first.
+// ingestCandidate is one new-or-grown transcript FILE ready to chunk and enqueue.
+// key is the file's ledger/dedup identity (see ingestUnitKey): every physical file
+// - top-level session OR nested sub-agent transcript - is its own ingest unit with
+// its own turn cursor, so a sub-agent (whose records carry the parent sessionId)
+// never collides with its parent. It carries the fully parsed session, the delta
+// cursor (prevTurns = how many turns were already emitted), the current transcript
+// byte size for the ledger, and a session-level ordering time so the backlog sorts
+// oldest session first.
 type ingestCandidate struct {
 	client    string
+	key       string
 	session   ingestSession
 	prevTurns int
 	size      int64
@@ -174,7 +179,7 @@ func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clie
 	enqueued := 0
 	changed := false
 	for _, cand := range candidates {
-		key := ingestKey(cand.client, cand.session.id)
+		key := cand.key
 		n := len(cand.session.turns)
 		start := cand.prevTurns
 		if start > n {
@@ -293,12 +298,14 @@ func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInte
 		return nil, err
 	}
 	now := a.Now().UTC()
-	// Cheapest filter first: stat each transcript and, using the filename-derived
-	// session id, skip any that has not grown past its ledger marker (or was
-	// ingested within the min interval) before opening and parsing the file, so a
-	// scheduler-driven sync only parses genuinely new or grown sessions.
+	// Cheapest filter first: stat each transcript and, using its per-file ledger key
+	// (see ingestUnitKey - the path for Claude, the rollout id for Codex), skip any
+	// that has not grown past its ledger marker (or was ingested within the min
+	// interval) before opening and parsing the file, so a scheduler-driven sync only
+	// parses genuinely new or grown files.
 	type grownFile struct {
 		path  string
+		key   string
 		size  int64
 		mtime time.Time
 	}
@@ -308,10 +315,11 @@ func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInte
 		if statErr != nil {
 			continue
 		}
-		if !shouldReingest(marks[ingestKey(client, pathSessionID(client, f))], info.Size(), now, minInterval) {
+		key := ingestUnitKey(client, f)
+		if !shouldReingest(marks[key], info.Size(), now, minInterval) {
 			continue
 		}
-		eligible = append(eligible, grownFile{path: f, size: info.Size(), mtime: info.ModTime()})
+		eligible = append(eligible, grownFile{path: f, key: key, size: info.Size(), mtime: info.ModTime()})
 	}
 	// A bounded run (parseCap > 0, used by the scheduler-driven sync) parses only
 	// the oldest few by file mtime so one sync stays within its context budget; the
@@ -327,10 +335,13 @@ func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInte
 		if !ok {
 			continue
 		}
-		// Re-check against the real session id (which the ledger is keyed on); this
-		// also catches the rare transcript whose filename id differs from its
-		// recorded id and slipped past the cheap pre-filter above.
-		mark := marks[ingestKey(client, session.id)]
+		// The ledger unit is the file (ef.key), unchanged since the pre-filter above;
+		// re-read its marker for the delta cursor and re-check that it still warrants
+		// ingest (a size race between the stat and the parse is all that could flip
+		// this). A Claude sub-agent transcript parses to session.id = the PARENT
+		// sessionId, but its cursor lives under ef.key (its own path), so it never
+		// collides with the parent session or a sibling sub-agent.
+		mark := marks[ef.key]
 		if !shouldReingest(mark, ef.size, now, minInterval) {
 			continue
 		}
@@ -344,7 +355,7 @@ func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInte
 		} else if parsed, ok := parseIngestTime(session.firstTS); ok {
 			captured = parsed
 		}
-		out = append(out, ingestCandidate{client: client, session: session, prevTurns: mark.Turns, size: ef.size, captured: captured})
+		out = append(out, ingestCandidate{client: client, key: ef.key, session: session, prevTurns: mark.Turns, size: ef.size, captured: captured})
 	}
 	return out, nil
 }
@@ -364,16 +375,39 @@ func shouldReingest(mark ingestMark, size int64, now time.Time, minInterval time
 	return now.Sub(mark.IngestedAt) >= minInterval
 }
 
-// pathSessionID recovers a session id from the transcript filename alone, so the
-// dedup ledger can skip an already-ingested session without parsing it. It equals
-// the parsed session id for well-formed transcripts (Claude names files by
-// sessionId; Codex names them rollout-<ts>-<uuid>); the post-parse dedup check
-// still uses the real id, so a rare filename/id mismatch only costs one reparse.
-func pathSessionID(client, path string) string {
+// ingestUnitKey is the client-namespaced ledger/dedup identity of one transcript
+// FILE. Intake keys each file's turn cursor and dedup on the physical file, not on
+// the content sessionId, so a Claude sub-agent transcript - which carries its
+// PARENT's sessionId - is its own ingest unit and never collides with the parent
+// session or with a same-named sub-agent under a different parent.
+//   - Claude: the transcript path relative to ~/.claude/projects/, which is unique
+//     per file (it distinguishes .../<parentA>/subagents/foo.jsonl from
+//     .../<parentB>/subagents/foo.jsonl where the bare basename would collide).
+//   - Codex: the rollout id. Codex writes exactly one transcript per session, so the
+//     id is already one-to-one with the file; keeping it avoids churning the Codex
+//     ledger and matches the id derived from a well-formed rollout filename.
+//
+// It is derived from the path alone so the cheap pre-filter can key the ledger
+// without parsing the file; the post-parse cursor lookup uses the same key.
+func ingestUnitKey(client, path string) string {
 	if client == "codex" {
-		return codexIDFromPath(path)
+		return ingestKey(client, codexIDFromPath(path))
 	}
-	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	return ingestKey(client, claudeFileKey(path))
+}
+
+// claudeFileKey is a stable, unique-per-file id: the transcript path relative to
+// ~/.claude/projects/ (slash-separated for OS independence). It falls back to the
+// base filename when the path lies outside that root, so the key stays deterministic
+// in every case (e.g. a test transcript under a custom layout).
+func claudeFileKey(path string) string {
+	if home, err := os.UserHomeDir(); err == nil {
+		root := filepath.Join(home, ".claude", "projects")
+		if rel, err := filepath.Rel(root, path); err == nil && rel != "" && !strings.HasPrefix(rel, "..") {
+			return filepath.ToSlash(rel)
+		}
+	}
+	return filepath.Base(path)
 }
 
 func parseIngestTime(value string) (time.Time, bool) {
@@ -389,12 +423,41 @@ func parseIngestTime(value string) (time.Time, bool) {
 }
 
 func claudeSessionFiles() ([]string, error) {
-	// Claude Code stores each top-level session at projects/<dash-encoded-cwd>/
-	// <sessionId>.jsonl (one directory level). Deeper paths under a session dir
-	// (e.g. .../<sessionId>/subagents/...) are SUB-AGENT transcripts that carry
-	// the PARENT's sessionId, so walking into them would only collide with the
-	// parent session's ingest cursor. Match top-level sessions only.
-	return globSessionFiles(filepath.Join(".claude", "projects", "*", "*.jsonl"))
+	// Claude Code stores a top-level session at projects/<dash-encoded-cwd>/
+	// <sessionId>.jsonl, but SUB-AGENT / workflow transcripts are nested deeper,
+	// e.g. projects/<dash-encoded-cwd>/<parentSessionId>/subagents/workflows/
+	// <name>.jsonl, and their records carry the PARENT's sessionId. On a heavy user
+	// the sub-agent files vastly outnumber top-level ones, so a single-level glob
+	// would miss most of the real work. Walk the whole tree for *.jsonl at any depth;
+	// each physical file is keyed by its own path (see ingestUnitKey), so a nested
+	// sub-agent never shares the parent session's ingest cursor.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	root := filepath.Join(home, ".claude", "projects")
+	var files []string
+	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		// Never abort the walk: an unreadable dir/file (or a missing root before the
+		// first session is written) just yields fewer files, mirroring the old glob.
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+			return nil
+		}
+		if strings.Contains(path, "hgsmoke") || strings.Contains(path, "-private-tmp-") {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	// Deterministic order so a fixed set of transcripts always enumerates the same.
+	sort.Strings(files)
+	return files, nil
 }
 
 func codexSessionFiles() ([]string, error) {
