@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -389,7 +390,34 @@ func parseIngestTime(value string) (time.Time, bool) {
 }
 
 func claudeSessionFiles() ([]string, error) {
-	return globSessionFiles(filepath.Join(".claude", "projects", "*", "*.jsonl"))
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	// Claude Code nests transcripts at a VARIABLE depth under projects/ (the
+	// project cwd becomes real nested subdirectories), so a single-level glob
+	// (projects/*/*.jsonl) sees only the shallowest sessions and misses the vast
+	// majority. Walk the whole tree for *.jsonl instead.
+	root := filepath.Join(home, ".claude", "projects")
+	var files []string
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries; never abort the whole walk
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+			return nil
+		}
+		if strings.Contains(path, "hgsmoke") || strings.Contains(path, "-private-tmp-") {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 func codexSessionFiles() ([]string, error) {
