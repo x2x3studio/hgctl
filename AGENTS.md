@@ -37,12 +37,14 @@ self-updates.
   user systemd timer with the same logical name). The scheduler runs
   `sync --update` about once a minute; neither needs a daemon.
 - Per-session transcript ingest is the single intake path (live + historical);
-  there are no per-turn capture hooks. Intake is hot and cumulative: a per-session
-  ledger marker (last-ingested byte size + time) drives a re-snapshot of the full
-  session-so-far whenever the transcript grows past the marker, throttled to at
-  most once per `HG_INGEST_MIN_INTERVAL` (default 5 minutes). A session that stops
-  growing needs no idle/end handling - its last snapshot is the final one - and a
-  non-growing historical session ingests exactly once; empty-rendering sessions
+  there are no per-turn capture hooks. Intake is INCREMENTAL: a per-session ledger
+  marker (emitted-turn cursor + transcript size + time) drives emission of only
+  the NEW turns since the last ingest, throttled to at most once per
+  `HG_INGEST_MIN_INTERVAL` (default 5 minutes). Turns are emitted COMPLETE (never
+  truncated); a delta is split into chunk events each bounded at a turn boundary,
+  so a session's first ingest streams the whole conversation as ordered chunks and
+  later growth emits only its new turns. A session that stops growing produces no
+  new event; a non-growing historical session ingests exactly once; empty sessions
   are never enqueued. Install, background repair, and uninstall prune any stale
   hgctl hook left in a client config; the `hook` subcommand is a clean no-op kept
   only so a stale registration disrupts nothing.
@@ -75,10 +77,11 @@ validation: intake is deliberately dumb and liberal (loose in, strict out) -
 all strictness lives in the one central reflect step, not at intake.
 `hgctl ingest [--client all|claude|codex]` is the operator/bulk entry point;
 every scheduled `hgctl sync` folds in a small, bounded re-ingest of new-or-grown
-sessions before draining the outbox. Each event carries the full session-so-far,
-stamped with the session's latest-activity time; the reflect step is idempotent,
-so re-processing a grown session accumulates into its note rather than
-duplicating it.
+sessions before draining the outbox. Each event carries a chunk of a session's
+NEW turns (complete, never truncated), stamped with those turns' latest-activity
+time and tagged with the session origin; the reflect step refines the session's
+note from each delta, so its distillation accumulates as the session grows rather
+than duplicating.
 
 ## Recall boundary
 
