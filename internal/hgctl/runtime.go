@@ -418,8 +418,6 @@ func commandPolicyFor(name string) commandPolicy {
 		return commandPolicy{class: "git", outputLimit: gitCommandOutputLimit}
 	case "basic-memory":
 		return commandPolicy{class: "Basic Memory", outputLimit: basicMemoryCommandOutputLimit}
-	case "gh":
-		return commandPolicy{class: "GitHub CLI", outputLimit: 2 << 20}
 	case "launchctl", "systemctl", "loginctl":
 		return commandPolicy{class: "scheduler", outputLimit: 256 << 10}
 	default:

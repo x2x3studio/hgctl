@@ -143,9 +143,9 @@ forces a check now.
 
 This repository is public, so the self-update fetches the latest release and
 its assets over unauthenticated HTTPS with the Go standard library - no `gh`
-needed. `gh` is still used for the optional `repository_dispatch` that notifies
-the private hourglass data repo, and git transport uses SSH; only the `hgctl`
-self-update is gh-free.
+needed. The endpoint never triggers reflect: it only appends events to the
+queue and fast-forwards `shared`; the reflect Action drains on its own
+schedule. Git transport uses SSH.
 
 ## Development
 

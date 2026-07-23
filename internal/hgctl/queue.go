@@ -76,11 +76,6 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 			return err
 		}
 	}
-	if needsPush && len(batch.OutboxPaths) > 0 {
-		if err := notifyDream(ctx, state.RepoURL); err != nil {
-			_, _ = fmt.Fprintln(a.Err, "hgctl: Dream notification deferred:", err)
-		}
-	}
 	return nil
 }
 
@@ -125,37 +120,6 @@ func reconcileQueueWithRemote(ctx context.Context, queue, branch string) error {
 	// un-pushed events on top.
 	_, err = runCommand(ctx, queue, "git", "reset", "--hard", remote)
 	return err
-}
-
-func notifyDream(ctx context.Context, remote string) error {
-	repo, ok := githubRepoSlug(remote)
-	if !ok || !commandExists("gh") {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_, err := runCommand(ctx, "", "gh", "api", "--hostname", "github.com", "--method", "POST", "repos/"+repo+"/dispatches", "-f", "event_type=hourglass_queue")
-	return err
-}
-
-func githubRepoSlug(remote string) (string, bool) {
-	remote = strings.TrimSpace(strings.TrimSuffix(remote, ".git"))
-	var path string
-	switch {
-	case strings.HasPrefix(remote, "git@github.com:"):
-		path = strings.TrimPrefix(remote, "git@github.com:")
-	case strings.HasPrefix(remote, "ssh://git@github.com/"):
-		path = strings.TrimPrefix(remote, "ssh://git@github.com/")
-	case strings.HasPrefix(remote, "https://github.com/"):
-		path = strings.TrimPrefix(remote, "https://github.com/")
-	default:
-		return "", false
-	}
-	parts := strings.Split(path, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || parts[0] == "." || parts[1] == "." || parts[0] == ".." || parts[1] == ".." {
-		return "", false
-	}
-	return parts[0] + "/" + parts[1], true
 }
 
 func shortMachine(branch string) string {
@@ -334,9 +298,6 @@ func (a *App) drainOutboxToQueue(ctx context.Context, state State) (int, error) 
 	if needsPush {
 		if _, err := runCommand(ctx, a.Paths.Queue, "git", "push", "origin", "HEAD:refs/heads/"+state.QueueBranch); err != nil {
 			return delivered, err
-		}
-		if err := notifyDream(ctx, state.RepoURL); err != nil {
-			_, _ = fmt.Fprintln(a.Err, "hgctl: Dream notification deferred:", err)
 		}
 	}
 	return delivered, nil

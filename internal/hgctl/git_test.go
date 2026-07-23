@@ -148,45 +148,6 @@ func holdFileLockForTest(t *testing.T, path string) *os.File {
 	return file
 }
 
-func TestGitHubRepoSlug(t *testing.T) {
-	for _, remote := range []string{
-		"git@github.com:x2x3studio/hourglass.git",
-		"ssh://git@github.com/x2x3studio/hourglass.git",
-		"https://github.com/x2x3studio/hourglass.git",
-	} {
-		if got, ok := githubRepoSlug(remote); !ok || got != "x2x3studio/hourglass" {
-			t.Fatalf("githubRepoSlug(%q)=(%q,%v)", remote, got, ok)
-		}
-	}
-	for _, remote := range []string{"git@example.com:x/y.git", "https://github.com/x", "https://github.com/x/y/z"} {
-		if got, ok := githubRepoSlug(remote); ok {
-			t.Fatalf("githubRepoSlug(%q) unexpectedly returned %q", remote, got)
-		}
-	}
-}
-
-func TestNotifyDreamPinsGitHubDotCom(t *testing.T) {
-	bin := t.TempDir()
-	logPath := filepath.Join(t.TempDir(), "gh.log")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$HGCTL_GH_LOG\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("HGCTL_GH_LOG", logPath)
-	if err := notifyDream(context.Background(), "git@github.com:x2x3studio/hourglass.git"); err != nil {
-		t.Fatal(err)
-	}
-	content, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "api --hostname github.com --method POST repos/x2x3studio/hourglass/dispatches -f event_type=hourglass_queue\n"
-	if string(content) != want {
-		t.Fatalf("gh call = %q, want %q", content, want)
-	}
-}
-
 func runGitTest(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
