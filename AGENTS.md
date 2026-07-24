@@ -33,9 +33,13 @@ self-updates.
 - Support macOS with Homebrew and Ubuntu Linux.
 - Persist one random app-scoped machine UUID. Hostname is mutable metadata.
 - `~/.local/bin/hgctl` is the only scheduler command path.
-- Exactly one macOS LaunchAgent label `com.x2x3studio.hgctl.sync` (Ubuntu uses a
-  user systemd timer with the same logical name). The scheduler runs
-  `sync --update` about once a minute; neither needs a daemon.
+- Exactly one logical scheduler `com.x2x3studio.hgctl.sync`, set up by `install`
+  per OS: a macOS LaunchAgent, or on Linux a systemd USER timer + oneshot service
+  (`~/.config/systemd/user/`, enabled with `systemctl --user enable --now`, plus
+  `loginctl enable-linger` so it runs headless without an active login - if that
+  needs privilege, install instructs to run `sudo loginctl enable-linger <uid>`
+  once). Either runs `sync --update` about once a minute (systemd timer is
+  `Persistent=true`, so a missed fire catches up); neither needs a resident daemon.
 - Per-session transcript ingest is the single intake path (live + historical);
   there are no per-turn capture hooks. Intake is INCREMENTAL: a per-session ledger
   marker (emitted-turn cursor + transcript size + time) drives emission of only
