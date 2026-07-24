@@ -47,8 +47,9 @@ ingest-side change - see "Adding a new client" in [AGENTS.md](AGENTS.md).
 authoritative autonomous onboarding contract is
 `x2x3studio/hourglass/AGENTS.md`. In short, the Agent:
 
-1. installs missing `git`, `gh` (authenticated to github.com), and `uv`
-   (Homebrew on macOS or the supported Ubuntu paths);
+1. ensures `git` (with SSH access to the data repo) and `uv` are present - `uv`
+   via `brew install uv` when Homebrew exists, else the official
+   `astral.sh/uv/install.sh` (works on macOS and Linux); `gh` is NOT required;
 2. runs `uv tool install --upgrade basic-memory`;
 3. downloads the current platform release asset and `checksums.txt`, verifies
    the exact checksum, then runs:
