@@ -35,6 +35,11 @@ hgctl version
 Intake, sync, and update failures are non-fatal: disk, Git, network, Basic
 Memory, and update errors are retried by the next scheduled sync.
 
+Supported session clients are Claude Code and Codex. Onboarding a machine that
+already runs one of them needs no code - just `hgctl install`. Teaching hgctl a
+brand-new transcript format (another agent as a data source) is a small
+ingest-side change - see "Adding a new client" in [AGENTS.md](AGENTS.md).
+
 ## Install
 
 `hgctl` ships as a prebuilt, date-versioned release binary
