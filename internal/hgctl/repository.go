@@ -278,8 +278,28 @@ func directoryNotEmpty(path string) (bool, error) {
 	return len(entries) > 0, nil
 }
 
+// Budgets for the scheduled sync. They are split because the two halves differ
+// by two orders of magnitude: everything but the reindex is git and transcript
+// parsing, while the reindex embeds the entire product.
+const (
+	// syncTimeout covers fetch, queue sync, session ingest, and shared sync.
+	// Session ingest parses multi-megabyte transcripts, so this has to leave room
+	// for that rather than being sized against git alone.
+	syncTimeout = 5 * time.Minute
+	// basicMemoryReindexTimeout covers `basic-memory reindex`, measured at 399s
+	// for a 291-note product and growing with it. Generous on purpose: a reindex
+	// killed halfway writes no receipt, so a budget that is merely close to the
+	// real cost fails permanently rather than occasionally.
+	basicMemoryReindexTimeout = 30 * time.Minute
+)
+
 func (a *App) sync(ctx context.Context) error {
-	syncCtx, cancel := context.WithTimeout(ctx, 50*time.Second)
+	// Everything except the reindex, which carries its own budget below. 50s was
+	// too tight once transcripts reached several megabytes: parsing them is what
+	// session ingest spends its time on, and a cancelled syncCtx cut that short
+	// without surfacing anything - sync exited 0 having emitted nothing, for 46
+	// hours, while the files kept growing.
+	syncCtx, cancel := context.WithTimeout(ctx, syncTimeout)
 	coreErr := withFileLock(a.Paths.SyncLock, func() error {
 		state, err := a.loadState()
 		if err != nil {
@@ -316,9 +336,23 @@ func (a *App) sync(ctx context.Context) error {
 			sharedReady = false
 		}
 		if sharedReady {
-			if err := a.reindexBasicMemory(syncCtx); err != nil {
+			// Reindex gets its OWN budget, derived from the caller's context
+			// rather than syncCtx. Embedding the whole product is the long pole
+			// by two orders of magnitude - measured at 399s for 291 notes, against
+			// a 50s sync - and sharing the budget made that unrecoverable: the
+			// reindex was killed every run, so its receipt was never written, so
+			// the next run tried the same doomed reindex again. The local recall
+			// mirror silently stopped advancing while sync kept exiting 0.
+			//
+			// It is also the one step that does not need to finish inside a sync:
+			// the receipt records which shared SHA is indexed, so a reindex that
+			// spans several scheduler ticks is simply skipped by the next one (the
+			// file lock serialises them), and the mirror catches up when it lands.
+			indexCtx, indexCancel := context.WithTimeout(ctx, basicMemoryReindexTimeout)
+			if err := a.reindexBasicMemory(indexCtx); err != nil {
 				errs = append(errs, fmt.Errorf("Basic Memory reindex: %w", err))
 			}
+			indexCancel()
 		}
 		return errors.Join(errs...)
 	})

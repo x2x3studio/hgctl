@@ -19,7 +19,10 @@ func (a *App) doctor(ctx context.Context) error {
 	projectNote := a.Paths.Vault
 	indexedOK := false
 	indexNote := a.Paths.IndexedSHA
-	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// `basic-memory project list` takes ~15s on a real corpus, so a 5s probe
+	// reported the binary as broken ("signal: killed") when it was merely slow -
+	// a doctor line that lies is worse than one that is missing.
+	checkCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	project, projectErr := a.resolveBasicMemoryProject(checkCtx)
 	if projectErr == nil {
 		projectOK = true
