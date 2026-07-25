@@ -140,6 +140,23 @@ files it indexes (re-serialised YAML frontmatter, an added permalink), so 294 of
 298 differ from their source and the comparison never skips anything. Hash the
 SOURCE - see `vault_mirror.go`.
 
+Reindex is also gated on the PRODUCT changing, not on shared's sha moving:
+reflect advances its cursor past a noop slice with an empty commit, and
+consolidate carries watermark trailers forward the same way. That gate is
+conservative by construction - an unknown commit or any git failure reindexes -
+because the two mistakes are not symmetric: a wrong "changed" costs one reindex,
+a wrong "unchanged" writes a receipt claiming the mirror is indexed when it is
+not, and recall goes stale with nothing reporting it.
+
+## Cost of the once-a-minute path
+
+`sync` runs every 60 seconds forever, so anything on it is paid ~1440 times a
+day and must earn that. Two costs that did not: a full vault re-copy (above),
+and a `git ls-remote` probe for `queue-template` - one SSH round trip, measured
+at 3.7s, for a branch only the install path reads. Before adding work here, ask
+what a day of it costs and whether the steady state reads the answer; prefer
+gating on a local receipt or marker over asking the network again.
+
 ## Configuration safety
 
 Preserve unrelated Claude Code, Codex, Basic Memory, LaunchAgent, systemd, and
