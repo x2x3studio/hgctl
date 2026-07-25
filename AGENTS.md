@@ -153,9 +153,27 @@ not, and recall goes stale with nothing reporting it.
 `sync` runs every 60 seconds forever, so anything on it is paid ~1440 times a
 day and must earn that. Two costs that did not: a full vault re-copy (above),
 and a `git ls-remote` probe for `queue-template` - one SSH round trip, measured
-at 3.7s, for a branch only the install path reads. Before adding work here, ask
-what a day of it costs and whether the steady state reads the answer; prefer
-gating on a local receipt or marker over asking the network again.
+at 3.7s, for a branch the control plane never grew and no caller read. Before
+adding work here, ask what a day of it costs and whether the steady state reads
+the answer; prefer gating on a local receipt or marker over asking the network
+again. When something turns out to be dead, DELETE it rather than gating it -
+a flag around dead code leaves the reader believing the path is live.
+
+Onboarding depends on nothing being present server-side: a machine with no queue
+branch on the remote self-seeds an orphan one. There is no template branch, and
+reintroducing one would put a network probe back on this path.
+
+## What doctor may claim
+
+Every line must be something doctor actually verified. A line that lies is worse
+than one that is missing, in BOTH directions - reporting a healthy endpoint as
+broken sends the reader chasing nothing, and reporting a broken one as healthy
+is how the endpoint went 46 hours emitting nothing while exiting 0. So a check
+either proves its claim end to end or narrows the claim until it can. The index
+line proves the receipt is current AND that the index holds entries; it does not
+assert a ratio between index size and note count, because Basic Memory mints
+extra entities for forward-referenced wikilinks and no honest threshold exists.
+It prints both numbers so a reader can see what doctor cannot assert.
 
 ## Configuration safety
 
