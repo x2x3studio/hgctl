@@ -66,6 +66,13 @@ self-updates.
   `shared` history: self-seeded locally when the remote carries no
   `queue-template`, or adopted from `queue-template` when one exists. All later
   commits are append-only event commits.
+- Events under `events/` are CREATE-ONLY; a modified event means captured
+  evidence was altered and the guards must keep refusing it. `machine.json` at
+  the branch root is the one tracked file rewritten in place (a hostname edit,
+  an OS upgrade, an hgctl release), so it is the one path where a modification
+  is legal. It is derived state, never evidence: a stage left behind by an
+  interrupted sync is REVERTED and re-derived, because recovery runs first and a
+  refusal there wedges every later sync permanently.
 - Use an OS-released advisory lock for sync; process death must not leave a
   logical lock or require manual cleanup.
 - Auto-update is checksum-verified and atomically retargets the stable symlink.
@@ -122,6 +129,16 @@ installed Claude Code and Codex client. Configuration must be exact, idempotent,
 and ownership safe; uninstall removes only MCP entries it created. Durable
 writes enter only through per-session ingest, reach the queue, and are distilled
 by the reflect Action - the endpoint never authors product.
+
+The mirror into that vault must stay INCREMENTAL, and this is a correctness
+constraint rather than an optimisation. Basic Memory's scan keys off mtime, and
+its reindex embeds notes with a local model, so refreshing every file's mtime
+makes it re-embed the whole corpus - measured at 466% CPU for 6+ minutes against
+298 notes, once a minute, for a product that had changed by one note. Do not
+compare the vault file against its source to decide: Basic Memory rewrites the
+files it indexes (re-serialised YAML frontmatter, an added permalink), so 294 of
+298 differ from their source and the comparison never skips anything. Hash the
+SOURCE - see `vault_mirror.go`.
 
 ## Configuration safety
 
