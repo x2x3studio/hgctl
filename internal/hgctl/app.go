@@ -16,6 +16,12 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	}
 	var err error
 	switch args[0] {
+	// `--help`, `-h`, and `help` are what a caller reaches for first. All three
+	// used to error out with "unknown command", which reads as a broken binary
+	// and sends the reader looking somewhere else - or, worse, guessing.
+	case "help", "--help", "-h":
+		a.usage()
+		return 0
 	case "version", "--version", "-v":
 		_, err = fmt.Fprintln(a.Out, Version)
 	case "install":
@@ -46,8 +52,48 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	return 0
 }
 
+// usage lists every command with what it is FOR, and with the behaviour that
+// surprises a first-time caller. hgctl is operated by agents as much as by
+// people, and an agent reaches for `--help` mid-task and acts on whatever comes
+// back - so this text, not the README, is where the operating contract has to
+// live. It cannot drift from the binary the way a separate document can.
+//
+// The specific failure this replaces: a caller who wanted to force an update ran
+// `hgctl sync --update`, got a silent no-op (it is throttled), concluded
+// self-update was broken, and reinstalled from the release tarball by hand. The
+// `update` command was one line away in the old usage output, but that output
+// listed command NAMES only, and `--help` and `help` both errored out.
 func (a *App) usage() {
-	_, _ = fmt.Fprintln(a.Err, "usage: hgctl <install|hook|sync|ingest|update|doctor|uninstall|version>")
+	_, _ = fmt.Fprint(a.Err, `hgctl - Hourglass endpoint runtime
+
+usage: hgctl <command> [flags]
+
+  install    Connect this machine: register the read-only recall MCP, seed this
+             machine's queue branch, install the sync scheduler. Idempotent -
+             re-running repairs a partial install and never mints a new machine
+             id.
+  sync       One scheduled cycle: ingest new session turns, publish this queue,
+             fast-forward shared, reindex the local recall mirror. Run by the
+             scheduler about once a minute; safe to run by hand.
+      --update   Also check for a newer release. THROTTLED to once an hour, so
+                 an immediate second call is a silent no-op. To force an update
+                 now, use the 'update' command instead.
+  ingest     Operator-path ingest of session transcripts, unbounded. Use when
+             the scheduled path is behind and you want everything pending
+             emitted in one go.
+      --client all|claude|codex   Limit to one source (default all).
+      --limit N                   Cap sessions this run. Candidates are ordered
+                                  OLDEST first, so a small limit reports 0 when
+                                  the oldest candidates have no new turns - it
+                                  is a poor probe for "is ingest working".
+  update     Force an update check now, ignoring the hourly throttle.
+  doctor     Check every endpoint invariant and print one line each. A failing
+             line names what is wrong, not what to do about it.
+  version    Print the installed version.
+  uninstall  Remove the scheduler, MCP registrations, and local state.
+  hook       Retired per-turn capture entry point. Kept only so a stale client
+             hook registration exits cleanly during the prune window.
+`)
 }
 
 func (a *App) runInstall(ctx context.Context, args []string) error {

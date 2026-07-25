@@ -59,6 +59,24 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 			}
 		}
 	}
+	// Identify the machine on its own branch. Upserted, so this commits only
+	// when the metadata actually changed - a hostname edit, an OS upgrade, an
+	// hgctl release - rather than on every scheduler tick.
+	if id, err := a.loadIdentity(); err == nil {
+		staged, err := a.upsertMachineMeta(ctx, id)
+		if err != nil {
+			return err
+		}
+		if staged {
+			if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, []string{machineMetaFile}, true); err != nil {
+				return err
+			}
+			message := fmt.Sprintf("queue(%s): record machine metadata", shortMachine(state.QueueBranch))
+			if _, err := runCommand(ctx, a.Paths.Queue, "git", "commit", "-m", message); err != nil {
+				return err
+			}
+		}
+	}
 	if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, nil, false); err != nil {
 		return err
 	}
@@ -494,7 +512,10 @@ func requireOnlyQueueTargets(ctx context.Context, queue string, targets []string
 	allowed := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		clean := filepath.ToSlash(filepath.Clean(target))
-		if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || !strings.HasPrefix(clean, "events/") {
+		// events/ plus the single machine metadata file at the root; see
+		// machine_meta.go for why that one exception is worth making.
+		if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") ||
+			(!strings.HasPrefix(clean, "events/") && clean != machineMetaFile) {
 			return fmt.Errorf("invalid queue target %q", target)
 		}
 		allowed[clean] = struct{}{}
