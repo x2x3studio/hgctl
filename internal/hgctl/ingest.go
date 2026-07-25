@@ -181,13 +181,15 @@ func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clie
 		candidates []ingestCandidate
 		errs       []error
 	)
+	var skipped []ingestSkip
 	for _, c := range clients {
-		got, err := a.gatherSessions(c, marks, minInterval, parseCap)
+		got, skips, err := a.gatherSessions(c, marks, minInterval, parseCap)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
 		candidates = append(candidates, got...)
+		skipped = append(skipped, skips...)
 	}
 	sortIngestCandidates(candidates)
 	if limit > 0 && len(candidates) > limit {
@@ -196,6 +198,14 @@ func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clie
 	now := a.Now().UTC()
 	enqueued := 0
 	changed := false
+	// Marker-only: these parsed to nothing worth ingesting, and without a marker
+	// they stay eligible forever and crowd real sessions out of the parse budget.
+	// Turns stays 0, so if one later becomes a real conversation its whole content
+	// is emitted then.
+	for _, skip := range skipped {
+		marks[skip.key] = ingestMark{Size: skip.size, Turns: 0, IngestedAt: now}
+		changed = true
+	}
 	for _, cand := range candidates {
 		key := cand.key
 		n := len(cand.session.turns)
@@ -379,7 +389,14 @@ func sortIngestCandidates(candidates []ingestCandidate) {
 	})
 }
 
-func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInterval time.Duration, parseCap int) ([]ingestCandidate, error) {
+// ingestSkip is a transcript that was parsed and turned out to hold nothing to
+// ingest. It still needs a ledger marker - see gatherSessions.
+type ingestSkip struct {
+	key  string
+	size int64
+}
+
+func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInterval time.Duration, parseCap int) ([]ingestCandidate, []ingestSkip, error) {
 	var (
 		files   []string
 		extract func(string) (ingestSession, bool)
@@ -393,10 +410,10 @@ func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInte
 		files, err = codexSessionFiles()
 		extract = extractCodexSession
 	default:
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	now := a.Now().UTC()
 	// Cheapest filter first: stat each transcript and, using its per-file ledger key
@@ -431,9 +448,19 @@ func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInte
 		eligible = eligible[:parseCap]
 	}
 	var out []ingestCandidate
+	var skipped []ingestSkip
 	for _, ef := range eligible {
 		session, ok := extract(ef.path)
 		if !ok {
+			// Parsed, and it is not a conversation. A workflow journal.jsonl holds
+			// only started/result records; a transcript can also carry too little
+			// user text to be worth distilling. Either way it needs a marker, or it
+			// stays eligible FOREVER - and since the parse budget takes the OLDEST
+			// eligible files first, a handful of them starve intake completely.
+			// Measured here: 81 journal.jsonl against a budget of 8, so the same 8
+			// were re-parsed every minute, no growing session was ever reached
+			// again, and sync reported success the whole time.
+			skipped = append(skipped, ingestSkip{key: ef.key, size: ef.size})
 			continue
 		}
 		// The ledger unit is the file (ef.key), unchanged since the pre-filter above;
@@ -458,7 +485,7 @@ func (a *App) gatherSessions(client string, marks map[string]ingestMark, minInte
 		}
 		out = append(out, ingestCandidate{client: client, key: ef.key, session: session, prevTurns: mark.Turns, size: ef.size, captured: captured})
 	}
-	return out, nil
+	return out, skipped, nil
 }
 
 // shouldReingest reports whether a transcript now at size should be (re)ingested

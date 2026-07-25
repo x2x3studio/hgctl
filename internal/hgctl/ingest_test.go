@@ -334,7 +334,7 @@ func TestGatherSessionsParseCapSelectsOldestByMtime(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 2)
+	got, _, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,14 +371,14 @@ func TestGatherSessionsIsClientNamespaced(t *testing.T) {
 		ingestUnitKey("claude", claudePath): {Size: 1 << 20, IngestedAt: app.Now().Add(-time.Hour)},
 	}
 
-	claude, err := app.gatherSessions("claude", marks, 0, 0)
+	claude, _, err := app.gatherSessions("claude", marks, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(claude) != 0 {
 		t.Fatalf("claude sessions = %d, want 0 (already ingested, not grown)", len(claude))
 	}
-	codex, err := app.gatherSessions("codex", marks, 0, 0)
+	codex, _, err := app.gatherSessions("codex", marks, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestGatherSessionsGrowthAndSkipsEmpty(t *testing.T) {
 		ingestUnitKey("claude", unchanged): {Size: info.Size(), IngestedAt: app.Now().Add(-time.Hour)},
 	}
 
-	got, err := app.gatherSessions("claude", marks, 0, 0)
+	got, _, err := app.gatherSessions("claude", marks, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +460,7 @@ func TestGatherSessionsIngestsNestedSubagentAsOwnUnit(t *testing.T) {
 	writeSessionFile(t, sub,
 		`{"type":"user","sessionId":"`+parent+`","isSidechain":true,"cwd":"/tmp/p","timestamp":"2026-07-07T03:00:00.000Z","message":{"role":"user","content":"A sub-agent question long enough to qualify for ingest here too."}}`+"\n")
 
-	got, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 0)
+	got, _, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +495,7 @@ func TestGatherSessionsSameBasenameDifferentParentsDistinctKeys(t *testing.T) {
 	writeSessionFile(t, b,
 		`{"type":"user","sessionId":"parent-B","timestamp":"2026-07-07T02:30:00.000Z","message":{"role":"user","content":"Sub-agent B question long enough to qualify for ingest here."}}`+"\n")
 
-	got, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 0)
+	got, _, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
