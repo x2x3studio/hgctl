@@ -301,3 +301,32 @@ func TestProductUnchangedIgnoresNonProductPaths(t *testing.T) {
 		t.Fatal("a change outside memory/ and Home.md forced a reindex")
 	}
 }
+
+// The denominator doctor compares the index against. Counting the wrong thing
+// makes the check either useless (0 notes always passes) or a liar.
+func TestProductNoteCountSeesOnlyProductMarkdown(t *testing.T) {
+	vault := t.TempDir()
+	for rel, body := range map[string]string{
+		"Home.md":                      "# Home\n",
+		"memory/world/a.md":            "a\n",
+		"memory/experiences/deep/b.md": "b\n",
+		"memory/models/c.md":           "c\n",
+		"memory/world/notes.txt":       "not markdown\n",
+		".obsidian/workspace.json":     "{}\n",
+		"scratch/d.md":                 "outside the product roots\n",
+	} {
+		path := filepath.Join(vault, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := productNoteCount(vault); got != 4 {
+		t.Fatalf("counted %d, want 4 (Home.md plus three notes; .txt, .obsidian and scratch/ are not the product)", got)
+	}
+	if got := productNoteCount(filepath.Join(vault, "does-not-exist")); got != 0 {
+		t.Fatalf("a missing vault counted %d, want 0", got)
+	}
+}

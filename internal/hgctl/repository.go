@@ -61,9 +61,7 @@ func (a *App) initGit(ctx context.Context, state State) error {
 	if err := a.ensureRepositoryBranches(ctx, state.RepoURL); err != nil {
 		return err
 	}
-	// Install: the only caller that goes on to seed a queue branch, so the only
-	// one that needs queue-template.
-	if err := a.fetchEndpointRefs(ctx, state, true); err != nil {
+	if err := a.fetchEndpointRefs(ctx, state); err != nil {
 		return err
 	}
 	if !gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/shared") {
@@ -75,7 +73,7 @@ func (a *App) initGit(ctx context.Context, state State) error {
 	if err := a.ensureQueueBranch(ctx, state.QueueBranch); err != nil {
 		return err
 	}
-	if err := a.ensureWorktree(ctx, a.Paths.Queue, state.QueueBranch, queueStartRef(ctx, a.Paths.Control, state.QueueBranch)); err != nil {
+	if err := a.ensureWorktree(ctx, a.Paths.Queue, state.QueueBranch, "origin/"+state.QueueBranch); err != nil {
 		return err
 	}
 	return a.syncSharedUnlocked(ctx)
@@ -156,27 +154,15 @@ func gitCommonDir(ctx context.Context, path string) (string, error) {
 	return filepath.Clean(common), nil
 }
 
-func queueStartRef(ctx context.Context, control, branch string) string {
-	remote := "refs/remotes/origin/" + branch
-	if gitRefExists(ctx, control, remote) {
-		return "origin/" + branch
-	}
-	return "origin/queue-template"
-}
-
 // ensureQueueBranch guarantees a local queue branch exists before the queue
-// worktree is created. It prefers an existing machine queue or the shared
-// queue-template (the unchanged onboarding path); on a fresh machine whose
-// remote carries neither, it self-seeds an orphan queue branch so onboarding
-// never depends on a server-side template.
+// worktree is created. It adopts this machine's existing queue when the remote
+// already carries one; otherwise it self-seeds an orphan queue branch, so
+// onboarding never depends on anything being present server-side.
 func (a *App) ensureQueueBranch(ctx context.Context, branch string) error {
 	if gitRefExists(ctx, a.Paths.Control, "refs/heads/"+branch) {
 		return nil
 	}
 	if gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+branch) {
-		return nil
-	}
-	if gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/queue-template") {
 		return nil
 	}
 	return a.seedOrphanQueueBranch(ctx, branch)
@@ -228,24 +214,19 @@ func gitRefExists(ctx context.Context, dir, ref string) bool {
 	return cmd.Run() == nil
 }
 
-// fetchEndpointRefs updates the refs this endpoint reads. includeTemplate is for
-// the INSTALL path only: `queue-template` is consulted once, when seeding a
-// machine's queue branch, and never again. Probing it costs a `git ls-remote` -
-// a full SSH round trip, measured at 3.7s against GitHub - and the scheduler
-// calls this once a minute, so leaving it on the steady-state path spent about
-// 90 minutes of network a day asking whether a branch that does not exist had
-// appeared, for an answer nothing downstream of sync would have read.
-func (a *App) fetchEndpointRefs(ctx context.Context, state State, includeTemplate bool) error {
+// fetchEndpointRefs updates the refs this endpoint reads: the control branch,
+// the product, and this machine's own queue once it exists.
+//
+// There is deliberately no `queue-template` here. hgctl once probed for one with
+// `git ls-remote` on every call - a full SSH round trip, measured at 3.7s - to
+// decide whether to adopt a server-side queue seed. The control plane never grew
+// that branch (ensureQueueBranch self-seeds an orphan instead, so onboarding
+// depends on nothing server-side), so the probe asked a question with a fixed
+// answer that no caller read, ~90 minutes of network a day.
+func (a *App) fetchEndpointRefs(ctx context.Context, state State) error {
 	refspecs := []string{
 		"+refs/heads/main:refs/remotes/origin/main",
 		"+refs/heads/shared:refs/remotes/origin/shared",
-	}
-	if includeTemplate {
-		if exists, err := remoteBranchExists(ctx, a.Paths.Control, "queue-template"); err != nil {
-			return err
-		} else if exists {
-			refspecs = append(refspecs, "+refs/heads/queue-template:refs/remotes/origin/queue-template")
-		}
 	}
 	exists := gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+state.QueueBranch)
 	if !exists {
@@ -327,7 +308,7 @@ func (a *App) sync(ctx context.Context) error {
 			return fmt.Errorf("configured queue %q does not match machine identity %q", state.QueueBranch, identity.ID)
 		}
 		var errs []error
-		if err := a.fetchEndpointRefs(syncCtx, state, false); err != nil {
+		if err := a.fetchEndpointRefs(syncCtx, state); err != nil {
 			errs = append(errs, err)
 			return errors.Join(errs...)
 		}

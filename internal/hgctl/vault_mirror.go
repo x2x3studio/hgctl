@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const vaultMirrorSchemaVersion = 1
@@ -224,6 +225,25 @@ func productUnchangedBetween(ctx context.Context, shared, from, to string) bool 
 	// means unchanged; a real git failure also exits non-zero and lands on false.
 	_, err := runCommand(ctx, shared, "git", args...)
 	return err == nil
+}
+
+// productNoteCount counts the Markdown notes actually sitting in the vault. It
+// is the denominator doctor compares the index against: the receipt alone only
+// proves a reindex once ran to completion, not that its result survived.
+func productNoteCount(vault string) int {
+	count := 0
+	for _, name := range productSubset {
+		_ = filepath.WalkDir(filepath.Join(vault, name), func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !entry.IsDir() && strings.HasSuffix(path, ".md") {
+				count++
+			}
+			return nil
+		})
+	}
+	return count
 }
 
 func fileSHA256(path string) (string, error) {

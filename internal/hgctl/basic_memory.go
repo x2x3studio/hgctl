@@ -96,6 +96,37 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 	})
 }
 
+// basicMemoryIndexedCount asks the index how many entries it actually holds.
+//
+// The receipt proves a reindex once ran to completion for a given shared sha; it
+// proves nothing about whether that result is still there. A dropped or reset
+// database leaves the receipt untouched, so `doctor` reported a current index
+// while recall returned nothing - the exact shape of failure this codebase calls
+// worse than no check at all, only inverted.
+//
+// The permalink wildcard is the one filter that matches the whole corpus without
+// depending on any single note's text. A title probe would ride on FTS escaping
+// of a title chosen at random from the vault, so a note with a quote or an
+// operator in it would fail the probe and make doctor report a healthy index as
+// broken.
+func basicMemoryIndexedCount(ctx context.Context) (int, error) {
+	out, err := runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "tool", "search-notes",
+		"--permalink", "*", "--project", ProjectName)
+	if err != nil {
+		return 0, err
+	}
+	var payload struct {
+		Total *int `json:"total"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		return 0, fmt.Errorf("parse index probe response: %w", err)
+	}
+	if payload.Total == nil {
+		return 0, errors.New("index probe response carried no total")
+	}
+	return *payload.Total, nil
+}
+
 type basicMemoryProject struct {
 	Name       string `json:"name"`
 	ExternalID string `json:"external_id"`
