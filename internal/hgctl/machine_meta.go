@@ -53,7 +53,27 @@ func renderMachineMeta(id Identity) ([]byte, error) {
 	return append(body, '\n'), nil
 }
 
-// upsertMachineMeta writes the metadata file and stages it, reporting whether
+// revertQueueMachineMeta puts the metadata file back to whatever HEAD says,
+// discarding a stage left behind by an interrupted sync. Reverting is safe
+// precisely because the file is derived: upsertMachineMeta re-applies it later
+// in the same sync, from the live identity, so nothing is lost by throwing a
+// half-finished write away.
+func (a *App) revertQueueMachineMeta(ctx context.Context) error {
+	if _, err := runCommand(ctx, a.Paths.Queue, "git", "cat-file", "-e", "HEAD:"+machineMetaFile); err == nil {
+		_, err := runCommand(ctx, a.Paths.Queue, "git", "restore", "--staged", "--worktree", "--", machineMetaFile)
+		return err
+	}
+	// Not in HEAD, so the leftover is a first-ever creation: drop it entirely
+	// rather than restoring a version that does not exist.
+	if _, err := runCommand(ctx, a.Paths.Queue, "git", "rm", "--cached", "--force", "--quiet", "--ignore-unmatch", "--", machineMetaFile); err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(a.Paths.Queue, machineMetaFile)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // anything actually changed. Byte-comparing first is what makes this an upsert
 // rather than a write: the scheduler calls it about once a minute, and a file
 // rewritten every time would bury the queue's real history - the event

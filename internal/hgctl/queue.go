@@ -462,6 +462,7 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 	}
 	var batch queueBatch
 	var staged []string
+	var resetMeta bool
 	for _, record := range strings.Split(status, "\x00") {
 		if record == "" {
 			continue
@@ -470,11 +471,21 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 			return queueBatch{}, errors.New("queue has an unrecognized Git status entry")
 		}
 		code := record[:2]
+		rel := filepath.ToSlash(record[3:])
+		clean := filepath.ToSlash(filepath.Clean(rel))
+		if clean == rel && clean == machineMetaFile {
+			// Derived state, not evidence: re-deriving it costs nothing, so a
+			// partial stage is reverted rather than refused. This path was
+			// written when a brand-new event under events/ was the only thing
+			// that could ever be staged, so a crash between the `git add` and
+			// the `git commit` of a metadata update wedged EVERY later sync -
+			// recovery refused the leftover, and recovery runs first.
+			resetMeta = true
+			continue
+		}
 		if code != "A " && code != "??" {
 			return queueBatch{}, errors.New("queue has staged or tracked worktree changes")
 		}
-		rel := filepath.ToSlash(record[3:])
-		clean := filepath.ToSlash(filepath.Clean(rel))
 		if clean != rel || !strings.HasPrefix(clean, "events/") || !strings.HasSuffix(clean, ".md") {
 			return queueBatch{}, fmt.Errorf("queue has unexpected change %q at %s", code, rel)
 		}
@@ -492,6 +503,11 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 		batch.EventPaths = append(batch.EventPaths, clean)
 		if code == "A " {
 			staged = append(staged, clean)
+		}
+	}
+	if resetMeta {
+		if err := a.revertQueueMachineMeta(ctx); err != nil {
+			return queueBatch{}, err
 		}
 	}
 	if len(staged) > 0 {
@@ -533,8 +549,26 @@ func requireOnlyQueueTargets(ctx context.Context, queue string, targets []string
 		}
 		code := record[:2]
 		path := filepath.ToSlash(record[3:])
-		_, expected := allowed[path]
-		if !expected || (!staged && code != "??") || (staged && code != "A ") {
+		if _, expected := allowed[path]; !expected {
+			return fmt.Errorf("queue has unexpected change %q at %s", code, path)
+		}
+		// An event is only ever created, so "A " staged and "??" unstaged is the
+		// entire vocabulary for one. The machine metadata file is the sole
+		// target that is rewritten IN PLACE - a hostname edit, an OS upgrade, an
+		// hgctl release - and so also arrives as a modification. Without this it
+		// committed exactly once, when it was created, and every later change
+		// failed the guard that exists to let it through.
+		ok := code == "A "
+		if !staged {
+			ok = code == "??"
+		}
+		if !ok && path == machineMetaFile {
+			ok = code == "M "
+			if !staged {
+				ok = code == " M"
+			}
+		}
+		if !ok {
 			return fmt.Errorf("queue has unexpected change %q at %s", code, path)
 		}
 	}
