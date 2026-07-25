@@ -63,9 +63,9 @@ self-updates.
   resetting onto the remote and replaying the event from the outbox (retained
   until a successful push), so no event is lost.
 - A new machine's `queue/<machine-id>` is an ORPHAN root with no `main` or
-  `shared` history: self-seeded locally when the remote carries no
-  `queue-template`, or adopted from `queue-template` when one exists. All later
-  commits are append-only event commits.
+  `shared` history: adopted when the remote already carries this machine's
+  branch, otherwise self-seeded locally. All later commits are append-only
+  event commits.
 - Events under `events/` are CREATE-ONLY; a modified event means captured
   evidence was altered and the guards must keep refusing it. `machine.json` at
   the branch root is the one tracked file rewritten in place (a hostname edit,
