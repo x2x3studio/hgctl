@@ -61,7 +61,9 @@ func (a *App) initGit(ctx context.Context, state State) error {
 	if err := a.ensureRepositoryBranches(ctx, state.RepoURL); err != nil {
 		return err
 	}
-	if err := a.fetchEndpointRefs(ctx, state); err != nil {
+	// Install: the only caller that goes on to seed a queue branch, so the only
+	// one that needs queue-template.
+	if err := a.fetchEndpointRefs(ctx, state, true); err != nil {
 		return err
 	}
 	if !gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/shared") {
@@ -226,15 +228,24 @@ func gitRefExists(ctx context.Context, dir, ref string) bool {
 	return cmd.Run() == nil
 }
 
-func (a *App) fetchEndpointRefs(ctx context.Context, state State) error {
+// fetchEndpointRefs updates the refs this endpoint reads. includeTemplate is for
+// the INSTALL path only: `queue-template` is consulted once, when seeding a
+// machine's queue branch, and never again. Probing it costs a `git ls-remote` -
+// a full SSH round trip, measured at 3.7s against GitHub - and the scheduler
+// calls this once a minute, so leaving it on the steady-state path spent about
+// 90 minutes of network a day asking whether a branch that does not exist had
+// appeared, for an answer nothing downstream of sync would have read.
+func (a *App) fetchEndpointRefs(ctx context.Context, state State, includeTemplate bool) error {
 	refspecs := []string{
 		"+refs/heads/main:refs/remotes/origin/main",
 		"+refs/heads/shared:refs/remotes/origin/shared",
 	}
-	if exists, err := remoteBranchExists(ctx, a.Paths.Control, "queue-template"); err != nil {
-		return err
-	} else if exists {
-		refspecs = append(refspecs, "+refs/heads/queue-template:refs/remotes/origin/queue-template")
+	if includeTemplate {
+		if exists, err := remoteBranchExists(ctx, a.Paths.Control, "queue-template"); err != nil {
+			return err
+		} else if exists {
+			refspecs = append(refspecs, "+refs/heads/queue-template:refs/remotes/origin/queue-template")
+		}
 	}
 	exists := gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+state.QueueBranch)
 	if !exists {
@@ -316,7 +327,7 @@ func (a *App) sync(ctx context.Context) error {
 			return fmt.Errorf("configured queue %q does not match machine identity %q", state.QueueBranch, identity.ID)
 		}
 		var errs []error
-		if err := a.fetchEndpointRefs(syncCtx, state); err != nil {
+		if err := a.fetchEndpointRefs(syncCtx, state, false); err != nil {
 			errs = append(errs, err)
 			return errors.Join(errs...)
 		}

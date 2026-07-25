@@ -3,6 +3,7 @@ package hgctl
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -204,5 +205,99 @@ func TestMirrorLeavesNonProductFilesAlone(t *testing.T) {
 	}
 	if _, err := os.Stat(foreign); err != nil {
 		t.Fatalf("mirror deleted Basic Memory's own file: %v", err)
+	}
+}
+
+// gitProduct makes a shared-like repo and returns a commit function.
+func gitProduct(t *testing.T, dir string) func(files map[string]string, message string) string {
+	t.Helper()
+	ctx := testContext(t)
+	run := func(args ...string) string {
+		t.Helper()
+		out, err := runCommand(ctx, dir, "git", args...)
+		if err != nil {
+			t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+		}
+		return out
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run("init", "--quiet")
+	run("config", "user.name", "hgctl-test")
+	run("config", "user.email", "hgctl-test@example.invalid")
+	return func(files map[string]string, message string) string {
+		t.Helper()
+		for rel, body := range files {
+			path := filepath.Join(dir, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		run("add", "--all")
+		run("commit", "--quiet", "--allow-empty", "-m", message)
+		return strings.TrimSpace(run("rev-parse", "HEAD"))
+	}
+}
+
+// reflect advances its cursor past a noop slice with an EMPTY commit, which moves
+// the SHA the index receipt keys on while leaving every indexed file identical.
+// Reindexing there costs a full local-embedding-model load for nothing.
+func TestProductUnchangedAcrossACursorOnlyCommit(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "shared")
+	commit := gitProduct(t, dir)
+	first := commit(map[string]string{"memory/world/a.md": "note a\n"}, "distill")
+	cursorOnly := commit(nil, "reflect: advance cursor over noop slice")
+
+	if !productUnchangedBetween(testContext(t), dir, first, cursorOnly) {
+		t.Fatal("a cursor-only commit was treated as a product change; every noop slice reindexes the corpus")
+	}
+	edited := commit(map[string]string{"memory/world/a.md": "note a, revised\n"}, "distill")
+	if productUnchangedBetween(testContext(t), dir, cursorOnly, edited) {
+		t.Fatal("a real product edit was skipped; recall would go permanently stale")
+	}
+	added := commit(map[string]string{"Home.md": "# Home\n"}, "home")
+	if productUnchangedBetween(testContext(t), dir, edited, added) {
+		t.Fatal("a new Home.md was skipped")
+	}
+}
+
+// The two mistakes are not symmetric. A wrong "changed" costs one reindex; a
+// wrong "unchanged" writes a receipt claiming the mirror is indexed when it is
+// not, and recall stays stale with nothing reporting it. So every ambiguous
+// input must answer false.
+func TestProductUnchangedIsConservative(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "shared")
+	commit := gitProduct(t, dir)
+	head := commit(map[string]string{"memory/world/a.md": "note a\n"}, "distill")
+	ctx := testContext(t)
+
+	for _, tc := range []struct{ name, from, to string }{
+		{"no receipt yet", "", head},
+		{"empty head", head, ""},
+		{"same commit is decided by the caller", head, head},
+		{"unknown from", "0000000000000000000000000000000000000000", head},
+		{"unknown to", head, "0000000000000000000000000000000000000000"},
+		{"not a repository at all", "", ""},
+	} {
+		if productUnchangedBetween(ctx, dir, tc.from, tc.to) {
+			t.Errorf("%s: answered unchanged, which would skip a needed reindex", tc.name)
+		}
+	}
+}
+
+// Only the product roots decide. A change confined to something the vault never
+// mirrors must not force a reindex.
+func TestProductUnchangedIgnoresNonProductPaths(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "shared")
+	commit := gitProduct(t, dir)
+	first := commit(map[string]string{"memory/world/a.md": "note a\n"}, "distill")
+	other := commit(map[string]string{"README.md": "not part of the product\n"}, "docs")
+
+	if !productUnchangedBetween(testContext(t), dir, first, other) {
+		t.Fatal("a change outside memory/ and Home.md forced a reindex")
 	}
 }

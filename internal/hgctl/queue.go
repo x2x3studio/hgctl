@@ -245,7 +245,7 @@ func (a *App) bulkPublishQueue(ctx context.Context) (int, error) {
 		if err := a.verifyControlCheckout(lockCtx, state.RepoURL); err != nil {
 			return err
 		}
-		if err := a.fetchEndpointRefs(lockCtx, state); err != nil {
+		if err := a.fetchEndpointRefs(lockCtx, state, false); err != nil {
 			return err
 		}
 		delivered, err = a.drainOutboxToQueue(lockCtx, state)

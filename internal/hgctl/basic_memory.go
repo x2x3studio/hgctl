@@ -63,6 +63,22 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 	if errors.Is(indexedErr, errUnsupportedSchemaVersion) {
 		return indexedErr
 	}
+	// shared moved but the PRODUCT did not. reflect advances its cursor past a
+	// noop slice with an empty commit, and consolidate carries watermark trailers
+	// forward the same way; both change the SHA this receipt keys on while every
+	// indexed file stays byte-identical. Re-point the receipt and skip the
+	// subprocess: `basic-memory reindex` loads a local embedding model on every
+	// invocation - measured at ~45s of CPU here - and there is nothing for it to
+	// index. Measured 4 of the last 40 shared commits, and a far larger share
+	// while a backlog drains, which is exactly when noop slices are common and
+	// the machine is least able to spare the cores.
+	if indexedErr == nil && indexed.ProjectExternalID == projectID &&
+		productUnchangedBetween(ctx, a.Paths.Shared, indexed.SharedSHA, head) {
+		return a.saveBasicMemoryIndexReceipt(BasicMemoryIndexReceipt{
+			SharedSHA:         head,
+			ProjectExternalID: projectID,
+		})
+	}
 	if !commandExists("basic-memory") {
 		return errors.New("basic-memory is not installed")
 	}

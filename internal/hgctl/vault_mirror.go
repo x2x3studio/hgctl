@@ -1,6 +1,7 @@
 package hgctl
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -202,6 +203,27 @@ func (a *App) loadVaultMirror() map[string]string {
 		return nil
 	}
 	return manifest.Sources
+}
+
+// productUnchangedBetween reports whether the product subset is identical at two
+// shared commits. It is deliberately CONSERVATIVE: an empty or unknown commit, a
+// git error, anything ambiguous answers false, so the worst case is running the
+// reindex that would have run anyway. A wrong "true" is the expensive mistake -
+// it would leave recall permanently stale with the receipt claiming otherwise.
+func productUnchangedBetween(ctx context.Context, shared, from, to string) bool {
+	if from == "" || to == "" || from == to {
+		return false
+	}
+	for _, sha := range []string{from, to} {
+		if _, err := runCommand(ctx, shared, "git", "cat-file", "-e", sha+"^{commit}"); err != nil {
+			return false
+		}
+	}
+	args := append([]string{"diff", "--quiet", from, to, "--"}, productSubset...)
+	// `git diff --quiet` exits 1 when there ARE differences, so only a clean exit
+	// means unchanged; a real git failure also exits non-zero and lands on false.
+	_, err := runCommand(ctx, shared, "git", args...)
+	return err == nil
 }
 
 func fileSHA256(path string) (string, error) {
