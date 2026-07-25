@@ -53,6 +53,7 @@ type Paths struct {
 	Identity      string
 	State         string
 	IndexedSHA    string
+	VaultMirror   string
 	UpdateCheck   string
 	LifecycleLock string
 	SyncLock      string
@@ -89,6 +90,7 @@ func DefaultPaths() (Paths, error) {
 		Identity:      filepath.Join(data, "identity.json"),
 		State:         filepath.Join(data, "state.json"),
 		IndexedSHA:    filepath.Join(data, "indexed-shared"),
+		VaultMirror:   filepath.Join(data, "vault-mirror.json"),
 		UpdateCheck:   filepath.Join(data, "update-check.json"),
 		LifecycleLock: filepath.Join(data, "lifecycle.lock"),
 		SyncLock:      filepath.Join(data, "sync.lock"),

@@ -27,6 +27,7 @@ func testApp(t *testing.T) *App {
 		Versions: filepath.Join(home, ".local", "lib", "hgctl", "versions"),
 		Identity: filepath.Join(data, "identity.json"), State: filepath.Join(data, "state.json"),
 		IndexedSHA:    filepath.Join(data, "indexed-shared"),
+		VaultMirror:   filepath.Join(data, "vault-mirror.json"),
 		UpdateCheck:   filepath.Join(data, "update-check.json"),
 		LifecycleLock: filepath.Join(data, "lifecycle.lock"),
 		SyncLock:      filepath.Join(data, "sync.lock"), UpdateLock: filepath.Join(data, "update.lock"),

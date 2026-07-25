@@ -407,60 +407,7 @@ func (a *App) syncSharedUnlocked(ctx context.Context) error {
 	return a.mirrorProductToVault()
 }
 
-// mirrorProductToVault copies the distilled product subset from the shared git
-// worktree into the Basic Memory vault, a disposable non-git directory. This
-// decouples Basic Memory (which rewrites permalink frontmatter into indexed
-// files) from tracked history: only reflect writes shared, and the vault is a
-// throwaway copy. Extraneous product files are removed so supersessions and
-// deletions propagate.
-func (a *App) mirrorProductToVault() error {
-	if err := os.MkdirAll(a.Paths.Vault, 0o700); err != nil {
-		return err
-	}
-	for _, name := range []string{"memory", "Home.md", "Hourglass.canvas"} {
-		if err := os.RemoveAll(filepath.Join(a.Paths.Vault, name)); err != nil {
-			return err
-		}
-		src := filepath.Join(a.Paths.Shared, name)
-		if _, err := os.Stat(src); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return err
-		}
-		if err := copyTree(src, filepath.Join(a.Paths.Vault, name)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func copyTree(src, dst string) error {
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		data, err := os.ReadFile(src)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(dst, data, 0o600)
-	}
-	if err := os.MkdirAll(dst, 0o700); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(src)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if err := copyTree(filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+// mirrorProductToVault lives in vault_mirror.go.
 
 func gitIsAncestor(ctx context.Context, dir, ancestor, descendant string) (bool, error) {
 	_, err := runCommand(ctx, dir, "git", "merge-base", "--is-ancestor", ancestor, descendant)
