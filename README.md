@@ -45,7 +45,7 @@ ingest-side change - see "Adding a new client" in [AGENTS.md](AGENTS.md).
 `hgctl` ships as a prebuilt, date-versioned release binary
 (`v0.YYYYMMDD.<secs>`), so onboarding needs no Go or build toolchain. The
 authoritative autonomous onboarding contract is
-`x2x3studio/hourglass/AGENTS.md`. In short, the Agent:
+`x2x3studio/hourglass/ONBOARDING.md`. In short, the Agent:
 
 1. ensures `git` (with SSH access to the data repo) and `uv` are present - `uv`
    via `brew install uv` when Homebrew exists, else the official

@@ -3,6 +3,8 @@ package hgctl
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -57,7 +59,17 @@ type ingestMark struct {
 	Size       int64     `json:"size"`
 	Turns      int       `json:"turns"`
 	IngestedAt time.Time `json:"ingested_at"`
+	// Tails holds, for a THREAD marker only (see threadIngestKey), the fingerprint
+	// of the last turn of each batch already emitted for that thread. It is what
+	// lets a freshly-opened rollout file skip the history Codex replayed into it.
+	// Bounded to the most recent maxThreadTails batches - matching only needs to
+	// reach back to whichever batch the fork branched from.
+	Tails []string `json:"tails,omitempty"`
 }
+
+// maxThreadTails bounds the per-thread batch-tail list. A fork replays the thread
+// as it stood at some earlier batch boundary, so only recent boundaries can match.
+const maxThreadTails = 64
 
 var ingestWrappers = []*regexp.Regexp{
 	regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`),
@@ -72,7 +84,13 @@ type ingestTurn struct{ role, text, ts string }
 
 type ingestSession struct {
 	id, cwd, title, firstTS, lastTS string
-	turns                           []ingestTurn
+	// thread is the LOGICAL conversation this transcript belongs to, which is not
+	// the same thing as the transcript file. Codex opens a NEW rollout file with a
+	// NEW id on every fork or resume and replays the whole conversation into it, so
+	// several files share one thread. It comes from session_meta.session_id; for a
+	// plain session it equals id.
+	thread string
+	turns  []ingestTurn
 }
 
 // ingestCandidate is one new-or-grown transcript FILE ready to chunk and enqueue.
@@ -187,6 +205,18 @@ func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clie
 			// the current turn count rather than re-emitting from the top.
 			start = n
 		}
+		// A file we have never seen before may still be replaying a conversation we
+		// have: that is what Codex does on every fork and resume. Skip the part of
+		// the thread already emitted, whichever file it was emitted from.
+		tKey := ""
+		if cand.session.thread != "" {
+			tKey = threadIngestKey(cand.client, cand.session.thread)
+			if start == 0 {
+				if skip := replayedPrefix(marks[tKey], cand.session.turns); skip > start {
+					start = skip
+				}
+			}
+		}
 		if start == n {
 			// Grew in bytes but produced no new complete turns (e.g. only tool
 			// I/O). Emit nothing, but advance Size so it is not reparsed forever.
@@ -223,6 +253,13 @@ func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clie
 			break
 		}
 		marks[key] = ingestMark{Size: cand.size, Turns: n, IngestedAt: now}
+		if tKey != "" {
+			// Record where this batch ended so a later fork of the same thread can
+			// recognise the history it replays.
+			tm := appendThreadTail(marks[tKey], turnFingerprint(cand.session.turns[n-1]))
+			tm.IngestedAt = now
+			marks[tKey] = tm
+		}
 		changed = true
 	}
 	return enqueued, changed, errors.Join(errs...)
@@ -261,6 +298,70 @@ func ingestClients(client string) ([]string, bool) {
 
 func ingestKey(client, id string) string {
 	return client + ":" + id
+}
+
+// threadIngestKey namespaces a LOGICAL thread's marker away from the per-file
+// markers in the same ledger. The per-file marker carries a turn cursor for one
+// transcript; the thread marker carries the batch tails shared by every transcript
+// of that conversation.
+func threadIngestKey(client, thread string) string {
+	return "thread:" + client + ":" + thread
+}
+
+// turnFingerprint identifies one turn by its content alone, so the same turn is
+// recognisable across the several transcript files a thread can be spread over.
+func turnFingerprint(t ingestTurn) string {
+	sum := sha256.Sum256([]byte(t.role + "\x00" + t.text))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// replayedPrefix reports how many LEADING turns of a freshly-opened transcript
+// were already emitted for its thread.
+//
+// Codex opens a new rollout file - new id, new ledger key, no turn cursor - every
+// time a conversation is forked or resumed, and replays the whole conversation
+// into it. Without this, each of those files re-emits the entire history: measured
+// on one machine, 868 queued events carried 112 distinct bodies, one conversation
+// having been captured 35 times. Keying the cursor by thread instead of by file
+// would fix that but break the reason the per-file cursor exists - two sibling
+// sub-agents branch from the SAME parent turn, so a shared count would make the
+// second one skip its own opening turns.
+//
+// So: match by content. Each emitted batch leaves the fingerprint of its last turn
+// in the thread's tails; the replayed prefix ends at the LAST position in this file
+// where any tail matches. Siblings each match the parent's tail and keep their own
+// work. A fork taken mid-batch matches nothing and is re-emitted - the reflect side
+// dedups whole bodies, so that case costs bandwidth, not correctness.
+func replayedPrefix(mark ingestMark, turns []ingestTurn) int {
+	if len(mark.Tails) == 0 || len(turns) == 0 {
+		return 0
+	}
+	tails := make(map[string]struct{}, len(mark.Tails))
+	for _, t := range mark.Tails {
+		tails[t] = struct{}{}
+	}
+	prefix := 0
+	for i, t := range turns {
+		if _, ok := tails[turnFingerprint(t)]; ok {
+			prefix = i + 1
+		}
+	}
+	return prefix
+}
+
+// appendThreadTail records a batch boundary for the thread, keeping the list
+// bounded to the most recent batches.
+func appendThreadTail(mark ingestMark, tail string) ingestMark {
+	for _, t := range mark.Tails {
+		if t == tail {
+			return mark
+		}
+	}
+	mark.Tails = append(mark.Tails, tail)
+	if len(mark.Tails) > maxThreadTails {
+		mark.Tails = mark.Tails[len(mark.Tails)-maxThreadTails:]
+	}
+	return mark
 }
 
 // sortIngestCandidates orders the backlog oldest session first, with a stable,
@@ -576,11 +677,12 @@ type codexRecord struct {
 }
 
 type codexPayload struct {
-	Type    string             `json:"type"`
-	Role    string             `json:"role"`
-	ID      string             `json:"id"`
-	CWD     string             `json:"cwd"`
-	Content []codexContentPart `json:"content"`
+	Type      string             `json:"type"`
+	Role      string             `json:"role"`
+	ID        string             `json:"id"`
+	SessionID string             `json:"session_id"`
+	CWD       string             `json:"cwd"`
+	Content   []codexContentPart `json:"content"`
 }
 
 type codexContentPart struct {
@@ -612,6 +714,12 @@ func extractCodexSession(path string) (ingestSession, bool) {
 		if record.Type == "session_meta" {
 			if session.id == "" {
 				session.id = record.Payload.ID
+			}
+			// A forked or resumed rollout replays the parent's session_meta further
+			// down the file, so only the FIRST one describes this transcript. Its
+			// session_id names the logical thread; id names this file.
+			if session.thread == "" {
+				session.thread = record.Payload.SessionID
 			}
 			if session.cwd == "" {
 				session.cwd = record.Payload.CWD

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -236,7 +237,7 @@ func TestIngestedSessionsMarkerRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got["claude:a"] != want["claude:a"] || got["codex:b"] != want["codex:b"] {
+	if len(got) != 2 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("markers did not round-trip: got %+v want %+v", got, want)
 	}
 }
@@ -1107,5 +1108,76 @@ func TestMarshalSessionFrontmatterGated(t *testing.T) {
 	injected := rawEvent{CapturedAt: chunk.CapturedAt, Client: "claude", Machine: "m", Session: "s", Title: "line1\nevil: x", TurnStart: 0, TurnEnd: 1, Body: "b"}
 	if strings.Contains(string(injected.marshal()), "\nevil: x") {
 		t.Fatal("newline in title leaked a frontmatter line")
+	}
+}
+
+// codexTurn renders one rollout message line.
+func codexTurn(ts, role, want, text string) string {
+	return fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"message","role":%q,"content":[{"type":%q,"text":%q}]}}`,
+		ts, role, want, text)
+}
+
+// Codex opens a NEW rollout file, with a NEW id and no turn cursor, every time a
+// conversation is forked or resumed - and replays the whole conversation into it.
+// Two sibling sub-agents therefore both arrive carrying the parent's history plus
+// their own work. Each must contribute only its own work, and the parent's history
+// must be emitted exactly once, no matter which file it arrives in.
+//
+// Keying the cursor by thread instead of by file would fix the duplication but
+// break the siblings: they branch from the SAME parent turn, so a shared turn
+// COUNT would make the second one skip its own opening turns. Hence content
+// matching, which this test pins.
+func TestCodexForkReplayIsNotReingested(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".codex", "sessions", "2026", "07", "18")
+
+	parentBody := []string{
+		`{"timestamp":"2026-07-18T01:00:00.000Z","type":"session_meta","payload":{"id":"thread-1","session_id":"thread-1","cwd":"/w/demo"}}`,
+		codexTurn("2026-07-18T01:00:01.000Z", "user", "input_text", "The parent question, long enough to qualify for ingest here."),
+		codexTurn("2026-07-18T01:00:02.000Z", "assistant", "output_text", "The parent answer."),
+	}
+	writeSessionFile(t, filepath.Join(dir, "rollout-2026-07-18T01-00-00-thread-1.jsonl"),
+		strings.Join(parentBody, "\n")+"\n")
+
+	// Both sub-agents replay the parent verbatim (Codex restamps the replayed lines
+	// with the fork time, so only the CONTENT is recognisable) and then add their
+	// own turn.
+	for _, sub := range []struct{ id, text string }{
+		{"fork-a", "Sub-agent A's own finding, which is unique to this branch."},
+		{"fork-b", "Sub-agent B's own finding, which is unique to this branch."},
+	} {
+		body := []string{
+			fmt.Sprintf(`{"timestamp":"2026-07-18T02:00:00.000Z","type":"session_meta","payload":{"id":%q,"session_id":"thread-1","forked_from_id":"thread-1","cwd":"/w/demo"}}`, sub.id),
+			codexTurn("2026-07-18T02:00:00.000Z", "user", "input_text", "The parent question, long enough to qualify for ingest here."),
+			codexTurn("2026-07-18T02:00:00.000Z", "assistant", "output_text", "The parent answer."),
+			codexTurn("2026-07-18T02:00:01.000Z", "assistant", "output_text", sub.text),
+		}
+		writeSessionFile(t, filepath.Join(dir, "rollout-2026-07-18T02-00-00-"+sub.id+".jsonl"),
+			strings.Join(body, "\n")+"\n")
+	}
+
+	app := testApp(t)
+	if err := os.MkdirAll(app.Paths.Outbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marks := map[string]ingestMark{}
+	if _, _, err := app.ingestGrownSessions(Identity{ID: "m1"}, marks, []string{"codex"}, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var bodies []string
+	for _, ev := range readOutboxEvents(t, app) {
+		bodies = append(bodies, ev.body)
+	}
+	joined := strings.Join(bodies, "\n---\n")
+
+	if got := strings.Count(joined, "The parent answer."); got != 1 {
+		t.Fatalf("parent history emitted %d times, want exactly 1:\n%s", got, joined)
+	}
+	for _, want := range []string{"Sub-agent A's own finding", "Sub-agent B's own finding"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("%s never reached the queue - dedup ate a sibling's own work:\n%s", want, joined)
+		}
 	}
 }
