@@ -15,9 +15,11 @@ import (
 	"github.com/x2x3studio/hgctl/internal/fsx"
 	"github.com/x2x3studio/hgctl/internal/gitx"
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
-func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
+func (a *App) syncQueueUnlocked(ctx context.Context, state config.State) error {
 	if err := cleanupQueueTemps(a.Paths.Queue); err != nil {
 		return err
 	}
@@ -65,7 +67,7 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 	// Identify the machine on its own branch. Upserted, so this commits only
 	// when the metadata actually changed - a hostname edit, an OS upgrade, an
 	// hgctl release - rather than on every scheduler tick.
-	if id, err := a.loadIdentity(); err == nil {
+	if id, err := config.LoadIdentity(a.Paths, a.Now); err == nil {
 		staged, err := a.upsertMachineMeta(ctx, id)
 		if err != nil {
 			return err
@@ -231,11 +233,11 @@ const bulkQueueCommitChunk = 500
 // that keep automatic Stop-hook syncs small. It waits for, rather than skips, a
 // held sync lock so the operator's import is never silently dropped.
 func (a *App) bulkPublishQueue(ctx context.Context) (int, error) {
-	state, err := a.loadState()
+	state, err := config.LoadState(a.Paths)
 	if err != nil {
 		return 0, err
 	}
-	identity, err := a.loadIdentity()
+	identity, err := config.LoadIdentity(a.Paths, a.Now)
 	if err != nil {
 		return 0, err
 	}
@@ -263,7 +265,7 @@ func (a *App) bulkPublishQueue(ctx context.Context) (int, error) {
 // syncQueueUnlocked preamble (temp cleanup, interrupted-batch recovery, clean
 // check, fast-forward) and per-batch guards, differing only in that it loops
 // until the outbox is empty instead of stopping at one bounded batch.
-func (a *App) drainOutboxToQueue(ctx context.Context, state State) (int, error) {
+func (a *App) drainOutboxToQueue(ctx context.Context, state config.State) (int, error) {
 	if err := cleanupQueueTemps(a.Paths.Queue); err != nil {
 		return 0, err
 	}
@@ -328,7 +330,7 @@ func (a *App) drainOutboxToQueue(ctx context.Context, state State) (int, error) 
 // stageAndCommitQueueBatch stages and commits one already-copied batch, enforcing
 // the events/ path guard before and after staging. A batch of only already-present
 // duplicates stages nothing and is skipped.
-func (a *App) stageAndCommitQueueBatch(ctx context.Context, state State, batch queueBatch) error {
+func (a *App) stageAndCommitQueueBatch(ctx context.Context, state config.State, batch queueBatch) error {
 	if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, batch.EventPaths, false); err != nil {
 		return err
 	}

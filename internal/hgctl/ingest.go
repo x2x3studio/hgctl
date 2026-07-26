@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 const (
@@ -142,7 +144,7 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 	if fs.NArg() != 0 || !ok || *limit < 0 {
 		return errors.New("usage: hgctl ingest [--client all|claude|codex] [--limit N]")
 	}
-	id, err := a.loadIdentity()
+	id, err := config.LoadIdentity(a.Paths, a.Now)
 	if err != nil {
 		return err
 	}
@@ -178,7 +180,7 @@ func (a *App) runIngest(ctx context.Context, args []string) error {
 // = no throttle). It only writes intake events; the caller publishes the outbox.
 // marks is mutated in place so the caller can persist the ledger even on a partial
 // error; the returned bool reports whether any marker changed.
-func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clients []string, limit, parseCap int, minInterval time.Duration) (int, bool, error) {
+func (a *App) ingestGrownSessions(id config.Identity, marks map[string]ingestMark, clients []string, limit, parseCap int, minInterval time.Duration) (int, bool, error) {
 	var (
 		candidates []ingestCandidate
 		errs       []error
@@ -283,7 +285,7 @@ func (a *App) ingestGrownSessions(id Identity, marks map[string]ingestMark, clie
 // within its context budget; the remainder is picked up next run. The cheap
 // size-marker pre-filter in gatherSessions keeps this from reparsing unchanged
 // sessions, and the min interval throttles a rapidly-growing live session.
-func (a *App) ingestForSync(id Identity) error {
+func (a *App) ingestForSync(id config.Identity) error {
 	clients, _ := ingestClients("all")
 	marks, err := a.loadIngestedSessions()
 	if err != nil {

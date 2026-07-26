@@ -5,6 +5,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 // The usage text is hgctl's operating contract for the agents that run it: they
@@ -35,7 +37,7 @@ func TestHelpFlagsWorkAndUsageDescribesEveryCommand(t *testing.T) {
 // minute. If it were a plain write rather than an upsert, the queue's real
 // history - the event captures - would be buried under identical commits.
 func TestMachineMetaIsAnUpsert(t *testing.T) {
-	id := Identity{ID: "a943c6d2-e7a3-48a4-a562-849aa8fa0560", Hostname: "Orange"}
+	id := config.Identity{ID: "a943c6d2-e7a3-48a4-a562-849aa8fa0560", Hostname: "Orange"}
 	first, err := renderMachineMeta(id)
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +54,7 @@ func TestMachineMetaIsAnUpsert(t *testing.T) {
 			t.Errorf("metadata is missing %s:\n%s", want, first)
 		}
 	}
-	changed, err := renderMachineMeta(Identity{ID: id.ID, Hostname: "Renamed"})
+	changed, err := renderMachineMeta(config.Identity{ID: id.ID, Hostname: "Renamed"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -9,6 +9,8 @@ import (
 	"os"
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 func (a *App) Run(ctx context.Context, args []string) int {
@@ -107,7 +109,7 @@ usage: hgctl <command> [flags]
 func (a *App) runInstall(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
-	repo := fs.String("repo", envOr("HOURGLASS_REPO", DefaultRepoURL), "Hourglass Git remote")
+	repo := fs.String("repo", envOr("HOURGLASS_REPO", config.DefaultRepoURL), "Hourglass Git remote")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -125,13 +127,13 @@ func (a *App) install(ctx context.Context, repo string) error {
 	if err := a.installBinary(); err != nil {
 		return err
 	}
-	id, err := a.loadIdentity()
+	id, err := config.LoadIdentity(a.Paths, a.Now)
 	if err != nil {
 		return err
 	}
-	state := State{RepoURL: repo, QueueBranch: "queue/" + id.ID}
+	state := config.State{RepoURL: repo, QueueBranch: "queue/" + id.ID}
 	if err := fsx.WithLockWait(ctx, a.Paths.SyncLock, func() error {
-		if previous, err := a.loadState(); err == nil {
+		if previous, err := config.LoadState(a.Paths); err == nil {
 			if previous.RepoURL != "" && previous.RepoURL != state.RepoURL {
 				return fmt.Errorf("refusing to replace configured repository %s with %s", previous.RepoURL, state.RepoURL)
 			}
@@ -143,7 +145,7 @@ func (a *App) install(ctx context.Context, repo string) error {
 		if err := a.initGit(ctx, state); err != nil {
 			return err
 		}
-		if err := a.saveState(state); err != nil {
+		if err := config.SaveState(a.Paths, state); err != nil {
 			return err
 		}
 		return a.setupBasicMemory(ctx)
@@ -188,7 +190,7 @@ func (a *App) install(ctx context.Context, repo string) error {
 //
 // Never fatal. A machine whose backfill fails is still installed and still
 // scheduled; it just catches up over ticks instead of in one pass.
-func (a *App) initialIntake(ctx context.Context, id Identity) error {
+func (a *App) initialIntake(ctx context.Context, id config.Identity) error {
 	marks, err := a.loadIngestedSessions()
 	if err != nil {
 		return err

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 func writeSessionFile(t *testing.T, path, content string) {
@@ -259,7 +261,7 @@ func TestIngestForSyncBoundsAndReingestsOnGrowth(t *testing.T) {
 		writeSessionFile(t, paths[i], fmt.Sprintf(`{"type":"user","sessionId":"s-%02d","timestamp":"2026-07-07T02:%02d:00.000Z","message":{"role":"user","content":"A question long enough to qualify for ingest number %02d here."}}`+"\n", i, i, i))
 	}
 
-	id, err := app.loadIdentity()
+	id, err := config.LoadIdentity(app.Paths, app.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +524,7 @@ func TestIngestNestedSubagentEndToEnd(t *testing.T) {
 	writeSessionFile(t, sub,
 		`{"type":"user","sessionId":"`+parent+`","isSidechain":true,"cwd":"/tmp/p","timestamp":"2026-07-07T03:00:00.000Z","message":{"role":"user","content":"A sub-agent workflow question long enough to qualify for ingest here."}}`+"\n")
 
-	id, err := app.loadIdentity()
+	id, err := config.LoadIdentity(app.Paths, app.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +643,7 @@ func setupBulkQueue(t *testing.T) (*App, string, string) {
 	runGitTest(t, control, "config", "user.email", "chinaboard@gmail.com")
 	runGitTest(t, control, "remote", "add", "origin", origin)
 
-	id, err := app.loadIdentity()
+	id, err := config.LoadIdentity(app.Paths, app.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -657,7 +659,7 @@ func setupBulkQueue(t *testing.T) (*App, string, string) {
 
 func TestDrainOutboxToQueuePublishesEntireBacklog(t *testing.T) {
 	app, origin, branch := setupBulkQueue(t)
-	state := State{RepoURL: origin, QueueBranch: branch}
+	state := config.State{RepoURL: origin, QueueBranch: branch}
 
 	const events = 9 // more than MaxSyncEvents, so a steady-state sync could not do this in one push
 	for i := 0; i < events; i++ {
@@ -714,7 +716,7 @@ func TestDrainOutboxToQueuePublishesEntireBacklog(t *testing.T) {
 
 func TestBulkPublishQueueRejectsForeignBranch(t *testing.T) {
 	app := testApp(t)
-	if err := app.saveState(State{RepoURL: "x", QueueBranch: "queue/not-this-machine"}); err != nil {
+	if err := config.SaveState(app.Paths, config.State{RepoURL: "x", QueueBranch: "queue/not-this-machine"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := app.bulkPublishQueue(testContext(t)); err == nil {
@@ -954,7 +956,7 @@ func TestFirstIngestEmitsCompleteChunkedFrontmatterOrdered(t *testing.T) {
 	path := filepath.Join(home, ".claude", "projects", "proj", "big.jsonl")
 	writeClaudeSession(t, path, "big-sess", "/tmp/proj", "My Session", texts)
 
-	id, err := app.loadIdentity()
+	id, err := config.LoadIdentity(app.Paths, app.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1019,7 +1021,7 @@ func TestIngestEmitsOnlyDeltaOnGrowth(t *testing.T) {
 	// The turn cursor lives under the per-file key, not the content sessionId.
 	fileKey := ingestUnitKey("claude", path)
 
-	id, err := app.loadIdentity()
+	id, err := config.LoadIdentity(app.Paths, app.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1195,7 +1197,7 @@ func TestCodexForkReplayIsNotReingested(t *testing.T) {
 		t.Fatal(err)
 	}
 	marks := map[string]ingestMark{}
-	if _, _, err := app.ingestGrownSessions(Identity{ID: "m1"}, marks, []string{"codex"}, 0, 0, 0); err != nil {
+	if _, _, err := app.ingestGrownSessions(config.Identity{ID: "m1"}, marks, []string{"codex"}, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 

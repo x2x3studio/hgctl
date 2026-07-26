@@ -9,6 +9,8 @@ import (
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 func (a *App) uninstall(ctx context.Context) error {
@@ -107,7 +109,7 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 }
 
 func (a *App) managedBasicMemoryCleanupRequired() (bool, error) {
-	state, err := a.loadState()
+	state, err := config.LoadState(a.Paths)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}

@@ -9,6 +9,8 @@ import (
 	"github.com/x2x3studio/hgctl/internal/fsx"
 	"github.com/x2x3studio/hgctl/internal/gitx"
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 type doctorCheck struct {
@@ -80,7 +82,7 @@ func (a *App) doctor(ctx context.Context) error {
 	}
 	checks = append(checks, a.basicMemoryMCPDoctorChecks(ctx)...)
 	checks = append(checks,
-		doctorCheck{"scheduler", a.schedulerLoaded(ctx), LaunchLabel},
+		doctorCheck{"scheduler", a.schedulerLoaded(ctx), config.LaunchLabel},
 	)
 	failed := 0
 	for _, item := range checks {
@@ -91,7 +93,7 @@ func (a *App) doctor(ctx context.Context) error {
 		}
 		_, _ = fmt.Fprintf(a.Out, "%-7s %-18s %s\n", status, item.name, item.note)
 	}
-	if id, err := a.loadIdentity(); err == nil {
+	if id, err := config.LoadIdentity(a.Paths, a.Now); err == nil {
 		_, _ = fmt.Fprintf(a.Out, "machine %-36s hostname=%s\n", id.ID, id.Hostname)
 	} else {
 		failed++

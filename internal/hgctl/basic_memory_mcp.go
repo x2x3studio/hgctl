@@ -12,6 +12,8 @@ import (
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 const basicMemoryMCPName = "hourglass-memory"
@@ -35,7 +37,7 @@ func (a *App) setupBasicMemoryMCP(ctx context.Context) error {
 	if err != nil {
 		return errors.New("basic-memory is not installed")
 	}
-	state, err := a.loadState()
+	state, err := config.LoadState(a.Paths)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -77,7 +79,7 @@ func (a *App) setupBasicMemoryMCP(ctx context.Context) error {
 		if managedPath != "" {
 			state.BasicMemoryMCP[client.name] = managedPath
 		}
-		if err := a.saveState(state); err != nil {
+		if err := config.SaveState(a.Paths, state); err != nil {
 			return err
 		}
 		configured++
@@ -107,7 +109,7 @@ func addBasicMemoryMCP(ctx context.Context, client mcpClient, binary string) err
 		}
 		args = append(args, basicMemoryMCPName)
 	}
-	args = append(args, "--", binary, "mcp", "--project", ProjectName)
+	args = append(args, "--", binary, "mcp", "--project", config.ProjectName)
 	_, err := proc.Run(ctx, "", client.executable, args...)
 	return err
 }
@@ -143,7 +145,7 @@ func inspectBasicMemoryMCP(ctx context.Context, client mcpClient, binary string)
 			return true, false, err
 		}
 		matches := entry.Enabled && entry.Transport.Type == "stdio" && entry.Transport.Command == binary &&
-			equalStrings(entry.Transport.Args, []string{"mcp", "--project", ProjectName}) && containsEnv(entry.Transport.Env)
+			equalStrings(entry.Transport.Args, []string{"mcp", "--project", config.ProjectName}) && containsEnv(entry.Transport.Env)
 		return true, matches, nil
 	}
 	output, err := proc.Run(ctx, "", client.executable, "mcp", "get", basicMemoryMCPName)
@@ -156,7 +158,7 @@ func inspectBasicMemoryMCP(ctx context.Context, client mcpClient, binary string)
 	matches := strings.Contains(output, "Scope: User config") &&
 		strings.Contains(output, "Type: stdio") &&
 		strings.Contains(output, "Command: "+binary) &&
-		strings.Contains(output, "Args: mcp --project "+ProjectName)
+		strings.Contains(output, "Args: mcp --project "+config.ProjectName)
 	for key, value := range basicMemoryMCPEnv {
 		matches = matches && strings.Contains(output, key+"="+value)
 	}
@@ -185,7 +187,7 @@ func equalStrings(left, right []string) bool {
 }
 
 func (a *App) removeManagedBasicMemoryMCP(ctx context.Context) error {
-	state, err := a.loadState()
+	state, err := config.LoadState(a.Paths)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -203,7 +205,7 @@ func (a *App) removeManagedBasicMemoryMCP(ctx context.Context) error {
 		}
 		if !exists {
 			delete(state.BasicMemoryMCP, client.name)
-			if err := a.saveState(state); err != nil {
+			if err := config.SaveState(a.Paths, state); err != nil {
 				return err
 			}
 			continue
@@ -216,7 +218,7 @@ func (a *App) removeManagedBasicMemoryMCP(ctx context.Context) error {
 			return fmt.Errorf("remove %s Basic Memory MCP: %w", client.name, err)
 		}
 		delete(state.BasicMemoryMCP, client.name)
-		if err := a.saveState(state); err != nil {
+		if err := config.SaveState(a.Paths, state); err != nil {
 			return err
 		}
 	}

@@ -12,6 +12,8 @@ import (
 	"github.com/x2x3studio/hgctl/internal/fsx"
 	"github.com/x2x3studio/hgctl/internal/gitx"
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 const (
@@ -19,7 +21,7 @@ const (
 	controlOriginKey  = "hgctl.origin"
 )
 
-func (a *App) initGit(ctx context.Context, state State) error {
+func (a *App) initGit(ctx context.Context, state config.State) error {
 	if !proc.Exists("git") {
 		return errors.New("git is required")
 	}
@@ -205,7 +207,7 @@ func (a *App) seedOrphanQueueBranch(ctx context.Context, branch string) error {
 // that branch (ensureQueueBranch self-seeds an orphan instead, so onboarding
 // depends on nothing server-side), so the probe asked a question with a fixed
 // answer that no caller read, ~90 minutes of network a day.
-func (a *App) fetchEndpointRefs(ctx context.Context, state State) error {
+func (a *App) fetchEndpointRefs(ctx context.Context, state config.State) error {
 	refspecs := []string{
 		"+refs/heads/main:refs/remotes/origin/main",
 		"+refs/heads/shared:refs/remotes/origin/shared",
@@ -260,14 +262,14 @@ func (a *App) sync(ctx context.Context) error {
 	// hours, while the files kept growing.
 	syncCtx, cancel := context.WithTimeout(ctx, syncTimeout)
 	coreErr := fsx.WithLock(a.Paths.SyncLock, func() error {
-		state, err := a.loadState()
+		state, err := config.LoadState(a.Paths)
 		if err != nil {
 			return err
 		}
 		if err := a.verifyControlCheckout(syncCtx, state.RepoURL); err != nil {
 			return err
 		}
-		identity, err := a.loadIdentity()
+		identity, err := config.LoadIdentity(a.Paths, a.Now)
 		if err != nil {
 			return err
 		}

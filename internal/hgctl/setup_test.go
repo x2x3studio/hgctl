@@ -12,6 +12,8 @@ import (
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 // writeManagedHookFile seeds a client config that carries one hgctl-managed hook
@@ -212,7 +214,7 @@ func TestBackgroundHookRepairPrunesStaleAndIsIdempotent(t *testing.T) {
 		if err := os.Symlink(target, filepath.Join(app.Paths.Bin, "hgctl")); err != nil {
 			t.Fatal(err)
 		}
-		if err := app.saveState(State{}); err != nil {
+		if err := config.SaveState(app.Paths, config.State{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -318,8 +320,8 @@ func TestBasicMemoryOwnershipRequiresExactIDAndPath(t *testing.T) {
 	if err := os.MkdirAll(want, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ownership := BasicMemoryOwnership{ExternalID: "owned-id", Path: want, Managed: true}
-	projects := []basicMemoryProject{{Name: ProjectName, ExternalID: "owned-id", LocalPath: want}}
+	ownership := config.BasicMemoryOwnership{ExternalID: "owned-id", Path: want, Managed: true}
+	projects := []basicMemoryProject{{Name: config.ProjectName, ExternalID: "owned-id", LocalPath: want}}
 	if !basicMemoryOwnershipMatches(ownership, projects, want) {
 		t.Fatal("exact project ownership did not match")
 	}
@@ -336,7 +338,7 @@ func TestBasicMemoryOwnershipRequiresExactIDAndPath(t *testing.T) {
 
 func TestBasicMemorySetupAdoptsExistingProjectWithoutTakingOwnership(t *testing.T) {
 	vault := t.TempDir()
-	project := basicMemoryProject{Name: ProjectName, ExternalID: "project-id", LocalPath: vault}
+	project := basicMemoryProject{Name: config.ProjectName, ExternalID: "project-id", LocalPath: vault}
 	adopted := basicMemoryOwnershipForSetup(nil, project, false, vault)
 	if adopted.Managed {
 		t.Fatal("an existing Basic Memory project was marked as hgctl-managed")
@@ -355,7 +357,7 @@ func TestBasicMemorySetupAdoptsExistingProjectWithoutTakingOwnership(t *testing.
 	if replaced.Managed {
 		t.Fatal("a replacement project inherited ownership")
 	}
-	pending := BasicMemoryOwnership{Path: vault, Managed: true, Pending: true}
+	pending := config.BasicMemoryOwnership{Path: vault, Managed: true, Pending: true}
 	recovered := basicMemoryOwnershipForSetup(&pending, project, false, vault)
 	if !recovered.Managed || recovered.Pending {
 		t.Fatalf("interrupted project creation was not recovered: %+v", recovered)
@@ -365,13 +367,13 @@ func TestBasicMemorySetupAdoptsExistingProjectWithoutTakingOwnership(t *testing.
 func TestBasicMemoryRemovalRequiresManagedExactIdentity(t *testing.T) {
 	tests := []struct {
 		name       string
-		ownership  BasicMemoryOwnership
+		ownership  config.BasicMemoryOwnership
 		wantRemove bool
 	}{
-		{name: "adopted project", ownership: BasicMemoryOwnership{ExternalID: "project-id", Managed: false}},
-		{name: "replaced project", ownership: BasicMemoryOwnership{ExternalID: "old-project-id", Managed: true}},
-		{name: "managed exact project", ownership: BasicMemoryOwnership{ExternalID: "project-id", Managed: true}, wantRemove: true},
-		{name: "interrupted managed creation", ownership: BasicMemoryOwnership{Managed: true, Pending: true}, wantRemove: true},
+		{name: "adopted project", ownership: config.BasicMemoryOwnership{ExternalID: "project-id", Managed: false}},
+		{name: "replaced project", ownership: config.BasicMemoryOwnership{ExternalID: "old-project-id", Managed: true}},
+		{name: "managed exact project", ownership: config.BasicMemoryOwnership{ExternalID: "project-id", Managed: true}, wantRemove: true},
+		{name: "interrupted managed creation", ownership: config.BasicMemoryOwnership{Managed: true, Pending: true}, wantRemove: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -380,10 +382,10 @@ func TestBasicMemoryRemovalRequiresManagedExactIdentity(t *testing.T) {
 				t.Fatal(err)
 			}
 			test.ownership.Path = app.Paths.Vault
-			if err := app.saveState(State{BasicMemoryProject: &test.ownership}); err != nil {
+			if err := config.SaveState(app.Paths, config.State{BasicMemoryProject: &test.ownership}); err != nil {
 				t.Fatal(err)
 			}
-			if err := fsx.WriteJSON(app.Paths.IndexedSHA, BasicMemoryIndexReceipt{
+			if err := fsx.WriteJSON(app.Paths.IndexedSHA, config.IndexReceipt{
 				SharedSHA:         strings.Repeat("a", 40),
 				ProjectExternalID: test.ownership.ExternalID,
 			}, 0o600); err != nil {
@@ -420,7 +422,7 @@ exit 20
 			if removed != test.wantRemove {
 				t.Fatalf("removed=%v, want %v", removed, test.wantRemove)
 			}
-			state, err := app.loadState()
+			state, err := config.LoadState(app.Paths)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -570,7 +572,7 @@ func TestUninstallReportsIncompleteBasicMemoryCleanupAndPreservesRetryPath(t *te
 		t.Run(test.name, func(t *testing.T) {
 			app := testApp(t)
 			stable := prepareUninstallFixture(t, app, false)
-			if err := app.saveState(State{BasicMemoryProject: &BasicMemoryOwnership{
+			if err := config.SaveState(app.Paths, config.State{BasicMemoryProject: &config.BasicMemoryOwnership{
 				ExternalID: "project-id", Path: app.Paths.Vault, Managed: true,
 			}}); err != nil {
 				t.Fatal(err)
@@ -635,7 +637,7 @@ exit 20
 		if err := os.WriteFile(filepath.Join(bin, "launchctl"), []byte(script), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		path := filepath.Join(app.Paths.Home, "Library", "LaunchAgents", LaunchLabel+".plist")
+		path := filepath.Join(app.Paths.Home, "Library", "LaunchAgents", config.LaunchLabel+".plist")
 		writeSchedulerFixture(t, path, blockSchedulerRemoval, stable)
 	case "linux":
 		script := `#!/bin/sh
@@ -649,8 +651,8 @@ exit 20
 			t.Fatal(err)
 		}
 		dir := filepath.Join(app.Paths.Home, ".config", "systemd", "user")
-		writeSchedulerFixture(t, filepath.Join(dir, LaunchLabel+".service"), blockSchedulerRemoval, stable)
-		writeSchedulerFixture(t, filepath.Join(dir, LaunchLabel+".timer"), false, stable)
+		writeSchedulerFixture(t, filepath.Join(dir, config.LaunchLabel+".service"), blockSchedulerRemoval, stable)
+		writeSchedulerFixture(t, filepath.Join(dir, config.LaunchLabel+".timer"), false, stable)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return stable
@@ -703,7 +705,7 @@ func TestStableSymlinkNeverReplacesRegularFile(t *testing.T) {
 func TestSchedulerOwnershipRejectsUnrelatedFiles(t *testing.T) {
 	root := t.TempDir()
 	stable := filepath.Join(root, ".local", "bin", "hgctl")
-	path := filepath.Join(root, "Library", "LaunchAgents", LaunchLabel+".plist")
+	path := filepath.Join(root, "Library", "LaunchAgents", config.LaunchLabel+".plist")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -800,7 +802,7 @@ printf x >> "$HGCTL_TEST_REINDEX_LOG"
 	t.Setenv("HGCTL_TEST_REINDEX_LOG", logPath)
 	t.Setenv("HGCTL_TEST_PROJECT_ID", "project-id")
 	t.Setenv("HGCTL_TEST_PROJECT_PATH", app.Paths.Vault)
-	if err := app.saveState(State{BasicMemoryProject: &BasicMemoryOwnership{
+	if err := config.SaveState(app.Paths, config.State{BasicMemoryProject: &config.BasicMemoryOwnership{
 		ExternalID: "project-id",
 		Path:       app.Paths.Vault,
 		Managed:    true,
@@ -811,19 +813,19 @@ printf x >> "$HGCTL_TEST_REINDEX_LOG"
 		t.Fatal(err)
 	}
 	head := strings.TrimSpace(runGitTest(t, app.Paths.Shared, "rev-parse", "HEAD"))
-	var receipt BasicMemoryIndexReceipt
+	var receipt config.IndexReceipt
 	if err := fsx.ReadJSON(app.Paths.IndexedSHA, &receipt); err != nil {
 		t.Fatal(err)
 	}
 	if receipt.SharedSHA != head || receipt.ProjectExternalID != "project-id" {
 		t.Fatalf("index receipt=%+v", receipt)
 	}
-	state, err := app.loadState()
+	state, err := config.LoadState(app.Paths)
 	if err != nil {
 		t.Fatal(err)
 	}
 	state.BasicMemoryProject.ExternalID = "replacement-project-id"
-	if err := app.saveState(state); err != nil {
+	if err := config.SaveState(app.Paths, state); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HGCTL_TEST_PROJECT_ID", "replacement-project-id")

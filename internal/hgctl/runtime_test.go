@@ -15,13 +15,15 @@ import (
 	"time"
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 func testApp(t *testing.T) *App {
 	t.Helper()
 	home := t.TempDir()
 	data := filepath.Join(home, ".local", "share", "hgctl")
-	paths := Paths{
+	paths := config.Paths{
 		Home: home, Data: data,
 		Control: filepath.Join(data, "repo"), Queue: filepath.Join(data, "queue"),
 		Outbox: filepath.Join(data, "outbox"),
@@ -42,11 +44,11 @@ func testApp(t *testing.T) *App {
 
 func TestIdentityIsStableAndHostnameIsMetadata(t *testing.T) {
 	app := testApp(t)
-	first, err := app.loadIdentity()
+	first, err := config.LoadIdentity(app.Paths, app.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := app.loadIdentity()
+	second, err := config.LoadIdentity(app.Paths, app.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +61,7 @@ func TestIdentityIsStableAndHostnameIsMetadata(t *testing.T) {
 	if first.Hostname == "" {
 		t.Fatal("hostname metadata is empty")
 	}
-	if first.SchemaVersion != identitySchemaVersion {
+	if first.SchemaVersion != config.IdentitySchemaVersion {
 		t.Fatalf("identity schema_version=%d", first.SchemaVersion)
 	}
 }
@@ -79,11 +81,11 @@ func TestLegacyPersistedFilesMigrateToCurrentSchemas(t *testing.T) {
 	if err := fsx.WriteJSON(app.Paths.Identity, legacyIdentity, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	identity, err := app.loadIdentity()
+	identity, err := config.LoadIdentity(app.Paths, app.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if identity.SchemaVersion != identitySchemaVersion || !identity.CreatedAt.Equal(created) || !identity.UpdatedAt.Equal(updated) {
+	if identity.SchemaVersion != config.IdentitySchemaVersion || !identity.CreatedAt.Equal(created) || !identity.UpdatedAt.Equal(updated) {
 		t.Fatalf("migrated identity=%+v", identity)
 	}
 
@@ -97,11 +99,11 @@ func TestLegacyPersistedFilesMigrateToCurrentSchemas(t *testing.T) {
 	if err := fsx.WriteJSON(app.Paths.State, legacyState, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	state, err := app.loadState()
+	state, err := config.LoadState(app.Paths)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.SchemaVersion != stateSchemaVersion || state.BasicMemoryProject == nil || state.BasicMemoryProject.ExternalID != "project-id" {
+	if state.SchemaVersion != config.StateSchemaVersion || state.BasicMemoryProject == nil || state.BasicMemoryProject.ExternalID != "project-id" {
 		t.Fatalf("migrated state=%+v", state)
 	}
 
@@ -121,11 +123,11 @@ func TestLegacyPersistedFilesMigrateToCurrentSchemas(t *testing.T) {
 	if err := fsx.WriteJSON(app.Paths.IndexedSHA, legacyIndex, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	index, err := app.loadBasicMemoryIndexReceipt()
+	index, err := config.LoadIndexReceipt(app.Paths)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if index.SchemaVersion != basicMemoryIndexReceiptSchemaVersion || index.ProjectExternalID != "project-id" {
+	if index.SchemaVersion != config.IndexReceiptSchemaVersion || index.ProjectExternalID != "project-id" {
 		t.Fatalf("migrated Basic Memory receipt=%+v", index)
 	}
 
@@ -146,10 +148,10 @@ func TestPersistedFilesRejectFutureSchemas(t *testing.T) {
 		path func(*App) string
 		load func(*App) error
 	}{
-		{"identity", func(app *App) string { return app.Paths.Identity }, func(app *App) error { _, err := app.loadIdentity(); return err }},
-		{"state", func(app *App) string { return app.Paths.State }, func(app *App) error { _, err := app.loadState(); return err }},
+		{"identity", func(app *App) string { return app.Paths.Identity }, func(app *App) error { _, err := config.LoadIdentity(app.Paths, app.Now); return err }},
+		{"state", func(app *App) string { return app.Paths.State }, func(app *App) error { _, err := config.LoadState(app.Paths); return err }},
 		{"update", func(app *App) string { return app.Paths.UpdateCheck }, func(app *App) error { _, err := app.loadUpdateCheck(); return err }},
-		{"basic-memory", func(app *App) string { return app.Paths.IndexedSHA }, func(app *App) error { _, err := app.loadBasicMemoryIndexReceipt(); return err }},
+		{"basic-memory", func(app *App) string { return app.Paths.IndexedSHA }, func(app *App) error { _, err := config.LoadIndexReceipt(app.Paths); return err }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -166,7 +168,7 @@ func TestPersistedFilesRejectFutureSchemas(t *testing.T) {
 
 func TestLaunchAgentUsesOneStableLabelAndPath(t *testing.T) {
 	body := launchAgent("/Users/test/.local/bin/hgctl", "/Users/test/.local/share/hgctl", "/Users/test", "/Users/test/hourglass-vault")
-	if got := strings.Count(body, LaunchLabel); got != 1 {
+	if got := strings.Count(body, config.LaunchLabel); got != 1 {
 		t.Fatalf("label occurs %d times", got)
 	}
 	if !strings.Contains(body, "/Users/test/.local/bin/hgctl") {
@@ -272,7 +274,7 @@ func TestReleaseInstallRequiresCandidateVersionToMatchTag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wrong := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\nv9.9.9\\n'\n")
+	wrong := []byte("#!/bin/sh\nprintf '" + config.ProbeMarker + "\\nv9.9.9\\n'\n")
 	if err := app.installReleaseBinary(testContext(t), "v0.2.0", wrong); err == nil || !strings.Contains(err.Error(), "expected exact tag") {
 		t.Fatalf("got %v", err)
 	}
@@ -283,7 +285,7 @@ func TestReleaseInstallRequiresCandidateVersionToMatchTag(t *testing.T) {
 		t.Fatalf("rejected candidate was promoted: %v", err)
 	}
 
-	matching := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\nv0.2.0\\n'\n")
+	matching := []byte("#!/bin/sh\nprintf '" + config.ProbeMarker + "\\nv0.2.0\\n'\n")
 	if err := app.installReleaseBinary(testContext(t), "v0.2.0", matching); err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +327,7 @@ func TestRepeatedReleaseInstallDoesNotOverwriteTheActiveTarget(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	content := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\nv0.2.0\\n'\n")
+	content := []byte("#!/bin/sh\nprintf '" + config.ProbeMarker + "\\nv0.2.0\\n'\n")
 	if err := os.WriteFile(target, content, 0o701); err != nil {
 		t.Fatal(err)
 	}
@@ -396,11 +398,11 @@ func TestManagedVersionPruningRetainsCurrentAndOneRollback(t *testing.T) {
 
 func TestUpdateReceiptDoesNotRewriteInstallState(t *testing.T) {
 	app := testApp(t)
-	state := State{
+	state := config.State{
 		RepoURL: "git@github.com:x2x3studio/hourglass.git", QueueBranch: "queue/00000000-0000-4000-8000-000000000000",
-		BasicMemoryProject: &BasicMemoryOwnership{ExternalID: "project-id", Path: app.Paths.Vault, Managed: true},
+		BasicMemoryProject: &config.BasicMemoryOwnership{ExternalID: "project-id", Path: app.Paths.Vault, Managed: true},
 	}
-	if err := app.saveState(state); err != nil {
+	if err := config.SaveState(app.Paths, state); err != nil {
 		t.Fatal(err)
 	}
 	before, err := os.ReadFile(app.Paths.State)
@@ -472,8 +474,8 @@ func TestLatestReleaseParsesAssetsAndSendsHeaders(t *testing.T) {
 func TestUpdateInstallsReleaseOverHTTP(t *testing.T) {
 	app := testApp(t)
 	tag := "v0.3.0"
-	assetName := executableAssetName()
-	binary := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\n" + tag + "\\n'\n")
+	assetName := config.AssetName()
+	binary := []byte("#!/bin/sh\nprintf '" + config.ProbeMarker + "\\n" + tag + "\\n'\n")
 	sum := sha256.Sum256(binary)
 	checksums := hex.EncodeToString(sum[:]) + "  " + assetName + "\n"
 
@@ -512,8 +514,8 @@ func TestUpdateInstallsReleaseOverHTTP(t *testing.T) {
 func TestUpdateRejectsChecksumMismatch(t *testing.T) {
 	app := testApp(t)
 	tag := "v0.3.0"
-	assetName := executableAssetName()
-	binary := []byte("#!/bin/sh\nprintf '" + stateProbeMarker + "\\n" + tag + "\\n'\n")
+	assetName := config.AssetName()
+	binary := []byte("#!/bin/sh\nprintf '" + config.ProbeMarker + "\\n" + tag + "\\n'\n")
 	wrongChecksums := strings.Repeat("0", 64) + "  " + assetName + "\n"
 
 	var base string

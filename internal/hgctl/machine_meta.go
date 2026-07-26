@@ -9,6 +9,8 @@ import (
 
 	"github.com/x2x3studio/hgctl/internal/gitx"
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 // machineMetaFile names the one tracked path a queue branch carries outside
@@ -41,7 +43,7 @@ type machineMeta struct {
 	HgctlVersion  string `json:"hgctl_version"`
 }
 
-func renderMachineMeta(id Identity) ([]byte, error) {
+func renderMachineMeta(id config.Identity) ([]byte, error) {
 	body, err := json.MarshalIndent(machineMeta{
 		SchemaVersion: 1,
 		MachineID:     id.ID,
@@ -81,7 +83,7 @@ func (a *App) revertQueueMachineMeta(ctx context.Context) error {
 // rather than a write: the scheduler calls it about once a minute, and a file
 // rewritten every time would bury the queue's real history - the event
 // captures - under commits that say nothing.
-func (a *App) upsertMachineMeta(ctx context.Context, id Identity) (bool, error) {
+func (a *App) upsertMachineMeta(ctx context.Context, id config.Identity) (bool, error) {
 	want, err := renderMachineMeta(id)
 	if err != nil {
 		return false, err

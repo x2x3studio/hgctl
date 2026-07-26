@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 // The hook subcommand is a retired-capture no-op: whatever a stale client
@@ -241,7 +243,7 @@ func TestSyncQueueFastForwardsThroughArchiveCommit(t *testing.T) {
 	pushArchiveCommit(t, origin, branch, consumed, "2026-03")
 	runGitTest(t, app.Paths.Queue, "fetch", "origin", "+refs/heads/"+branch+":refs/remotes/origin/"+branch)
 
-	state := State{QueueBranch: branch, RepoURL: origin}
+	state := config.State{QueueBranch: branch, RepoURL: origin}
 	if err := app.syncQueueUnlocked(testContext(t), state); err != nil {
 		t.Fatalf("clean archive fast-forward failed: %v", err)
 	}
@@ -289,7 +291,7 @@ func TestSyncQueueSelfHealsDivergedRemoteViaOutboxReplay(t *testing.T) {
 	pushArchiveCommit(t, origin, branch, consumed, "2026-03")
 	runGitTest(t, app.Paths.Queue, "fetch", "origin", "+refs/heads/"+branch+":refs/remotes/origin/"+branch)
 
-	state := State{QueueBranch: branch, RepoURL: origin}
+	state := config.State{QueueBranch: branch, RepoURL: origin}
 	if err := app.syncQueueUnlocked(testContext(t), state); err != nil {
 		t.Fatalf("diverged queue did not self-heal: %v", err)
 	}

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 // seedQueueRepo makes a real queue repository with machine.json committed, which
@@ -28,7 +30,7 @@ func seedQueueRepo(t *testing.T, app *App) {
 	git("init", "--quiet")
 	git("config", "user.name", "hgctl-test")
 	git("config", "user.email", "hgctl-test@example.invalid")
-	meta, err := renderMachineMeta(Identity{ID: "a943c6d2", Hostname: "Orange"})
+	meta, err := renderMachineMeta(config.Identity{ID: "a943c6d2", Hostname: "Orange"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +59,7 @@ func TestQueueGuardAcceptsAModifiedMachineMeta(t *testing.T) {
 	seedQueueRepo(t, app)
 	ctx := testContext(t)
 
-	meta, err := renderMachineMeta(Identity{ID: "a943c6d2", Hostname: "Renamed"})
+	meta, err := renderMachineMeta(config.Identity{ID: "a943c6d2", Hostname: "Renamed"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +113,7 @@ func TestInterruptedMachineMetaStageDoesNotWedgeTheQueue(t *testing.T) {
 	seedQueueRepo(t, app)
 	ctx := testContext(t)
 
-	bumped, err := renderMachineMeta(Identity{ID: "a943c6d2", Hostname: "Orange-v2"})
+	bumped, err := renderMachineMeta(config.Identity{ID: "a943c6d2", Hostname: "Orange-v2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +166,7 @@ func TestInterruptedFirstMachineMetaStageIsDropped(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	meta, err := renderMachineMeta(Identity{ID: "a943c6d2", Hostname: "Orange"})
+	meta, err := renderMachineMeta(config.Identity{ID: "a943c6d2", Hostname: "Orange"})
 	if err != nil {
 		t.Fatal(err)
 	}

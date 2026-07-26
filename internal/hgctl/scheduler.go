@@ -14,6 +14,8 @@ import (
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 const schedulerOwnership = "x2x3studio.hgctl.scheduler/v1"
@@ -30,7 +32,7 @@ func (a *App) writeSchedulerDefinition() error {
 	switch runtime.GOOS {
 	case "darwin":
 		dir := filepath.Join(a.Paths.Home, "Library", "LaunchAgents")
-		path := filepath.Join(dir, LaunchLabel+".plist")
+		path := filepath.Join(dir, config.LaunchLabel+".plist")
 		plist := launchAgent(stable, a.Paths.Data, a.Paths.Home, a.Paths.Vault)
 		if err := verifySchedulerFile(path, stable); err != nil {
 			return err
@@ -44,8 +46,8 @@ func (a *App) writeSchedulerDefinition() error {
 		return nil
 	case "linux":
 		dir := filepath.Join(a.Paths.Home, ".config", "systemd", "user")
-		service := filepath.Join(dir, LaunchLabel+".service")
-		timer := filepath.Join(dir, LaunchLabel+".timer")
+		service := filepath.Join(dir, config.LaunchLabel+".service")
+		timer := filepath.Join(dir, config.LaunchLabel+".timer")
 		pathValue := a.Paths.Bin + ":" + filepath.Join(a.Paths.Home, ".local", "bin") + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 		serviceBody := fmt.Sprintf("# X-HGCTL-Ownership=%s\n[Unit]\nDescription=Hourglass sync\n\n[Service]\nType=oneshot\nTimeoutStartSec=180\nEnvironment=\"PATH=%s\"\nEnvironment=\"HGCTL_HOME=%s\"\nEnvironment=\"HGCTL_DATA_DIR=%s\"\nEnvironment=\"HOURGLASS_VAULT=%s\"\nExecStart=%s sync --update\n", schedulerOwnership, systemdQuote(pathValue), systemdQuote(a.Paths.Home), systemdQuote(a.Paths.Data), systemdQuote(a.Paths.Vault), systemdEscape(stable))
 		timerBody := "# X-HGCTL-Ownership=" + schedulerOwnership + "\n[Unit]\nDescription=Run Hourglass sync every minute\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec=60s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
@@ -66,7 +68,7 @@ func (a *App) writeSchedulerDefinition() error {
 func (a *App) activateScheduler(ctx context.Context) error {
 	switch runtime.GOOS {
 	case "darwin":
-		path := filepath.Join(a.Paths.Home, "Library", "LaunchAgents", LaunchLabel+".plist")
+		path := filepath.Join(a.Paths.Home, "Library", "LaunchAgents", config.LaunchLabel+".plist")
 		domain := "gui/" + strconv.Itoa(os.Getuid())
 		_, _ = proc.Run(ctx, "", "launchctl", "bootout", domain, path)
 		_, err := proc.Run(ctx, "", "launchctl", "bootstrap", domain, path)
@@ -78,7 +80,7 @@ func (a *App) activateScheduler(ctx context.Context) error {
 		if _, err := proc.Run(ctx, "", "systemctl", "--user", "daemon-reload"); err != nil {
 			return err
 		}
-		_, err := proc.Run(ctx, "", "systemctl", "--user", "enable", "--now", LaunchLabel+".timer")
+		_, err := proc.Run(ctx, "", "systemctl", "--user", "enable", "--now", config.LaunchLabel+".timer")
 		return err
 	default:
 		return nil
@@ -124,7 +126,7 @@ func launchAgent(binary, data, home, vault string) string {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>` + LaunchLabel + `</string>
+  <key>Label</key><string>` + config.LaunchLabel + `</string>
   <key>ProgramArguments</key>
   <array>
     <string>` + escape(binary) + `</string>
@@ -200,7 +202,7 @@ func verifySchedulerFile(path, stable string) error {
 	marker := "X-HGCTL-Ownership=" + schedulerOwnership
 	switch {
 	case strings.HasSuffix(path, ".plist"):
-		identity := strings.Contains(text, "<key>Label</key><string>"+LaunchLabel+"</string>") &&
+		identity := strings.Contains(text, "<key>Label</key><string>"+config.LaunchLabel+"</string>") &&
 			strings.Contains(text, "<string>"+html.EscapeString(stable)+"</string>")
 		current := strings.Contains(text, "<key>HGCTL_SCHEDULER_OWNERSHIP</key><string>"+schedulerOwnership+"</string>")
 		previousMarker := strings.Contains(text, "<key>HGCTLOwnership</key><string>"+schedulerOwnership+"</string>")
@@ -252,10 +254,10 @@ func (a *App) verifySchedulerOwnership() error {
 func (a *App) schedulerPaths() []string {
 	switch runtime.GOOS {
 	case "darwin":
-		return []string{filepath.Join(a.Paths.Home, "Library", "LaunchAgents", LaunchLabel+".plist")}
+		return []string{filepath.Join(a.Paths.Home, "Library", "LaunchAgents", config.LaunchLabel+".plist")}
 	case "linux":
 		dir := filepath.Join(a.Paths.Home, ".config", "systemd", "user")
-		return []string{filepath.Join(dir, LaunchLabel+".service"), filepath.Join(dir, LaunchLabel+".timer")}
+		return []string{filepath.Join(dir, config.LaunchLabel+".service"), filepath.Join(dir, config.LaunchLabel+".timer")}
 	default:
 		return nil
 	}
@@ -265,23 +267,23 @@ func (a *App) quiesceScheduler(ctx context.Context) error {
 	switch runtime.GOOS {
 	case "darwin":
 		domain := "gui/" + strconv.Itoa(os.Getuid())
-		target := domain + "/" + LaunchLabel
+		target := domain + "/" + config.LaunchLabel
 		if _, err := proc.Run(ctx, "", "launchctl", "bootout", target); err != nil && !ignorableSchedulerStopError(err) {
 			return err
 		}
 		if _, err := proc.Run(ctx, "", "launchctl", "print", target); err == nil {
-			return fmt.Errorf("LaunchAgent %s is still loaded", LaunchLabel)
+			return fmt.Errorf("LaunchAgent %s is still loaded", config.LaunchLabel)
 		} else if !ignorableSchedulerStopError(err) {
 			return fmt.Errorf("verify LaunchAgent stopped: %w", err)
 		}
 	case "linux":
-		if _, err := proc.Run(ctx, "", "systemctl", "--user", "disable", "--now", LaunchLabel+".timer"); err != nil && !ignorableSchedulerStopError(err) {
+		if _, err := proc.Run(ctx, "", "systemctl", "--user", "disable", "--now", config.LaunchLabel+".timer"); err != nil && !ignorableSchedulerStopError(err) {
 			return err
 		}
-		if _, err := proc.Run(ctx, "", "systemctl", "--user", "stop", LaunchLabel+".service"); err != nil && !ignorableSchedulerStopError(err) {
+		if _, err := proc.Run(ctx, "", "systemctl", "--user", "stop", config.LaunchLabel+".service"); err != nil && !ignorableSchedulerStopError(err) {
 			return err
 		}
-		for _, name := range []string{LaunchLabel + ".timer", LaunchLabel + ".service"} {
+		for _, name := range []string{config.LaunchLabel + ".timer", config.LaunchLabel + ".service"} {
 			inactive, err := systemdUnitInactive(ctx, name)
 			if err != nil {
 				return err
@@ -316,13 +318,13 @@ func (a *App) removeSchedulerFiles(ctx context.Context) error {
 	}
 	switch runtime.GOOS {
 	case "darwin":
-		path := filepath.Join(a.Paths.Home, "Library", "LaunchAgents", LaunchLabel+".plist")
+		path := filepath.Join(a.Paths.Home, "Library", "LaunchAgents", config.LaunchLabel+".plist")
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	case "linux":
 		dir := filepath.Join(a.Paths.Home, ".config", "systemd", "user")
-		for _, name := range []string{LaunchLabel + ".service", LaunchLabel + ".timer"} {
+		for _, name := range []string{config.LaunchLabel + ".service", config.LaunchLabel + ".timer"} {
 			if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
@@ -360,11 +362,11 @@ func (a *App) schedulerLoaded(ctx context.Context) bool {
 	defer cancel()
 	switch runtime.GOOS {
 	case "darwin":
-		domain := "gui/" + strconv.Itoa(os.Getuid()) + "/" + LaunchLabel
+		domain := "gui/" + strconv.Itoa(os.Getuid()) + "/" + config.LaunchLabel
 		_, err := proc.Run(ctx, "", "launchctl", "print", domain)
 		return err == nil
 	case "linux":
-		if _, err := proc.Run(ctx, "", "systemctl", "--user", "is-active", "--quiet", LaunchLabel+".timer"); err != nil {
+		if _, err := proc.Run(ctx, "", "systemctl", "--user", "is-active", "--quiet", config.LaunchLabel+".timer"); err != nil {
 			return false
 		}
 		out, err := proc.Run(ctx, "", "loginctl", "show-user", strconv.Itoa(os.Getuid()), "--property=Linger", "--value")

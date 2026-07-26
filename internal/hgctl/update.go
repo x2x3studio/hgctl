@@ -19,6 +19,8 @@ import (
 	"github.com/x2x3studio/hgctl/internal/fsx"
 
 	"github.com/x2x3studio/hgctl/internal/proc"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 const (
@@ -85,7 +87,7 @@ func (a *App) update(ctx context.Context, force bool) error {
 		if !newer {
 			return nil
 		}
-		binaryName := executableAssetName()
+		binaryName := config.AssetName()
 		var binaryAsset, checksumAsset releaseAsset
 		for _, asset := range rel.Assets {
 			switch asset.Name {
@@ -265,10 +267,10 @@ func (a *App) verifyCandidateVersion(parent context.Context, path, tag string) e
 	cmd := exec.CommandContext(ctx, path, "version")
 	cmd.Env = os.Environ()
 	for key, value := range map[string]string{
-		"HGCTL_HOME":          a.Paths.Home,
-		"HGCTL_DATA_DIR":      a.Paths.Data,
-		"HOURGLASS_VAULT":     a.Paths.Vault,
-		stateProbeEnvironment: "1",
+		"HGCTL_HOME":      a.Paths.Home,
+		"HGCTL_DATA_DIR":  a.Paths.Data,
+		"HOURGLASS_VAULT": a.Paths.Vault,
+		config.ProbeEnv:   "1",
 	} {
 		cmd.Env = setEnvironment(cmd.Env, key, value)
 	}
@@ -295,7 +297,7 @@ func (a *App) verifyCandidateVersion(parent context.Context, path, tag string) e
 	if waitErr != nil {
 		return fmt.Errorf("run release candidate compatibility probe: %w (output suppressed)", waitErr)
 	}
-	want := stateProbeMarker + "\n" + tag + "\n"
+	want := config.ProbeMarker + "\n" + tag + "\n"
 	if string(output) != want {
 		return fmt.Errorf("release candidate did not return the compatibility marker and expected exact tag %q", tag)
 	}

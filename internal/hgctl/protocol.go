@@ -157,13 +157,3 @@ func validLowerHex(value string, length int) bool {
 	}
 	return true
 }
-
-func validMachineID(value string) bool {
-	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' || value[14] != '4' {
-		return false
-	}
-	if value[19] != '8' && value[19] != '9' && value[19] != 'a' && value[19] != 'b' {
-		return false
-	}
-	return validLowerHex(value[:8]+value[9:13]+value[14:18]+value[19:23]+value[24:], 32)
-}

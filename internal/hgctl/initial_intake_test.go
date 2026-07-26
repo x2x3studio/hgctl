@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/x2x3studio/hgctl/internal/config"
 )
 
 // A first install has this machine's entire history waiting, and the scheduled
@@ -15,7 +17,7 @@ import (
 func TestFirstInstallBackfillsTheWholeHistory(t *testing.T) {
 	app := testApp(t)
 	t.Setenv("HOME", app.Paths.Home)
-	if err := app.ensureDataDirs(); err != nil {
+	if err := app.Paths.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -27,7 +29,7 @@ func TestFirstInstallBackfillsTheWholeHistory(t *testing.T) {
 				`"message":{"content":"a real question, long enough to clear the minimum user text bar"}}`)
 	}
 
-	id, err := app.loadIdentity()
+	id, err := config.LoadIdentity(app.Paths, app.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +61,7 @@ func TestFirstInstallBackfillsTheWholeHistory(t *testing.T) {
 func TestReinstallDoesNotRebackfill(t *testing.T) {
 	app := testApp(t)
 	t.Setenv("HOME", app.Paths.Home)
-	if err := app.ensureDataDirs(); err != nil {
+	if err := app.Paths.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
 	if err := app.saveIngestedSessions(map[string]ingestMark{
