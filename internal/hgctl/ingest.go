@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
 )
 
 const (
@@ -987,5 +989,5 @@ func normalizeIngestKey(key string) string {
 }
 
 func (a *App) saveIngestedSessions(marks map[string]ingestMark) error {
-	return writeJSONAtomic(a.ingestedSessionsPath(), marks, 0o600)
+	return fsx.WriteJSON(a.ingestedSessionsPath(), marks, 0o600)
 }

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
 )
 
 const (
@@ -87,10 +89,10 @@ func (e rawEvent) marshal() []byte {
 	var b strings.Builder
 	b.WriteString("---\n")
 	fmt.Fprintf(&b, "captured_at: %s\n", e.CapturedAt.UTC().Format(time.RFC3339))
-	fmt.Fprintf(&b, "client: %s\n", boundString(e.Client, MaxClient))
+	fmt.Fprintf(&b, "client: %s\n", fsx.Bound(e.Client, MaxClient))
 	fmt.Fprintf(&b, "machine: %s\n", e.Machine)
 	if e.Hostname != "" {
-		fmt.Fprintf(&b, "hostname: %s\n", boundString(e.Hostname, MaxMachineHostname))
+		fmt.Fprintf(&b, "hostname: %s\n", fsx.Bound(e.Hostname, MaxMachineHostname))
 	}
 	if e.Session != "" {
 		fmt.Fprintf(&b, "session: %s\n", frontmatterValue(e.Session, MaxMetaField))
@@ -115,7 +117,7 @@ func (e rawEvent) marshal() []byte {
 func frontmatterValue(value string, limit int) string {
 	value = strings.ReplaceAll(value, "\r", " ")
 	value = strings.ReplaceAll(value, "\n", " ")
-	return boundString(strings.TrimSpace(value), limit)
+	return fsx.Bound(strings.TrimSpace(value), limit)
 }
 
 func randHex(n int) string {
@@ -138,18 +140,6 @@ func boundText(value string) string {
 		return value
 	}
 	b := []byte(value)[:MaxTextBytes]
-	for len(b) > 0 && !utf8.Valid(b) {
-		b = b[:len(b)-1]
-	}
-	return string(b)
-}
-
-func boundString(value string, limit int) string {
-	value = strings.ToValidUTF8(value, "�")
-	if len(value) <= limit {
-		return value
-	}
-	b := []byte(value)[:limit]
 	for len(b) > 0 && !utf8.Valid(b) {
 		b = b[:len(b)-1]
 	}

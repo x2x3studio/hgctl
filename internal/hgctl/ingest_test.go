@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
 )
 
 func writeSessionFile(t *testing.T, path, content string) {
@@ -203,7 +205,7 @@ func TestReenqueueWithDedupCollapsesInsteadOfDuplicating(t *testing.T) {
 
 func TestLoadIngestedSessionsMigratesLegacyLedger(t *testing.T) {
 	app := testApp(t)
-	if err := writeJSONAtomic(app.ingestedSessionsPath(), []string{"legacy-claude", "codex:known"}, 0o600); err != nil {
+	if err := fsx.WriteJSON(app.ingestedSessionsPath(), []string{"legacy-claude", "codex:known"}, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	marks, err := app.loadIngestedSessions()

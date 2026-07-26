@@ -15,6 +15,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 const (
@@ -118,22 +122,22 @@ func (a *App) update(ctx context.Context, force bool) error {
 		return err
 	}
 	if force {
-		return withFileLockWait(ctx, a.Paths.UpdateLock, updateLocked)
+		return fsx.WithLockWait(ctx, a.Paths.UpdateLock, updateLocked)
 	}
-	return withFileLock(a.Paths.UpdateLock, updateLocked)
+	return fsx.WithLock(a.Paths.UpdateLock, updateLocked)
 }
 
 func (a *App) loadUpdateCheck() (updateCheck, error) {
 	var check updateCheck
-	if err := readJSON(a.Paths.UpdateCheck, &check); err != nil {
+	if err := fsx.ReadJSON(a.Paths.UpdateCheck, &check); err != nil {
 		return updateCheck{}, err
 	}
-	migrated, err := migrateSchemaVersion(a.Paths.UpdateCheck, &check.SchemaVersion, updateCheckSchemaVersion)
+	migrated, err := fsx.MigrateSchema(a.Paths.UpdateCheck, &check.SchemaVersion, updateCheckSchemaVersion)
 	if err != nil {
 		return updateCheck{}, err
 	}
 	if migrated {
-		if err := writeJSONAtomic(a.Paths.UpdateCheck, check, 0o600); err != nil {
+		if err := fsx.WriteJSON(a.Paths.UpdateCheck, check, 0o600); err != nil {
 			return updateCheck{}, err
 		}
 	}
@@ -142,7 +146,7 @@ func (a *App) loadUpdateCheck() (updateCheck, error) {
 
 func (a *App) saveUpdateCheck(check updateCheck) error {
 	check.SchemaVersion = updateCheckSchemaVersion
-	return writeJSONAtomic(a.Paths.UpdateCheck, check, 0o600)
+	return fsx.WriteJSON(a.Paths.UpdateCheck, check, 0o600)
 }
 
 func (a *App) installReleaseBinary(ctx context.Context, tag string, content []byte) error {
@@ -272,8 +276,8 @@ func (a *App) verifyCandidateVersion(parent context.Context, path, tag string) e
 	if err != nil {
 		return err
 	}
-	stderr := boundedCommandOutput{limit: 64 << 10}
-	cmd.Stderr = &stderr
+	stderr := proc.NewBoundedWriter(64 << 10)
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start release candidate: %w", err)
 	}
@@ -285,7 +289,7 @@ func (a *App) verifyCandidateVersion(parent context.Context, path, tag string) e
 	if readErr != nil {
 		return fmt.Errorf("read release candidate version: %w", readErr)
 	}
-	if stderr.truncated {
+	if stderr.Truncated() {
 		return errors.New("release candidate compatibility probe exceeded its stderr limit")
 	}
 	if waitErr != nil {

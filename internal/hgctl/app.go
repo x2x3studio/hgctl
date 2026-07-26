@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
 )
 
 func (a *App) Run(ctx context.Context, args []string) int {
@@ -112,8 +114,8 @@ func (a *App) runInstall(ctx context.Context, args []string) error {
 	if fs.NArg() != 0 {
 		return errors.New("install accepts flags only")
 	}
-	return withFileLockWait(ctx, a.Paths.LifecycleLock, func() error {
-		return withFileLockWait(ctx, a.Paths.UpdateLock, func() error {
+	return fsx.WithLockWait(ctx, a.Paths.LifecycleLock, func() error {
+		return fsx.WithLockWait(ctx, a.Paths.UpdateLock, func() error {
 			return a.install(ctx, *repo)
 		})
 	})
@@ -128,7 +130,7 @@ func (a *App) install(ctx context.Context, repo string) error {
 		return err
 	}
 	state := State{RepoURL: repo, QueueBranch: "queue/" + id.ID}
-	if err := withFileLockWait(ctx, a.Paths.SyncLock, func() error {
+	if err := fsx.WithLockWait(ctx, a.Paths.SyncLock, func() error {
 		if previous, err := a.loadState(); err == nil {
 			if previous.RepoURL != "" && previous.RepoURL != state.RepoURL {
 				return fmt.Errorf("refusing to replace configured repository %s with %s", previous.RepoURL, state.RepoURL)

@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/gitx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 const (
@@ -17,7 +20,7 @@ const (
 )
 
 func (a *App) initGit(ctx context.Context, state State) error {
-	if !commandExists("git") {
+	if !proc.Exists("git") {
 		return errors.New("git is required")
 	}
 	created := false
@@ -30,7 +33,7 @@ func (a *App) initGit(ctx context.Context, state State) error {
 		if err := os.MkdirAll(filepath.Dir(a.Paths.Control), 0o700); err != nil {
 			return err
 		}
-		if _, err := runCommand(ctx, "", "git", "clone", "--branch", "main", "--single-branch", state.RepoURL, a.Paths.Control); err != nil {
+		if _, err := proc.Run(ctx, "", "git", "clone", "--branch", "main", "--single-branch", state.RepoURL, a.Paths.Control); err != nil {
 			return err
 		}
 		created = true
@@ -38,10 +41,10 @@ func (a *App) initGit(ctx context.Context, state State) error {
 		return err
 	}
 	if created {
-		if _, err := runCommand(ctx, a.Paths.Control, "git", "config", "--local", controlManagedKey, "true"); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Control, "git", "config", "--local", controlManagedKey, "true"); err != nil {
 			return err
 		}
-		if _, err := runCommand(ctx, a.Paths.Control, "git", "config", "--local", controlOriginKey, state.RepoURL); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Control, "git", "config", "--local", controlOriginKey, state.RepoURL); err != nil {
 			return err
 		}
 	} else if err := a.verifyControlCheckout(ctx, state.RepoURL); err != nil {
@@ -54,7 +57,7 @@ func (a *App) initGit(ctx context.Context, state State) error {
 		{"user.name", "chinaboard"},
 		{"user.email", "chinaboard@gmail.com"},
 	} {
-		if _, err := runCommand(ctx, a.Paths.Control, "git", "config", pair[0], pair[1]); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Control, "git", "config", pair[0], pair[1]); err != nil {
 			return err
 		}
 	}
@@ -64,7 +67,7 @@ func (a *App) initGit(ctx context.Context, state State) error {
 	if err := a.fetchEndpointRefs(ctx, state); err != nil {
 		return err
 	}
-	if !gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/shared") {
+	if !gitx.RefExists(ctx, a.Paths.Control, "refs/remotes/origin/shared") {
 		return errors.New("remote branch shared does not exist")
 	}
 	if err := a.ensureWorktree(ctx, a.Paths.Shared, "shared", "origin/shared"); err != nil {
@@ -80,19 +83,19 @@ func (a *App) initGit(ctx context.Context, state State) error {
 }
 
 func (a *App) verifyControlCheckout(ctx context.Context, repoURL string) error {
-	top, err := runCommand(ctx, a.Paths.Control, "git", "rev-parse", "--show-toplevel")
-	if err != nil || canonicalPath(strings.TrimSpace(top)) != canonicalPath(a.Paths.Control) {
+	top, err := proc.Run(ctx, a.Paths.Control, "git", "rev-parse", "--show-toplevel")
+	if err != nil || fsx.Canonical(strings.TrimSpace(top)) != fsx.Canonical(a.Paths.Control) {
 		return fmt.Errorf("control path is not an owned hgctl checkout: %s", a.Paths.Control)
 	}
-	managed, err := runCommand(ctx, a.Paths.Control, "git", "config", "--local", "--get", controlManagedKey)
+	managed, err := proc.Run(ctx, a.Paths.Control, "git", "config", "--local", "--get", controlManagedKey)
 	if err != nil || strings.TrimSpace(managed) != "true" {
 		return fmt.Errorf("control checkout has no hgctl ownership marker: %s", a.Paths.Control)
 	}
-	markedOrigin, err := runCommand(ctx, a.Paths.Control, "git", "config", "--local", "--get", controlOriginKey)
+	markedOrigin, err := proc.Run(ctx, a.Paths.Control, "git", "config", "--local", "--get", controlOriginKey)
 	if err != nil || strings.TrimSpace(markedOrigin) != repoURL {
 		return fmt.Errorf("control checkout origin marker does not match %s", repoURL)
 	}
-	origin, err := runCommand(ctx, a.Paths.Control, "git", "remote", "get-url", "origin")
+	origin, err := proc.Run(ctx, a.Paths.Control, "git", "remote", "get-url", "origin")
 	if err != nil || strings.TrimSpace(origin) != repoURL {
 		return fmt.Errorf("control checkout origin does not match %s", repoURL)
 	}
@@ -101,18 +104,18 @@ func (a *App) verifyControlCheckout(ctx context.Context, repoURL string) error {
 
 func (a *App) ensureWorktree(ctx context.Context, path, branch, start string) error {
 	if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
-		controlCommon, err := gitCommonDir(ctx, a.Paths.Control)
+		controlCommon, err := gitx.CommonDir(ctx, a.Paths.Control)
 		if err != nil {
 			return err
 		}
-		worktreeCommon, err := gitCommonDir(ctx, path)
+		worktreeCommon, err := gitx.CommonDir(ctx, path)
 		if err != nil {
 			return err
 		}
 		if controlCommon != worktreeCommon {
 			return fmt.Errorf("worktree %s belongs to another repository", path)
 		}
-		current, err := runCommand(ctx, path, "git", "branch", "--show-current")
+		current, err := proc.Run(ctx, path, "git", "branch", "--show-current")
 		if err != nil {
 			return err
 		}
@@ -126,32 +129,17 @@ func (a *App) ensureWorktree(ctx context.Context, path, branch, start string) er
 	} else if exists {
 		return fmt.Errorf("refusing to replace non-empty path %s", path)
 	}
-	if !gitRefExists(ctx, a.Paths.Control, "refs/heads/"+branch) {
+	if !gitx.RefExists(ctx, a.Paths.Control, "refs/heads/"+branch) {
 		args := []string{"branch", "--no-track", branch, start}
-		if _, err := runCommand(ctx, a.Paths.Control, "git", args...); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Control, "git", args...); err != nil {
 			return err
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	_, err := runCommand(ctx, a.Paths.Control, "git", "worktree", "add", path, branch)
+	_, err := proc.Run(ctx, a.Paths.Control, "git", "worktree", "add", path, branch)
 	return err
-}
-
-func gitCommonDir(ctx context.Context, path string) (string, error) {
-	out, err := runCommand(ctx, path, "git", "rev-parse", "--git-common-dir")
-	if err != nil {
-		return "", err
-	}
-	common := strings.TrimSpace(out)
-	if !filepath.IsAbs(common) {
-		common = filepath.Join(path, common)
-	}
-	if resolved, err := filepath.EvalSymlinks(common); err == nil {
-		common = resolved
-	}
-	return filepath.Clean(common), nil
 }
 
 // ensureQueueBranch guarantees a local queue branch exists before the queue
@@ -159,10 +147,10 @@ func gitCommonDir(ctx context.Context, path string) (string, error) {
 // already carries one; otherwise it self-seeds an orphan queue branch, so
 // onboarding never depends on anything being present server-side.
 func (a *App) ensureQueueBranch(ctx context.Context, branch string) error {
-	if gitRefExists(ctx, a.Paths.Control, "refs/heads/"+branch) {
+	if gitx.RefExists(ctx, a.Paths.Control, "refs/heads/"+branch) {
 		return nil
 	}
-	if gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+branch) {
+	if gitx.RefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+branch) {
 		return nil
 	}
 	return a.seedOrphanQueueBranch(ctx, branch)
@@ -184,34 +172,28 @@ func (a *App) seedOrphanQueueBranch(ctx context.Context, branch string) error {
 	if err := os.WriteFile(placeholder, nil, 0o600); err != nil {
 		return err
 	}
-	blob, err := runCommand(ctx, a.Paths.Control, "git", "hash-object", "-w", placeholder)
+	blob, err := proc.Run(ctx, a.Paths.Control, "git", "hash-object", "-w", placeholder)
 	if err != nil {
 		return err
 	}
 	indexEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(scratch, "index")}
-	if _, err := runCommandEnv(ctx, a.Paths.Control, indexEnv, "git", "update-index", "--add",
+	if _, err := proc.RunEnv(ctx, a.Paths.Control, indexEnv, "git", "update-index", "--add",
 		"--cacheinfo", "100644,"+strings.TrimSpace(blob)+",events/.gitkeep"); err != nil {
 		return err
 	}
-	tree, err := runCommandEnv(ctx, a.Paths.Control, indexEnv, "git", "write-tree")
+	tree, err := proc.RunEnv(ctx, a.Paths.Control, indexEnv, "git", "write-tree")
 	if err != nil {
 		return err
 	}
-	commit, err := runCommand(ctx, a.Paths.Control, "git", "commit-tree", strings.TrimSpace(tree), "-m", "Seed machine queue")
+	commit, err := proc.Run(ctx, a.Paths.Control, "git", "commit-tree", strings.TrimSpace(tree), "-m", "Seed machine queue")
 	if err != nil {
 		return err
 	}
-	if _, err := runCommand(ctx, a.Paths.Control, "git", "update-ref", "refs/heads/"+branch, strings.TrimSpace(commit)); err != nil {
+	if _, err := proc.Run(ctx, a.Paths.Control, "git", "update-ref", "refs/heads/"+branch, strings.TrimSpace(commit)); err != nil {
 		return err
 	}
-	_, err = runCommand(ctx, a.Paths.Control, "git", "push", "origin", "refs/heads/"+branch+":refs/heads/"+branch)
+	_, err = proc.Run(ctx, a.Paths.Control, "git", "push", "origin", "refs/heads/"+branch+":refs/heads/"+branch)
 	return err
-}
-
-func gitRefExists(ctx context.Context, dir, ref string) bool {
-	cmd := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", ref)
-	cmd.Dir = dir
-	return cmd.Run() == nil
 }
 
 // fetchEndpointRefs updates the refs this endpoint reads: the control branch,
@@ -228,10 +210,10 @@ func (a *App) fetchEndpointRefs(ctx context.Context, state State) error {
 		"+refs/heads/main:refs/remotes/origin/main",
 		"+refs/heads/shared:refs/remotes/origin/shared",
 	}
-	exists := gitRefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+state.QueueBranch)
+	exists := gitx.RefExists(ctx, a.Paths.Control, "refs/remotes/origin/"+state.QueueBranch)
 	if !exists {
 		var err error
-		exists, err = remoteBranchExists(ctx, a.Paths.Control, state.QueueBranch)
+		exists, err = gitx.RemoteBranchExists(ctx, a.Paths.Control, state.QueueBranch)
 		if err != nil {
 			return err
 		}
@@ -240,23 +222,8 @@ func (a *App) fetchEndpointRefs(ctx context.Context, state State) error {
 		refspecs = append(refspecs, "+refs/heads/"+state.QueueBranch+":refs/remotes/origin/"+state.QueueBranch)
 	}
 	args := append([]string{"fetch", "--prune", "origin"}, refspecs...)
-	_, err := runCommand(ctx, a.Paths.Control, "git", args...)
+	_, err := proc.Run(ctx, a.Paths.Control, "git", args...)
 	return err
-}
-
-func remoteBranchExists(ctx context.Context, dir, branch string) (bool, error) {
-	_, err := runCommand(ctx, dir, "git", "ls-remote", "--exit-code", "--heads", "origin", branch)
-	if err == nil {
-		return true, nil
-	}
-	if errors.Is(err, errCommandOutputLimit) {
-		return false, err
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
-		return false, nil
-	}
-	return false, fmt.Errorf("git ls-remote: %w", err)
 }
 
 func directoryNotEmpty(path string) (bool, error) {
@@ -292,7 +259,7 @@ func (a *App) sync(ctx context.Context) error {
 	// without surfacing anything - sync exited 0 having emitted nothing, for 46
 	// hours, while the files kept growing.
 	syncCtx, cancel := context.WithTimeout(ctx, syncTimeout)
-	coreErr := withFileLock(a.Paths.SyncLock, func() error {
+	coreErr := fsx.WithLock(a.Paths.SyncLock, func() error {
 		state, err := a.loadState()
 		if err != nil {
 			return err
@@ -359,23 +326,23 @@ func (a *App) syncSharedUnlocked(ctx context.Context) error {
 	if _, err := os.Stat(filepath.Join(a.Paths.Shared, ".git")); err != nil {
 		return nil
 	}
-	status, err := runCommand(ctx, a.Paths.Shared, "git", "status", "--porcelain")
+	status, err := proc.Run(ctx, a.Paths.Shared, "git", "status", "--porcelain")
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(status) != "" {
 		return errors.New("shared worktree is dirty; refusing automatic merge")
 	}
-	remote, err := runCommand(ctx, a.Paths.Shared, "git", "rev-parse", "origin/shared")
+	remote, err := proc.Run(ctx, a.Paths.Shared, "git", "rev-parse", "origin/shared")
 	if err != nil {
 		return err
 	}
-	ancestor, err := gitIsAncestor(ctx, a.Paths.Shared, "HEAD", "origin/shared")
+	ancestor, err := gitx.IsAncestor(ctx, a.Paths.Shared, "HEAD", "origin/shared")
 	if err != nil {
 		return err
 	}
 	if ancestor {
-		if _, err := runCommand(ctx, a.Paths.Shared, "git", "merge", "--ff-only", "origin/shared"); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Shared, "git", "merge", "--ff-only", "origin/shared"); err != nil {
 			return err
 		}
 	} else {
@@ -385,11 +352,11 @@ func (a *App) syncSharedUnlocked(ctx context.Context) error {
 		// origin/shared instead of wedging every future sync (which would freeze
 		// reindex and leave recall permanently stale). The dirty guard above still
 		// protects any local uncommitted changes from being discarded.
-		if _, err := runCommand(ctx, a.Paths.Shared, "git", "reset", "--hard", "origin/shared"); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Shared, "git", "reset", "--hard", "origin/shared"); err != nil {
 			return err
 		}
 	}
-	head, err := runCommand(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
+	head, err := proc.Run(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return err
 	}
@@ -400,18 +367,3 @@ func (a *App) syncSharedUnlocked(ctx context.Context) error {
 }
 
 // mirrorProductToVault lives in vault_mirror.go.
-
-func gitIsAncestor(ctx context.Context, dir, ancestor, descendant string) (bool, error) {
-	_, err := runCommand(ctx, dir, "git", "merge-base", "--is-ancestor", ancestor, descendant)
-	if err == nil {
-		return true, nil
-	}
-	if errors.Is(err, errCommandOutputLimit) {
-		return false, err
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		return false, nil
-	}
-	return false, fmt.Errorf("git merge-base --is-ancestor: %w", err)
-}

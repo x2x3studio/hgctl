@@ -1,18 +1,16 @@
 package hgctl
 
 import (
-	"bytes"
-	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
 )
 
 const (
@@ -28,17 +26,7 @@ const (
 	stateProbeEnvironment                = "HGCTL_INTERNAL_STATE_PROBE"
 )
 
-const (
-	defaultCommandOutputLimit     = 1 << 20
-	gitCommandOutputLimit         = 8 << 20
-	basicMemoryCommandOutputLimit = 4 << 20
-)
-
 var Version = "v0.2.0"
-
-var errUnsupportedSchemaVersion = errors.New("unsupported persisted schema version")
-
-var errCommandOutputLimit = errors.New("subprocess output limit exceeded")
 
 type Paths struct {
 	Home          string
@@ -157,37 +145,25 @@ func New(in io.Reader, out, errOut io.Writer) (*App, error) {
 // persisted schema while merely checking compatibility.
 func (a *App) probePersistedStateCompatibility() error {
 	var identity Identity
-	if exists, err := probeJSONSchema(a.Paths.Identity, &identity, &identity.SchemaVersion, identitySchemaVersion); err != nil {
+	if exists, err := fsx.ProbeSchema(a.Paths.Identity, &identity, &identity.SchemaVersion, identitySchemaVersion); err != nil {
 		return err
 	} else if exists && !validMachineID(identity.ID) {
 		return errors.New("identity.json has an invalid machine id")
 	}
 
 	var state State
-	if _, err := probeJSONSchema(a.Paths.State, &state, &state.SchemaVersion, stateSchemaVersion); err != nil {
+	if _, err := fsx.ProbeSchema(a.Paths.State, &state, &state.SchemaVersion, stateSchemaVersion); err != nil {
 		return err
 	}
 	var receipt BasicMemoryIndexReceipt
-	if _, err := probeJSONSchema(a.Paths.IndexedSHA, &receipt, &receipt.SchemaVersion, basicMemoryIndexReceiptSchemaVersion); err != nil {
+	if _, err := fsx.ProbeSchema(a.Paths.IndexedSHA, &receipt, &receipt.SchemaVersion, basicMemoryIndexReceiptSchemaVersion); err != nil {
 		return err
 	}
 	var check updateCheck
-	if _, err := probeJSONSchema(a.Paths.UpdateCheck, &check, &check.SchemaVersion, updateCheckSchemaVersion); err != nil {
+	if _, err := fsx.ProbeSchema(a.Paths.UpdateCheck, &check, &check.SchemaVersion, updateCheckSchemaVersion); err != nil {
 		return err
 	}
 	return nil
-}
-
-func probeJSONSchema(path string, dst any, version *int, current int) (bool, error) {
-	if err := readJSON(path, dst); errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	} else if err != nil {
-		return false, err
-	}
-	if _, err := migrateSchemaVersion(path, version, current); err != nil {
-		return true, err
-	}
-	return true, nil
 }
 
 func (a *App) ensureDataDirs() error {
@@ -208,7 +184,7 @@ func (a *App) loadIdentity() (Identity, error) {
 		host = "unknown"
 	}
 	var id Identity
-	if err := readJSON(a.Paths.Identity, &id); err != nil {
+	if err := fsx.ReadJSON(a.Paths.Identity, &id); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return Identity{}, err
 		}
@@ -218,12 +194,12 @@ func (a *App) loadIdentity() (Identity, error) {
 			return Identity{}, err
 		}
 		id = Identity{SchemaVersion: identitySchemaVersion, ID: machineID, Hostname: host, CreatedAt: now, UpdatedAt: now}
-		if err := writeJSONAtomic(a.Paths.Identity, id, 0o600); err != nil {
+		if err := fsx.WriteJSON(a.Paths.Identity, id, 0o600); err != nil {
 			return Identity{}, err
 		}
 		return id, nil
 	}
-	migrated, err := migrateSchemaVersion(a.Paths.Identity, &id.SchemaVersion, identitySchemaVersion)
+	migrated, err := fsx.MigrateSchema(a.Paths.Identity, &id.SchemaVersion, identitySchemaVersion)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -237,7 +213,7 @@ func (a *App) loadIdentity() (Identity, error) {
 		changed = true
 	}
 	if changed {
-		if err := writeJSONAtomic(a.Paths.Identity, id, 0o600); err != nil {
+		if err := fsx.WriteJSON(a.Paths.Identity, id, 0o600); err != nil {
 			return Identity{}, err
 		}
 	}
@@ -246,15 +222,15 @@ func (a *App) loadIdentity() (Identity, error) {
 
 func (a *App) loadState() (State, error) {
 	var state State
-	if err := readJSON(a.Paths.State, &state); err != nil {
+	if err := fsx.ReadJSON(a.Paths.State, &state); err != nil {
 		return State{}, err
 	}
-	migrated, err := migrateSchemaVersion(a.Paths.State, &state.SchemaVersion, stateSchemaVersion)
+	migrated, err := fsx.MigrateSchema(a.Paths.State, &state.SchemaVersion, stateSchemaVersion)
 	if err != nil {
 		return State{}, err
 	}
 	if migrated {
-		if err := writeJSONAtomic(a.Paths.State, state, 0o600); err != nil {
+		if err := fsx.WriteJSON(a.Paths.State, state, 0o600); err != nil {
 			return State{}, err
 		}
 	}
@@ -263,20 +239,20 @@ func (a *App) loadState() (State, error) {
 
 func (a *App) saveState(state State) error {
 	state.SchemaVersion = stateSchemaVersion
-	return writeJSONAtomic(a.Paths.State, state, 0o600)
+	return fsx.WriteJSON(a.Paths.State, state, 0o600)
 }
 
 func (a *App) loadBasicMemoryIndexReceipt() (BasicMemoryIndexReceipt, error) {
 	var receipt BasicMemoryIndexReceipt
-	if err := readJSON(a.Paths.IndexedSHA, &receipt); err != nil {
+	if err := fsx.ReadJSON(a.Paths.IndexedSHA, &receipt); err != nil {
 		return BasicMemoryIndexReceipt{}, err
 	}
-	migrated, err := migrateSchemaVersion(a.Paths.IndexedSHA, &receipt.SchemaVersion, basicMemoryIndexReceiptSchemaVersion)
+	migrated, err := fsx.MigrateSchema(a.Paths.IndexedSHA, &receipt.SchemaVersion, basicMemoryIndexReceiptSchemaVersion)
 	if err != nil {
 		return BasicMemoryIndexReceipt{}, err
 	}
 	if migrated {
-		if err := writeJSONAtomic(a.Paths.IndexedSHA, receipt, 0o600); err != nil {
+		if err := fsx.WriteJSON(a.Paths.IndexedSHA, receipt, 0o600); err != nil {
 			return BasicMemoryIndexReceipt{}, err
 		}
 	}
@@ -285,77 +261,7 @@ func (a *App) loadBasicMemoryIndexReceipt() (BasicMemoryIndexReceipt, error) {
 
 func (a *App) saveBasicMemoryIndexReceipt(receipt BasicMemoryIndexReceipt) error {
 	receipt.SchemaVersion = basicMemoryIndexReceiptSchemaVersion
-	return writeJSONAtomic(a.Paths.IndexedSHA, receipt, 0o600)
-}
-
-func migrateSchemaVersion(path string, version *int, current int) (bool, error) {
-	switch *version {
-	case 0:
-		if current != 1 {
-			return false, fmt.Errorf("%w: %s requires an explicit migration from the legacy schema to %d", errUnsupportedSchemaVersion, path, current)
-		}
-		*version = 1
-		return true, nil
-	case current:
-		return false, nil
-	default:
-		return false, fmt.Errorf("%w: %s has unsupported schema_version %d; current is %d", errUnsupportedSchemaVersion, path, *version, current)
-	}
-}
-
-func readJSON(path string, dst any) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(b, dst); err != nil {
-		return fmt.Errorf("parse %s: %w", path, err)
-	}
-	return nil
-}
-
-func writeJSONAtomic(path string, value any, mode os.FileMode) error {
-	b, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	b = append(b, '\n')
-	return writeFileAtomic(path, b, mode)
-}
-
-func writeFileAtomic(path string, content []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".hgctl-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	ok := false
-	defer func() {
-		_ = f.Close()
-		if !ok {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if err := f.Chmod(mode); err != nil {
-		return err
-	}
-	if _, err := f.Write(content); err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	ok = true
-	return nil
+	return fsx.WriteJSON(a.Paths.IndexedSHA, receipt, 0o600)
 }
 
 func newUUID() (string, error) {
@@ -367,116 +273,6 @@ func newUUID() (string, error) {
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
-}
-
-func commandExists(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
-}
-
-func runCommand(ctx context.Context, dir, name string, args ...string) (string, error) {
-	return runCommandEnv(ctx, dir, nil, name, args...)
-}
-
-func runCommandEnv(ctx context.Context, dir string, environment []string, name string, args ...string) (string, error) {
-	if name == "git" {
-		args = append([]string{
-			"-c", "core.hooksPath=/dev/null",
-			"-c", "commit.gpgSign=false",
-			"-c", "tag.gpgSign=false",
-		}, args...)
-	}
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), environment...)
-	if name == "git" {
-		cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
-		if os.Getenv("GIT_SSH_COMMAND") == "" {
-			cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10")
-		}
-	}
-	policy := commandPolicyFor(name)
-	output := boundedCommandOutput{limit: policy.outputLimit}
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	err := cmd.Run()
-	if output.truncated {
-		return output.String(), &commandRunError{class: policy.class, cause: errors.Join(err, errCommandOutputLimit), output: output.String(), outputLimit: policy.outputLimit}
-	}
-	if err != nil {
-		return output.String(), &commandRunError{class: policy.class, cause: err, output: output.String()}
-	}
-	return output.String(), nil
-}
-
-type commandPolicy struct {
-	class       string
-	outputLimit int
-}
-
-func commandPolicyFor(name string) commandPolicy {
-	switch name {
-	case "git":
-		return commandPolicy{class: "git", outputLimit: gitCommandOutputLimit}
-	case "basic-memory":
-		return commandPolicy{class: "Basic Memory", outputLimit: basicMemoryCommandOutputLimit}
-	case "launchctl", "systemctl", "loginctl":
-		return commandPolicy{class: "scheduler", outputLimit: 256 << 10}
-	default:
-		return commandPolicy{class: "external", outputLimit: defaultCommandOutputLimit}
-	}
-}
-
-type boundedCommandOutput struct {
-	buffer    bytes.Buffer
-	limit     int
-	truncated bool
-}
-
-func (b *boundedCommandOutput) Write(content []byte) (int, error) {
-	written := len(content)
-	remaining := b.limit - b.buffer.Len()
-	if remaining > 0 {
-		if len(content) > remaining {
-			_, _ = b.buffer.Write(content[:remaining])
-		} else {
-			_, _ = b.buffer.Write(content)
-		}
-	}
-	if len(content) > remaining {
-		b.truncated = true
-	}
-	return written, nil
-}
-
-func (b *boundedCommandOutput) String() string {
-	return b.buffer.String()
-}
-
-type commandRunError struct {
-	class       string
-	cause       error
-	output      string
-	outputLimit int
-}
-
-func (e *commandRunError) Error() string {
-	if e.outputLimit > 0 {
-		return fmt.Sprintf("%s command exceeded its %d-byte output limit", e.class, e.outputLimit)
-	}
-	return fmt.Sprintf("%s command failed: %v (output suppressed)", e.class, e.cause)
-}
-
-func (e *commandRunError) Unwrap() error {
-	return e.cause
-}
-
-func commandFailureOutput(err error) string {
-	var commandErr *commandRunError
-	if errors.As(err, &commandErr) {
-		return commandErr.output
-	}
-	return ""
 }
 
 func executableAssetName() string {

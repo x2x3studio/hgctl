@@ -10,6 +10,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/gitx"
 )
 
 func TestExistingWorktreeMustBelongToControlRepository(t *testing.T) {
@@ -33,11 +36,11 @@ func TestExistingWorktreeMustBelongToControlRepository(t *testing.T) {
 func TestFileLockReleasesAfterError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.lock")
 	want := errors.New("boom")
-	if err := withFileLock(path, func() error { return want }); !errors.Is(err, want) {
+	if err := fsx.WithLock(path, func() error { return want }); !errors.Is(err, want) {
 		t.Fatalf("got %v", err)
 	}
 	called := false
-	if err := withFileLock(path, func() error { called = true; return nil }); err != nil {
+	if err := fsx.WithLock(path, func() error { called = true; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if !called {
@@ -61,7 +64,7 @@ func TestFileLockWaitDoesNotRunCleanupWithoutTheLock(t *testing.T) {
 	called := false
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	err = withFileLockWait(ctx, path, func() error {
+	err = fsx.WithLockWait(ctx, path, func() error {
 		called = true
 		return nil
 	})
@@ -74,7 +77,7 @@ func TestFileLockWaitDoesNotRunCleanupWithoutTheLock(t *testing.T) {
 	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_UN); err != nil {
 		t.Fatal(err)
 	}
-	if err := withFileLockWait(context.Background(), path, func() error {
+	if err := fsx.WithLockWait(context.Background(), path, func() error {
 		called = true
 		return nil
 	}); err != nil {
@@ -176,7 +179,7 @@ func TestSeedOrphanQueueBranchWithoutTemplate(t *testing.T) {
 		t.Fatalf("seed orphan queue: %v", err)
 	}
 
-	if !gitRefExists(testContext(t), control, "refs/heads/"+branch) {
+	if !gitx.RefExists(testContext(t), control, "refs/heads/"+branch) {
 		t.Fatal("local queue branch was not created")
 	}
 	if parents := strings.Fields(runGitTest(t, control, "rev-list", "--parents", "-n", "1", branch)); len(parents) != 1 {

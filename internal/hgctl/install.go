@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
 )
 
 func (a *App) installBinary() error {
@@ -22,7 +24,7 @@ func (a *App) installBinary() error {
 		version = "dev"
 	}
 	target := filepath.Join(a.Paths.Versions, version, "hgctl")
-	if err := writeFileAtomic(target, content, 0o755); err != nil {
+	if err := fsx.WriteAtomic(target, content, 0o755); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(a.Paths.Bin, 0o755); err != nil {
@@ -76,6 +78,6 @@ func managedStableSymlink(link, versions string) bool {
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(filepath.Dir(link), target)
 	}
-	rel, err := filepath.Rel(canonicalPath(versions), canonicalPath(target))
+	rel, err := filepath.Rel(fsx.Canonical(versions), fsx.Canonical(target))
 	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

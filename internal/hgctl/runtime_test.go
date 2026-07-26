@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
 )
 
 func testApp(t *testing.T) *App {
@@ -74,7 +76,7 @@ func TestLegacyPersistedFilesMigrateToCurrentSchemas(t *testing.T) {
 		"id": "00000000-0000-4000-8000-000000000000", "hostname": hostname,
 		"created_at": created, "updated_at": updated,
 	}
-	if err := writeJSONAtomic(app.Paths.Identity, legacyIdentity, 0o600); err != nil {
+	if err := fsx.WriteJSON(app.Paths.Identity, legacyIdentity, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	identity, err := app.loadIdentity()
@@ -92,7 +94,7 @@ func TestLegacyPersistedFilesMigrateToCurrentSchemas(t *testing.T) {
 			"external_id": "project-id", "path": app.Paths.Vault, "managed": true,
 		},
 	}
-	if err := writeJSONAtomic(app.Paths.State, legacyState, 0o600); err != nil {
+	if err := fsx.WriteJSON(app.Paths.State, legacyState, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	state, err := app.loadState()
@@ -104,7 +106,7 @@ func TestLegacyPersistedFilesMigrateToCurrentSchemas(t *testing.T) {
 	}
 
 	checkedAt := time.Date(2026, 6, 7, 8, 9, 10, 0, time.UTC)
-	if err := writeJSONAtomic(app.Paths.UpdateCheck, map[string]any{"checked_at": checkedAt}, 0o600); err != nil {
+	if err := fsx.WriteJSON(app.Paths.UpdateCheck, map[string]any{"checked_at": checkedAt}, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	check, err := app.loadUpdateCheck()
@@ -116,7 +118,7 @@ func TestLegacyPersistedFilesMigrateToCurrentSchemas(t *testing.T) {
 	}
 
 	legacyIndex := map[string]any{"shared_sha": strings.Repeat("a", 40), "project_external_id": "project-id"}
-	if err := writeJSONAtomic(app.Paths.IndexedSHA, legacyIndex, 0o600); err != nil {
+	if err := fsx.WriteJSON(app.Paths.IndexedSHA, legacyIndex, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	index, err := app.loadBasicMemoryIndexReceipt()
@@ -129,7 +131,7 @@ func TestLegacyPersistedFilesMigrateToCurrentSchemas(t *testing.T) {
 
 	for _, path := range []string{app.Paths.Identity, app.Paths.State, app.Paths.UpdateCheck, app.Paths.IndexedSHA} {
 		var content map[string]any
-		if err := readJSON(path, &content); err != nil {
+		if err := fsx.ReadJSON(path, &content); err != nil {
 			t.Fatal(err)
 		}
 		if content["schema_version"] != float64(1) {
@@ -152,7 +154,7 @@ func TestPersistedFilesRejectFutureSchemas(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			app := testApp(t)
-			if err := writeJSONAtomic(test.path(app), map[string]any{"schema_version": 2}, 0o600); err != nil {
+			if err := fsx.WriteJSON(test.path(app), map[string]any{"schema_version": 2}, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if err := test.load(app); err == nil || !strings.Contains(err.Error(), "unsupported schema_version 2") {
@@ -194,10 +196,10 @@ func TestLaunchAgentUsesOneStableLabelAndPath(t *testing.T) {
 
 func TestWriteFileAtomicReplacesContent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "state")
-	if err := writeFileAtomic(path, []byte("one"), 0o600); err != nil {
+	if err := fsx.WriteAtomic(path, []byte("one"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFileAtomic(path, []byte("two"), 0o600); err != nil {
+	if err := fsx.WriteAtomic(path, []byte("two"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
@@ -294,10 +296,10 @@ func TestReleaseInstallRequiresCandidateVersionToMatchTag(t *testing.T) {
 func TestPersistedStateCompatibilityProbeIsReadOnly(t *testing.T) {
 	app := testApp(t)
 	content := []byte("{\n  \"schema_version\": 2,\n  \"repo_url\": \"private\"\n}\n")
-	if err := writeFileAtomic(app.Paths.State, content, 0o600); err != nil {
+	if err := fsx.WriteAtomic(app.Paths.State, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.probePersistedStateCompatibility(); err == nil || !errors.Is(err, errUnsupportedSchemaVersion) {
+	if err := app.probePersistedStateCompatibility(); err == nil || !errors.Is(err, fsx.ErrUnsupportedSchema) {
 		t.Fatalf("future schema probe error=%v", err)
 	}
 	after, err := os.ReadFile(app.Paths.State)
@@ -392,46 +394,6 @@ func TestManagedVersionPruningRetainsCurrentAndOneRollback(t *testing.T) {
 	}
 }
 
-func TestCommandOutputIsBoundedAndFailureErrorsAreRedacted(t *testing.T) {
-	app := testApp(t)
-	bin := filepath.Join(app.Paths.Home, "fake-bin")
-	if err := os.MkdirAll(bin, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	script := `#!/bin/sh
-if [ "$HGCTL_TEST_MODE" = "large" ]; then
-  dd if=/dev/zero bs=1048576 count=5 2>/dev/null
-  exit 0
-fi
-printf '%s\n' "$*" >&2
-printf 'token-secret-value\n' >&2
-exit 9
-`
-	if err := os.WriteFile(filepath.Join(bin, "basic-memory"), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("HGCTL_TEST_MODE", "large")
-	output, err := runCommand(testContext(t), "", "basic-memory")
-	if err == nil || !errors.Is(err, errCommandOutputLimit) {
-		t.Fatalf("oversized output error=%v", err)
-	}
-	if len(output) != basicMemoryCommandOutputLimit {
-		t.Fatalf("captured output bytes=%d, want %d", len(output), basicMemoryCommandOutputLimit)
-	}
-
-	t.Setenv("HGCTL_TEST_MODE", "failure")
-	_, err = runCommand(testContext(t), "", "basic-memory", "tool", "search-notes", "private-query")
-	if err == nil {
-		t.Fatal("failing command returned success")
-	}
-	for _, secret := range []string{"private-query", "token-secret-value"} {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("command error leaked %q: %v", secret, err)
-		}
-	}
-}
-
 func TestUpdateReceiptDoesNotRewriteInstallState(t *testing.T) {
 	app := testApp(t)
 	state := State{
@@ -461,7 +423,7 @@ func TestUpdateReceiptDoesNotRewriteInstallState(t *testing.T) {
 		t.Fatalf("update rewrote install state:\nbefore=%s\nafter=%s", before, after)
 	}
 	var receipt updateCheck
-	if err := readJSON(app.Paths.UpdateCheck, &receipt); err != nil || !receipt.CheckedAt.Equal(app.Now()) {
+	if err := fsx.ReadJSON(app.Paths.UpdateCheck, &receipt); err != nil || !receipt.CheckedAt.Equal(app.Now()) {
 		t.Fatalf("independent update receipt=%+v err=%v", receipt, err)
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 // seedProduct lays out a small product in the shared worktree.
@@ -214,7 +216,7 @@ func gitProduct(t *testing.T, dir string) func(files map[string]string, message 
 	ctx := testContext(t)
 	run := func(args ...string) string {
 		t.Helper()
-		out, err := runCommand(ctx, dir, "git", args...)
+		out, err := proc.Run(ctx, dir, "git", args...)
 		if err != nil {
 			t.Fatalf("git %s: %v", strings.Join(args, " "), err)
 		}

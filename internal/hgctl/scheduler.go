@@ -11,6 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 const schedulerOwnership = "x2x3studio.hgctl.scheduler/v1"
@@ -32,7 +35,7 @@ func (a *App) writeSchedulerDefinition() error {
 		if err := verifySchedulerFile(path, stable); err != nil {
 			return err
 		}
-		if err := writeFileAtomic(path, []byte(plist), 0o644); err != nil {
+		if err := fsx.WriteAtomic(path, []byte(plist), 0o644); err != nil {
 			return err
 		}
 		if err := removeLegacySchedulerLogs(a.Paths.Data); err != nil {
@@ -51,10 +54,10 @@ func (a *App) writeSchedulerDefinition() error {
 				return err
 			}
 		}
-		if err := writeFileAtomic(service, []byte(serviceBody), 0o644); err != nil {
+		if err := fsx.WriteAtomic(service, []byte(serviceBody), 0o644); err != nil {
 			return err
 		}
-		return writeFileAtomic(timer, []byte(timerBody), 0o644)
+		return fsx.WriteAtomic(timer, []byte(timerBody), 0o644)
 	default:
 		return nil
 	}
@@ -65,17 +68,17 @@ func (a *App) activateScheduler(ctx context.Context) error {
 	case "darwin":
 		path := filepath.Join(a.Paths.Home, "Library", "LaunchAgents", LaunchLabel+".plist")
 		domain := "gui/" + strconv.Itoa(os.Getuid())
-		_, _ = runCommand(ctx, "", "launchctl", "bootout", domain, path)
-		_, err := runCommand(ctx, "", "launchctl", "bootstrap", domain, path)
+		_, _ = proc.Run(ctx, "", "launchctl", "bootout", domain, path)
+		_, err := proc.Run(ctx, "", "launchctl", "bootstrap", domain, path)
 		return err
 	case "linux":
 		if err := ensureUserLinger(ctx); err != nil {
 			return err
 		}
-		if _, err := runCommand(ctx, "", "systemctl", "--user", "daemon-reload"); err != nil {
+		if _, err := proc.Run(ctx, "", "systemctl", "--user", "daemon-reload"); err != nil {
 			return err
 		}
-		_, err := runCommand(ctx, "", "systemctl", "--user", "enable", "--now", LaunchLabel+".timer")
+		_, err := proc.Run(ctx, "", "systemctl", "--user", "enable", "--now", LaunchLabel+".timer")
 		return err
 	default:
 		return nil
@@ -89,7 +92,7 @@ func ensureUserLinger(ctx context.Context) error {
 	if enabled, _ := userLingerEnabled(ctx, uid); enabled {
 		return nil
 	}
-	attemptOutput, attemptErr := runCommand(ctx, "", "loginctl", "--no-ask-password", "enable-linger", uid)
+	attemptOutput, attemptErr := proc.Run(ctx, "", "loginctl", "--no-ask-password", "enable-linger", uid)
 	if enabled, verifyErr := userLingerEnabled(ctx, uid); enabled {
 		return nil
 	} else {
@@ -108,7 +111,7 @@ func ensureUserLinger(ctx context.Context) error {
 }
 
 func userLingerEnabled(ctx context.Context, uid string) (bool, error) {
-	out, err := runCommand(ctx, "", "loginctl", "show-user", uid, "--property=Linger", "--value")
+	out, err := proc.Run(ctx, "", "loginctl", "show-user", uid, "--property=Linger", "--value")
 	if err != nil {
 		return false, err
 	}
@@ -263,19 +266,19 @@ func (a *App) quiesceScheduler(ctx context.Context) error {
 	case "darwin":
 		domain := "gui/" + strconv.Itoa(os.Getuid())
 		target := domain + "/" + LaunchLabel
-		if _, err := runCommand(ctx, "", "launchctl", "bootout", target); err != nil && !ignorableSchedulerStopError(err) {
+		if _, err := proc.Run(ctx, "", "launchctl", "bootout", target); err != nil && !ignorableSchedulerStopError(err) {
 			return err
 		}
-		if _, err := runCommand(ctx, "", "launchctl", "print", target); err == nil {
+		if _, err := proc.Run(ctx, "", "launchctl", "print", target); err == nil {
 			return fmt.Errorf("LaunchAgent %s is still loaded", LaunchLabel)
 		} else if !ignorableSchedulerStopError(err) {
 			return fmt.Errorf("verify LaunchAgent stopped: %w", err)
 		}
 	case "linux":
-		if _, err := runCommand(ctx, "", "systemctl", "--user", "disable", "--now", LaunchLabel+".timer"); err != nil && !ignorableSchedulerStopError(err) {
+		if _, err := proc.Run(ctx, "", "systemctl", "--user", "disable", "--now", LaunchLabel+".timer"); err != nil && !ignorableSchedulerStopError(err) {
 			return err
 		}
-		if _, err := runCommand(ctx, "", "systemctl", "--user", "stop", LaunchLabel+".service"); err != nil && !ignorableSchedulerStopError(err) {
+		if _, err := proc.Run(ctx, "", "systemctl", "--user", "stop", LaunchLabel+".service"); err != nil && !ignorableSchedulerStopError(err) {
 			return err
 		}
 		for _, name := range []string{LaunchLabel + ".timer", LaunchLabel + ".service"} {
@@ -292,7 +295,7 @@ func (a *App) quiesceScheduler(ctx context.Context) error {
 }
 
 func systemdUnitInactive(ctx context.Context, name string) (bool, error) {
-	out, err := runCommand(ctx, "", "systemctl", "--user", "show", name, "--property=ActiveState", "--value")
+	out, err := proc.Run(ctx, "", "systemctl", "--user", "show", name, "--property=ActiveState", "--value")
 	if err != nil {
 		if ignorableSchedulerStopError(err) {
 			return true, nil
@@ -324,7 +327,7 @@ func (a *App) removeSchedulerFiles(ctx context.Context) error {
 				return err
 			}
 		}
-		if _, err := runCommand(ctx, "", "systemctl", "--user", "daemon-reload"); err != nil {
+		if _, err := proc.Run(ctx, "", "systemctl", "--user", "daemon-reload"); err != nil {
 			return err
 		}
 	}
@@ -343,7 +346,7 @@ func (a *App) schedulerFilesPresent() (bool, error) {
 }
 
 func ignorableSchedulerStopError(err error) bool {
-	message := strings.ToLower(err.Error() + " " + commandFailureOutput(err))
+	message := strings.ToLower(err.Error() + " " + proc.FailureOutput(err))
 	for _, text := range []string{"could not find specified service", "could not find service", "could not be found", "no such process", "not loaded", "not found", "does not exist"} {
 		if strings.Contains(message, text) {
 			return true
@@ -358,13 +361,13 @@ func (a *App) schedulerLoaded(ctx context.Context) bool {
 	switch runtime.GOOS {
 	case "darwin":
 		domain := "gui/" + strconv.Itoa(os.Getuid()) + "/" + LaunchLabel
-		_, err := runCommand(ctx, "", "launchctl", "print", domain)
+		_, err := proc.Run(ctx, "", "launchctl", "print", domain)
 		return err == nil
 	case "linux":
-		if _, err := runCommand(ctx, "", "systemctl", "--user", "is-active", "--quiet", LaunchLabel+".timer"); err != nil {
+		if _, err := proc.Run(ctx, "", "systemctl", "--user", "is-active", "--quiet", LaunchLabel+".timer"); err != nil {
 			return false
 		}
-		out, err := runCommand(ctx, "", "loginctl", "show-user", strconv.Itoa(os.Getuid()), "--property=Linger", "--value")
+		out, err := proc.Run(ctx, "", "loginctl", "show-user", strconv.Itoa(os.Getuid()), "--property=Linger", "--value")
 		return err == nil && strings.TrimSpace(out) == "yes"
 	default:
 		return true

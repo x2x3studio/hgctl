@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 // seedQueueRepo makes a real queue repository with machine.json committed, which
@@ -17,7 +19,7 @@ func seedQueueRepo(t *testing.T, app *App) {
 	}
 	git := func(args ...string) string {
 		t.Helper()
-		out, err := runCommand(ctx, app.Paths.Queue, "git", args...)
+		out, err := proc.Run(ctx, app.Paths.Queue, "git", args...)
 		if err != nil {
 			t.Fatalf("git %s: %v", strings.Join(args, " "), err)
 		}
@@ -39,7 +41,7 @@ func seedQueueRepo(t *testing.T, app *App) {
 
 func queueStatus(t *testing.T, app *App) string {
 	t.Helper()
-	out, err := runCommand(testContext(t), app.Paths.Queue, "git", "status", "--porcelain=v1", "--untracked-files=all")
+	out, err := proc.Run(testContext(t), app.Paths.Queue, "git", "status", "--porcelain=v1", "--untracked-files=all")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +67,7 @@ func TestQueueGuardAcceptsAModifiedMachineMeta(t *testing.T) {
 	if err := requireOnlyQueueTargets(ctx, app.Paths.Queue, []string{machineMetaFile}, false); err != nil {
 		t.Fatalf("unstaged metadata edit rejected: %v", err)
 	}
-	if _, err := runCommand(ctx, app.Paths.Queue, "git", "add", "--", machineMetaFile); err != nil {
+	if _, err := proc.Run(ctx, app.Paths.Queue, "git", "add", "--", machineMetaFile); err != nil {
 		t.Fatal(err)
 	}
 	if err := requireOnlyQueueTargets(ctx, app.Paths.Queue, []string{machineMetaFile}, true); err != nil {
@@ -86,14 +88,14 @@ func TestQueueGuardStillRefusesAModifiedEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{{"add", "--", event}, {"commit", "--quiet", "-m", "capture"}} {
-		if _, err := runCommand(ctx, app.Paths.Queue, "git", args...); err != nil {
+		if _, err := proc.Run(ctx, app.Paths.Queue, "git", args...); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := os.WriteFile(full, []byte("rewritten\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runCommand(ctx, app.Paths.Queue, "git", "add", "--", event); err != nil {
+	if _, err := proc.Run(ctx, app.Paths.Queue, "git", "add", "--", event); err != nil {
 		t.Fatal(err)
 	}
 	if err := requireOnlyQueueTargets(ctx, app.Paths.Queue, []string{filepath.ToSlash(event)}, true); err == nil {
@@ -116,7 +118,7 @@ func TestInterruptedMachineMetaStageDoesNotWedgeTheQueue(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(app.Paths.Queue, machineMetaFile), bumped, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runCommand(ctx, app.Paths.Queue, "git", "add", "--", machineMetaFile); err != nil {
+	if _, err := proc.Run(ctx, app.Paths.Queue, "git", "add", "--", machineMetaFile); err != nil {
 		t.Fatal(err)
 	}
 	if got := queueStatus(t, app); got != "M  "+machineMetaFile {
@@ -158,7 +160,7 @@ func TestInterruptedFirstMachineMetaStageIsDropped(t *testing.T) {
 		{"config", "user.email", "hgctl-test@example.invalid"},
 		{"commit", "--quiet", "--allow-empty", "-m", "root"},
 	} {
-		if _, err := runCommand(ctx, app.Paths.Queue, "git", args...); err != nil {
+		if _, err := proc.Run(ctx, app.Paths.Queue, "git", args...); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -169,7 +171,7 @@ func TestInterruptedFirstMachineMetaStageIsDropped(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(app.Paths.Queue, machineMetaFile), meta, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runCommand(ctx, app.Paths.Queue, "git", "add", "--", machineMetaFile); err != nil {
+	if _, err := proc.Run(ctx, app.Paths.Queue, "git", "add", "--", machineMetaFile); err != nil {
 		t.Fatal(err)
 	}
 

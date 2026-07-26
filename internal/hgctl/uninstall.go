@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 func (a *App) uninstall(ctx context.Context) error {
-	return withFileLockWait(ctx, a.Paths.LifecycleLock, func() error {
+	return fsx.WithLockWait(ctx, a.Paths.LifecycleLock, func() error {
 		return a.uninstallLocked(ctx)
 	})
 }
@@ -27,8 +30,8 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 
 	var errs []error
 	safeToRemoveBinary := true
-	cleanupErr := withFileLockWait(ctx, a.Paths.SyncLock, func() error {
-		return withFileLockWait(ctx, a.Paths.UpdateLock, func() error {
+	cleanupErr := fsx.WithLockWait(ctx, a.Paths.SyncLock, func() error {
+		return fsx.WithLockWait(ctx, a.Paths.UpdateLock, func() error {
 			if err := a.removeManagedBasicMemoryMCP(ctx); err != nil {
 				errs = append(errs, err)
 				safeToRemoveBinary = false
@@ -62,7 +65,7 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 			if err != nil {
 				errs = append(errs, fmt.Errorf("inspect Basic Memory ownership: %w", err))
 				safeToRemoveBinary = false
-			} else if basicMemoryCleanup && !commandExists("basic-memory") {
+			} else if basicMemoryCleanup && !proc.Exists("basic-memory") {
 				errs = append(errs, errors.New("managed Basic Memory project cleanup requires the basic-memory command"))
 				safeToRemoveBinary = false
 			} else if err := a.removeManagedBasicMemoryProject(ctx); err != nil {

@@ -9,6 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 const vaultMirrorSchemaVersion = 1
@@ -85,7 +88,7 @@ func (a *App) mirrorProductToVault() error {
 	if err := pruneVault(a.Paths.Vault, sources); err != nil {
 		return err
 	}
-	return writeJSONAtomic(a.Paths.VaultMirror, vaultMirror{
+	return fsx.WriteJSON(a.Paths.VaultMirror, vaultMirror{
 		SchemaVersion: vaultMirrorSchemaVersion,
 		Sources:       sources,
 	}, 0o600)
@@ -197,7 +200,7 @@ func pruneVault(vault string, sources map[string]string) error {
 // wedging the sync that keeps recall current.
 func (a *App) loadVaultMirror() map[string]string {
 	var manifest vaultMirror
-	if err := readJSON(a.Paths.VaultMirror, &manifest); err != nil {
+	if err := fsx.ReadJSON(a.Paths.VaultMirror, &manifest); err != nil {
 		return nil
 	}
 	if manifest.SchemaVersion != vaultMirrorSchemaVersion {
@@ -216,14 +219,14 @@ func productUnchangedBetween(ctx context.Context, shared, from, to string) bool 
 		return false
 	}
 	for _, sha := range []string{from, to} {
-		if _, err := runCommand(ctx, shared, "git", "cat-file", "-e", sha+"^{commit}"); err != nil {
+		if _, err := proc.Run(ctx, shared, "git", "cat-file", "-e", sha+"^{commit}"); err != nil {
 			return false
 		}
 	}
 	args := append([]string{"diff", "--quiet", from, to, "--"}, productSubset...)
 	// `git diff --quiet` exits 1 when there ARE differences, so only a clean exit
 	// means unchanged; a real git failure also exits non-zero and lands on false.
-	_, err := runCommand(ctx, shared, "git", args...)
+	_, err := proc.Run(ctx, shared, "git", args...)
 	return err == nil
 }
 

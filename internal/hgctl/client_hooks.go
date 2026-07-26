@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
 )
 
 type clientAdapter struct {
@@ -42,7 +44,7 @@ func (a *App) pruneClientHooks() error {
 }
 
 func (a *App) repairClientHooks(ctx context.Context) {
-	err := withFileLock(a.Paths.LifecycleLock, func() error {
+	err := fsx.WithLock(a.Paths.LifecycleLock, func() error {
 		stable := filepath.Join(a.Paths.Bin, "hgctl")
 		if !managedStableSymlink(stable, a.Paths.Versions) {
 			return nil
@@ -101,7 +103,7 @@ func pruneClientHookFileWithRetry(writePath, displayPath, binary, client string,
 		if !sameHookConfigSnapshot(snapshot, current) {
 			continue
 		}
-		if err := writeFileAtomic(writePath, desired, 0o600); err != nil {
+		if err := fsx.WriteAtomic(writePath, desired, 0o600); err != nil {
 			return err
 		}
 		persisted, err := readHookConfigSnapshot(writePath)
@@ -289,7 +291,7 @@ func managedHooksPresent(path, binary, client string) (bool, error) {
 			} `json:"hooks"`
 		} `json:"hooks"`
 	}
-	if err := readJSON(readPath, &root); err != nil {
+	if err := fsx.ReadJSON(readPath, &root); err != nil {
 		return false, err
 	}
 	for _, groups := range root.Hooks {

@@ -9,6 +9,9 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 const basicMemoryMCPName = "hourglass-memory"
@@ -44,7 +47,7 @@ func (a *App) setupBasicMemoryMCP(ctx context.Context) error {
 	}
 	var configured int
 	for _, client := range mcpClients() {
-		if !commandExists(client.executable) {
+		if !proc.Exists(client.executable) {
 			continue
 		}
 		exists, matches, err := inspectBasicMemoryMCP(ctx, client, binary)
@@ -105,7 +108,7 @@ func addBasicMemoryMCP(ctx context.Context, client mcpClient, binary string) err
 		args = append(args, basicMemoryMCPName)
 	}
 	args = append(args, "--", binary, "mcp", "--project", ProjectName)
-	_, err := runCommand(ctx, "", client.executable, args...)
+	_, err := proc.Run(ctx, "", client.executable, args...)
 	return err
 }
 
@@ -114,13 +117,13 @@ func removeBasicMemoryMCP(ctx context.Context, client mcpClient) error {
 	if client.name == "claude" {
 		args = append(args, "--scope", "user")
 	}
-	_, err := runCommand(ctx, "", client.executable, args...)
+	_, err := proc.Run(ctx, "", client.executable, args...)
 	return err
 }
 
 func inspectBasicMemoryMCP(ctx context.Context, client mcpClient, binary string) (bool, bool, error) {
 	if client.name == "codex" {
-		output, err := runCommand(ctx, "", client.executable, "mcp", "get", basicMemoryMCPName, "--json")
+		output, err := proc.Run(ctx, "", client.executable, "mcp", "get", basicMemoryMCPName, "--json")
 		if err != nil {
 			if strings.Contains(output, "No MCP server named") {
 				return false, false, nil
@@ -143,7 +146,7 @@ func inspectBasicMemoryMCP(ctx context.Context, client mcpClient, binary string)
 			equalStrings(entry.Transport.Args, []string{"mcp", "--project", ProjectName}) && containsEnv(entry.Transport.Env)
 		return true, matches, nil
 	}
-	output, err := runCommand(ctx, "", client.executable, "mcp", "get", basicMemoryMCPName)
+	output, err := proc.Run(ctx, "", client.executable, "mcp", "get", basicMemoryMCPName)
 	if err != nil {
 		if strings.Contains(output, "No MCP server named") {
 			return false, false, nil
@@ -191,7 +194,7 @@ func (a *App) removeManagedBasicMemoryMCP(ctx context.Context) error {
 	}
 	for _, client := range mcpClients() {
 		managedPath := state.BasicMemoryMCP[client.name]
-		if managedPath == "" || !commandExists(client.executable) {
+		if managedPath == "" || !proc.Exists(client.executable) {
 			continue
 		}
 		exists, matches, inspectErr := inspectBasicMemoryMCP(ctx, client, managedPath)
@@ -209,7 +212,7 @@ func (a *App) removeManagedBasicMemoryMCP(ctx context.Context) error {
 		if client.name == "claude" {
 			args = append(args, "--scope", "user")
 		}
-		if _, err := runCommand(ctx, "", client.executable, args...); err != nil {
+		if _, err := proc.Run(ctx, "", client.executable, args...); err != nil {
 			return fmt.Errorf("remove %s Basic Memory MCP: %w", client.name, err)
 		}
 		delete(state.BasicMemoryMCP, client.name)
@@ -227,13 +230,13 @@ func (a *App) basicMemoryMCPDoctorChecks(ctx context.Context) []doctorCheck {
 	}
 	var checks []doctorCheck
 	for _, client := range mcpClients() {
-		if !commandExists(client.executable) {
+		if !proc.Exists(client.executable) {
 			continue
 		}
 		exists, matches, inspectErr := inspectBasicMemoryMCP(ctx, client, binary)
 		note := basicMemoryMCPName
 		if inspectErr != nil {
-			note = boundString(inspectErr.Error(), 512)
+			note = fsx.Bound(inspectErr.Error(), 512)
 		}
 		checks = append(checks, doctorCheck{client.name + " memory MCP", inspectErr == nil && exists && matches, note})
 	}

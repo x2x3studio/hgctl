@@ -9,6 +9,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 // writeManagedHookFile seeds a client config that carries one hgctl-managed hook
@@ -30,7 +33,7 @@ func writeManagedHookFile(t *testing.T, path, binary, client string) {
 			}},
 		},
 	}
-	if err := writeJSONAtomic(path, body, 0o600); err != nil {
+	if err := fsx.WriteJSON(path, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -52,7 +55,7 @@ func TestPruneClientHookFileRemovesOnlyManagedCommands(t *testing.T) {
 			}},
 		},
 	}
-	if err := writeJSONAtomic(path, original, 0o600); err != nil {
+	if err := fsx.WriteJSON(path, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := pruneClientHookFile(path, binary, "claude"); err != nil {
@@ -106,7 +109,7 @@ func TestPruneClientHookFileDropsEmptiedEventGroup(t *testing.T) {
 			}},
 		},
 	}
-	if err := writeJSONAtomic(path, original, 0o600); err != nil {
+	if err := fsx.WriteJSON(path, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := pruneClientHookFile(path, binary, "claude"); err != nil {
@@ -237,7 +240,7 @@ func TestBackgroundHookRepairPrunesStaleAndIsIdempotent(t *testing.T) {
 		done := make(chan error, 1)
 		ctx := testContext(t)
 		go func() {
-			done <- withFileLockWait(ctx, app.Paths.LifecycleLock, func() error {
+			done <- fsx.WithLockWait(ctx, app.Paths.LifecycleLock, func() error {
 				close(locked)
 				<-release
 				return nil
@@ -380,7 +383,7 @@ func TestBasicMemoryRemovalRequiresManagedExactIdentity(t *testing.T) {
 			if err := app.saveState(State{BasicMemoryProject: &test.ownership}); err != nil {
 				t.Fatal(err)
 			}
-			if err := writeJSONAtomic(app.Paths.IndexedSHA, BasicMemoryIndexReceipt{
+			if err := fsx.WriteJSON(app.Paths.IndexedSHA, BasicMemoryIndexReceipt{
 				SharedSHA:         strings.Repeat("a", 40),
 				ProjectExternalID: test.ownership.ExternalID,
 			}, 0o600); err != nil {
@@ -499,7 +502,7 @@ func TestUninstallRemovesManagedIntegrationAfterSchedulerStops(t *testing.T) {
 	stable := prepareUninstallFixture(t, app, false)
 	// Client removal must not strand hooks that were previously owned by hgctl.
 	t.Setenv("PATH", filepath.Join(app.Paths.Home, "fake-bin"))
-	if commandExists("claude") || commandExists("codex") {
+	if proc.Exists("claude") || proc.Exists("codex") {
 		t.Fatal("client executables unexpectedly remain in the uninstall fixture")
 	}
 	writeManagedHookFile(t, filepath.Join(app.Paths.Home, ".claude", "settings.json"), stable, "claude")
@@ -809,7 +812,7 @@ printf x >> "$HGCTL_TEST_REINDEX_LOG"
 	}
 	head := strings.TrimSpace(runGitTest(t, app.Paths.Shared, "rev-parse", "HEAD"))
 	var receipt BasicMemoryIndexReceipt
-	if err := readJSON(app.Paths.IndexedSHA, &receipt); err != nil {
+	if err := fsx.ReadJSON(app.Paths.IndexedSHA, &receipt); err != nil {
 		t.Fatal(err)
 	}
 	if receipt.SharedSHA != head || receipt.ProjectExternalID != "project-id" {
@@ -831,7 +834,7 @@ printf x >> "$HGCTL_TEST_REINDEX_LOG"
 	if err != nil || string(logBody) != "xx" {
 		t.Fatalf("project replacement did not force reindex: log=%q err=%v", logBody, err)
 	}
-	if err := readJSON(app.Paths.IndexedSHA, &receipt); err != nil {
+	if err := fsx.ReadJSON(app.Paths.IndexedSHA, &receipt); err != nil {
 		t.Fatal(err)
 	}
 	if receipt.ProjectExternalID != "replacement-project-id" {

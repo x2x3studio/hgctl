@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/x2x3studio/hgctl/internal/gitx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 // machineMetaFile names the one tracked path a queue branch carries outside
@@ -59,13 +62,13 @@ func renderMachineMeta(id Identity) ([]byte, error) {
 // in the same sync, from the live identity, so nothing is lost by throwing a
 // half-finished write away.
 func (a *App) revertQueueMachineMeta(ctx context.Context) error {
-	if _, err := runCommand(ctx, a.Paths.Queue, "git", "cat-file", "-e", "HEAD:"+machineMetaFile); err == nil {
-		_, err := runCommand(ctx, a.Paths.Queue, "git", "restore", "--staged", "--worktree", "--", machineMetaFile)
+	if _, err := proc.Run(ctx, a.Paths.Queue, "git", "cat-file", "-e", "HEAD:"+machineMetaFile); err == nil {
+		_, err := proc.Run(ctx, a.Paths.Queue, "git", "restore", "--staged", "--worktree", "--", machineMetaFile)
 		return err
 	}
 	// Not in HEAD, so the leftover is a first-ever creation: drop it entirely
 	// rather than restoring a version that does not exist.
-	if _, err := runCommand(ctx, a.Paths.Queue, "git", "rm", "--cached", "--force", "--quiet", "--ignore-unmatch", "--", machineMetaFile); err != nil {
+	if _, err := proc.Run(ctx, a.Paths.Queue, "git", "rm", "--cached", "--force", "--quiet", "--ignore-unmatch", "--", machineMetaFile); err != nil {
 		return err
 	}
 	if err := os.Remove(filepath.Join(a.Paths.Queue, machineMetaFile)); err != nil && !os.IsNotExist(err) {
@@ -92,8 +95,8 @@ func (a *App) upsertMachineMeta(ctx context.Context, id Identity) (bool, error) 
 	if err := os.WriteFile(path, want, 0o600); err != nil {
 		return false, err
 	}
-	if _, err := runCommand(ctx, a.Paths.Queue, "git", "add", "--", machineMetaFile); err != nil {
+	if _, err := proc.Run(ctx, a.Paths.Queue, "git", "add", "--", machineMetaFile); err != nil {
 		return false, err
 	}
-	return gitHasStagedChanges(ctx, a.Paths.Queue)
+	return gitx.HasStagedChanges(ctx, a.Paths.Queue)
 }

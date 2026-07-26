@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/gitx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
@@ -25,7 +28,7 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 	if err := requireQueueTrackedClean(ctx, a.Paths.Queue); err != nil {
 		return err
 	}
-	if gitRefExists(ctx, a.Paths.Queue, "refs/remotes/origin/"+state.QueueBranch) {
+	if gitx.RefExists(ctx, a.Paths.Queue, "refs/remotes/origin/"+state.QueueBranch) {
 		if err := reconcileQueueWithRemote(ctx, a.Paths.Queue, state.QueueBranch); err != nil {
 			return err
 		}
@@ -42,19 +45,19 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 	}
 	if len(batch.EventPaths) > 0 {
 		args := append([]string{"add", "--"}, batch.EventPaths...)
-		if _, err := runCommand(ctx, a.Paths.Queue, "git", args...); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Queue, "git", args...); err != nil {
 			return err
 		}
 		if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, batch.EventPaths, true); err != nil {
 			return err
 		}
-		staged, err := gitHasStagedChanges(ctx, a.Paths.Queue)
+		staged, err := gitx.HasStagedChanges(ctx, a.Paths.Queue)
 		if err != nil {
 			return err
 		}
 		if staged {
 			message := fmt.Sprintf("queue(%s): capture %d event(s)", shortMachine(state.QueueBranch), len(batch.EventPaths))
-			if _, err := runCommand(ctx, a.Paths.Queue, "git", "commit", "-m", message); err != nil {
+			if _, err := proc.Run(ctx, a.Paths.Queue, "git", "commit", "-m", message); err != nil {
 				return err
 			}
 		}
@@ -72,7 +75,7 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 				return err
 			}
 			message := fmt.Sprintf("queue(%s): record machine metadata", shortMachine(state.QueueBranch))
-			if _, err := runCommand(ctx, a.Paths.Queue, "git", "commit", "-m", message); err != nil {
+			if _, err := proc.Run(ctx, a.Paths.Queue, "git", "commit", "-m", message); err != nil {
 				return err
 			}
 		}
@@ -85,7 +88,7 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 		return err
 	}
 	if needsPush {
-		if _, err := runCommand(ctx, a.Paths.Queue, "git", "push", "origin", "HEAD:refs/heads/"+state.QueueBranch); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Queue, "git", "push", "origin", "HEAD:refs/heads/"+state.QueueBranch); err != nil {
 			return err
 		}
 	}
@@ -115,16 +118,16 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state State) error {
 // so the subsequent push publishes it rather than discarding it.
 func reconcileQueueWithRemote(ctx context.Context, queue, branch string) error {
 	remote := "origin/" + branch
-	behind, err := gitIsAncestor(ctx, queue, "HEAD", remote)
+	behind, err := gitx.IsAncestor(ctx, queue, "HEAD", remote)
 	if err != nil {
 		return err
 	}
 	if behind {
 		// HEAD is an ancestor of the remote: a clean fast-forward (or already equal).
-		_, err := runCommand(ctx, queue, "git", "merge", "--ff-only", remote)
+		_, err := proc.Run(ctx, queue, "git", "merge", "--ff-only", remote)
 		return err
 	}
-	ahead, err := gitIsAncestor(ctx, queue, remote, "HEAD")
+	ahead, err := gitx.IsAncestor(ctx, queue, remote, "HEAD")
 	if err != nil {
 		return err
 	}
@@ -136,7 +139,7 @@ func reconcileQueueWithRemote(ctx context.Context, queue, branch string) error {
 	// Diverged: origin advanced via an Action archive while a local append was
 	// committed but not pushed. Adopt the remote; the outbox replay re-stages the
 	// un-pushed events on top.
-	_, err = runCommand(ctx, queue, "git", "reset", "--hard", remote)
+	_, err = proc.Run(ctx, queue, "git", "reset", "--hard", remote)
 	return err
 }
 
@@ -205,7 +208,7 @@ func (a *App) copyOutboxBatch(maxEvents, maxBytes int) (queueBatch, error) {
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return batch, err
-		} else if err := writeFileAtomic(target, content, 0o600); err != nil {
+		} else if err := fsx.WriteAtomic(target, content, 0o600); err != nil {
 			return batch, err
 		}
 		batch.OutboxPaths = append(batch.OutboxPaths, sourcePath)
@@ -242,7 +245,7 @@ func (a *App) bulkPublishQueue(ctx context.Context) (int, error) {
 	lockCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	var delivered int
-	err = withFileLockWait(lockCtx, a.Paths.SyncLock, func() error {
+	err = fsx.WithLockWait(lockCtx, a.Paths.SyncLock, func() error {
 		if err := a.verifyControlCheckout(lockCtx, state.RepoURL); err != nil {
 			return err
 		}
@@ -271,7 +274,7 @@ func (a *App) drainOutboxToQueue(ctx context.Context, state State) (int, error) 
 	if err := requireQueueTrackedClean(ctx, a.Paths.Queue); err != nil {
 		return 0, err
 	}
-	if gitRefExists(ctx, a.Paths.Queue, "refs/remotes/origin/"+state.QueueBranch) {
+	if gitx.RefExists(ctx, a.Paths.Queue, "refs/remotes/origin/"+state.QueueBranch) {
 		if err := reconcileQueueWithRemote(ctx, a.Paths.Queue, state.QueueBranch); err != nil {
 			return 0, err
 		}
@@ -315,7 +318,7 @@ func (a *App) drainOutboxToQueue(ctx context.Context, state State) (int, error) 
 		return delivered, err
 	}
 	if needsPush {
-		if _, err := runCommand(ctx, a.Paths.Queue, "git", "push", "origin", "HEAD:refs/heads/"+state.QueueBranch); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Queue, "git", "push", "origin", "HEAD:refs/heads/"+state.QueueBranch); err != nil {
 			return delivered, err
 		}
 	}
@@ -330,18 +333,18 @@ func (a *App) stageAndCommitQueueBatch(ctx context.Context, state State, batch q
 		return err
 	}
 	args := append([]string{"add", "--"}, batch.EventPaths...)
-	if _, err := runCommand(ctx, a.Paths.Queue, "git", args...); err != nil {
+	if _, err := proc.Run(ctx, a.Paths.Queue, "git", args...); err != nil {
 		return err
 	}
 	if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, batch.EventPaths, true); err != nil {
 		return err
 	}
-	staged, err := gitHasStagedChanges(ctx, a.Paths.Queue)
+	staged, err := gitx.HasStagedChanges(ctx, a.Paths.Queue)
 	if err != nil || !staged {
 		return err
 	}
 	message := fmt.Sprintf("queue(%s): ingest %d event(s)", shortMachine(state.QueueBranch), len(batch.EventPaths))
-	_, err = runCommand(ctx, a.Paths.Queue, "git", "commit", "-m", message)
+	_, err = proc.Run(ctx, a.Paths.Queue, "git", "commit", "-m", message)
 	return err
 }
 
@@ -401,20 +404,6 @@ func readOutboxFile(path string) ([]byte, error) {
 	return content, nil
 }
 
-func gitHasStagedChanges(ctx context.Context, dir string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet", "--exit-code")
-	cmd.Dir = dir
-	err := cmd.Run()
-	if err == nil {
-		return false, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		return true, nil
-	}
-	return false, err
-}
-
 func cleanupQueueTemps(queue string) error {
 	root := filepath.Join(queue, "events")
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
@@ -440,7 +429,7 @@ func cleanupQueueTemps(queue string) error {
 }
 
 func requireQueueTrackedClean(ctx context.Context, queue string) error {
-	status, err := runCommand(ctx, queue, "git", "status", "--porcelain=v1", "-z", "--untracked-files=no")
+	status, err := proc.Run(ctx, queue, "git", "status", "--porcelain=v1", "-z", "--untracked-files=no")
 	if err != nil {
 		return err
 	}
@@ -454,7 +443,7 @@ func requireQueueTrackedClean(ctx context.Context, queue string) error {
 // Events are opaque Markdown under events/; a staged file must byte-match its
 // outbox source.
 func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, error) {
-	status, err := runCommand(ctx, a.Paths.Queue, "git", "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	status, err := proc.Run(ctx, a.Paths.Queue, "git", "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
 		return queueBatch{}, err
 	}
@@ -513,7 +502,7 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 	}
 	if len(staged) > 0 {
 		args := append([]string{"restore", "--staged", "--"}, staged...)
-		if _, err := runCommand(ctx, a.Paths.Queue, "git", args...); err != nil {
+		if _, err := proc.Run(ctx, a.Paths.Queue, "git", args...); err != nil {
 			return queueBatch{}, err
 		}
 	}
@@ -537,7 +526,7 @@ func requireOnlyQueueTargets(ctx context.Context, queue string, targets []string
 		}
 		allowed[clean] = struct{}{}
 	}
-	status, err := runCommand(ctx, queue, "git", "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	status, err := proc.Run(ctx, queue, "git", "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
 		return err
 	}
@@ -578,21 +567,21 @@ func requireOnlyQueueTargets(ctx context.Context, queue string, targets []string
 
 func queueNeedsPush(ctx context.Context, queue, branch string) (bool, error) {
 	remote := "refs/remotes/origin/" + branch
-	if !gitRefExists(ctx, queue, remote) {
+	if !gitx.RefExists(ctx, queue, remote) {
 		return true, nil
 	}
-	headSHA, err := runCommand(ctx, queue, "git", "rev-parse", "HEAD")
+	headSHA, err := proc.Run(ctx, queue, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return false, err
 	}
-	remoteSHA, err := runCommand(ctx, queue, "git", "rev-parse", remote)
+	remoteSHA, err := proc.Run(ctx, queue, "git", "rev-parse", remote)
 	if err != nil {
 		return false, err
 	}
 	if strings.TrimSpace(headSHA) == strings.TrimSpace(remoteSHA) {
 		return false, nil
 	}
-	ancestor, err := gitIsAncestor(ctx, queue, remote, "HEAD")
+	ancestor, err := gitx.IsAncestor(ctx, queue, remote, "HEAD")
 	if err != nil {
 		return false, err
 	}

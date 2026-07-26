@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 func (a *App) setupBasicMemory(ctx context.Context) error {
-	if !commandExists("basic-memory") {
+	if !proc.Exists("basic-memory") {
 		return errors.New("basic-memory is not installed")
 	}
 	state, err := a.loadState()
@@ -41,7 +43,7 @@ func (a *App) setupBasicMemory(ctx context.Context) error {
 var basicMemoryReadOnlyEnv []string
 
 func (a *App) reindexBasicMemory(ctx context.Context) error {
-	head, err := runCommand(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
+	head, err := proc.Run(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return err
 	}
@@ -51,7 +53,7 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 		return err
 	}
 	if state.BasicMemoryProject == nil || state.BasicMemoryProject.ExternalID == "" || state.BasicMemoryProject.Path == "" ||
-		canonicalPath(state.BasicMemoryProject.Path) != canonicalPath(a.Paths.Vault) {
+		fsx.Canonical(state.BasicMemoryProject.Path) != fsx.Canonical(a.Paths.Vault) {
 		return errors.New("Basic Memory project identity is not configured")
 	}
 	projectID := state.BasicMemoryProject.ExternalID
@@ -60,7 +62,7 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 		indexed.SharedSHA == head && indexed.ProjectExternalID == projectID {
 		return nil
 	}
-	if errors.Is(indexedErr, errUnsupportedSchemaVersion) {
+	if errors.Is(indexedErr, fsx.ErrUnsupportedSchema) {
 		return indexedErr
 	}
 	// shared moved but the PRODUCT did not. reflect advances its cursor past a
@@ -79,7 +81,7 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 			ProjectExternalID: projectID,
 		})
 	}
-	if !commandExists("basic-memory") {
+	if !proc.Exists("basic-memory") {
 		return errors.New("basic-memory is not installed")
 	}
 	project, err := a.resolveBasicMemoryProject(ctx)
@@ -87,7 +89,7 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 		return err
 	}
 	projectID = project.ExternalID
-	if _, err := runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "reindex", "--project", ProjectName); err != nil {
+	if _, err := proc.RunEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "reindex", "--project", ProjectName); err != nil {
 		return err
 	}
 	return a.saveBasicMemoryIndexReceipt(BasicMemoryIndexReceipt{
@@ -110,7 +112,7 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 // operator in it would fail the probe and make doctor report a healthy index as
 // broken.
 func basicMemoryIndexedCount(ctx context.Context) (int, error) {
-	out, err := runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "tool", "search-notes",
+	out, err := proc.RunEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "tool", "search-notes",
 		"--permalink", "*", "--project", ProjectName)
 	if err != nil {
 		return 0, err
@@ -139,11 +141,11 @@ func (p basicMemoryProject) CanonicalPath() string {
 	if path == "" {
 		path = p.Path
 	}
-	return canonicalPath(path)
+	return fsx.Canonical(path)
 }
 
 func listBasicMemoryProjects(ctx context.Context) ([]basicMemoryProject, error) {
-	out, err := runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "tool", "list-projects", "--local")
+	out, err := proc.RunEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "tool", "list-projects", "--local")
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +159,7 @@ func listBasicMemoryProjects(ctx context.Context) ([]basicMemoryProject, error) 
 }
 
 func (a *App) resolveBasicMemoryProject(ctx context.Context) (basicMemoryProject, error) {
-	if !commandExists("basic-memory") {
+	if !proc.Exists("basic-memory") {
 		return basicMemoryProject{}, errors.New("basic-memory is not installed")
 	}
 	state, err := a.loadState()
@@ -165,7 +167,7 @@ func (a *App) resolveBasicMemoryProject(ctx context.Context) (basicMemoryProject
 		return basicMemoryProject{}, fmt.Errorf("load Basic Memory identity: %w", err)
 	}
 	if state.BasicMemoryProject == nil || state.BasicMemoryProject.ExternalID == "" ||
-		canonicalPath(state.BasicMemoryProject.Path) != canonicalPath(a.Paths.Vault) {
+		fsx.Canonical(state.BasicMemoryProject.Path) != fsx.Canonical(a.Paths.Vault) {
 		return basicMemoryProject{}, errors.New("Basic Memory project identity is not configured for the shared vault")
 	}
 	projects, err := listBasicMemoryProjects(ctx)
@@ -183,14 +185,14 @@ func (a *App) resolveBasicMemoryProject(ctx context.Context) (basicMemoryProject
 	}
 	project := named[0]
 	if (project.LocalPath == "" && project.Path == "") || project.ExternalID != state.BasicMemoryProject.ExternalID ||
-		project.CanonicalPath() != canonicalPath(a.Paths.Vault) {
+		project.CanonicalPath() != fsx.Canonical(a.Paths.Vault) {
 		return basicMemoryProject{}, errors.New("Basic Memory project identity or shared path changed")
 	}
 	return project, nil
 }
 
 func (a *App) verifyBasicMemoryIndexReceipt(ctx context.Context, project basicMemoryProject) (string, error) {
-	head, err := runCommand(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
+	head, err := proc.Run(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("read shared revision: %w", err)
 	}
@@ -210,7 +212,7 @@ func (a *App) ensureBasicMemoryProject(ctx context.Context, state *State) (basic
 	if err != nil {
 		return basicMemoryProject{}, false, err
 	}
-	want := canonicalPath(a.Paths.Vault)
+	want := fsx.Canonical(a.Paths.Vault)
 	for _, project := range projects {
 		if project.Name != ProjectName {
 			continue
@@ -225,13 +227,13 @@ func (a *App) ensureBasicMemoryProject(ctx context.Context, state *State) (basic
 	}
 	previous := state.BasicMemoryProject
 	state.BasicMemoryProject = &BasicMemoryOwnership{
-		Path: canonicalPath(a.Paths.Vault), Managed: true, Pending: true,
+		Path: fsx.Canonical(a.Paths.Vault), Managed: true, Pending: true,
 	}
 	if err := a.saveState(*state); err != nil {
 		state.BasicMemoryProject = previous
 		return basicMemoryProject{}, false, fmt.Errorf("record Basic Memory create intent: %w", err)
 	}
-	_, err = runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "project", "add", ProjectName, a.Paths.Vault, "--local")
+	_, err = proc.RunEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "project", "add", ProjectName, a.Paths.Vault, "--local")
 	if err != nil {
 		return basicMemoryProject{}, false, err
 	}
@@ -247,22 +249,11 @@ func (a *App) ensureBasicMemoryProject(ctx context.Context, state *State) (basic
 	return basicMemoryProject{}, false, errors.New("Basic Memory did not return the created project identity")
 }
 
-func canonicalPath(path string) string {
-	abs, err := filepath.Abs(path)
-	if err == nil {
-		path = abs
-	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
-	return filepath.Clean(path)
-}
-
 func basicMemoryOwnershipForSetup(previous *BasicMemoryOwnership, project basicMemoryProject, created bool, vault string) BasicMemoryOwnership {
 	managed := created
 	if !created && previous != nil && previous.Managed {
 		managed = basicMemoryOwnershipMatches(*previous, []basicMemoryProject{project}, vault) ||
-			(previous.Pending && canonicalPath(previous.Path) == canonicalPath(vault))
+			(previous.Pending && fsx.Canonical(previous.Path) == fsx.Canonical(vault))
 	}
 	return BasicMemoryOwnership{
 		ExternalID: project.ExternalID,
@@ -280,7 +271,7 @@ func (a *App) removeManagedBasicMemoryProject(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
-	if !commandExists("basic-memory") || state.BasicMemoryProject == nil || !state.BasicMemoryProject.Managed {
+	if !proc.Exists("basic-memory") || state.BasicMemoryProject == nil || !state.BasicMemoryProject.Managed {
 		return nil
 	}
 	projects, err := listBasicMemoryProjects(ctx)
@@ -288,10 +279,10 @@ func (a *App) removeManagedBasicMemoryProject(ctx context.Context) error {
 		return fmt.Errorf("Basic Memory project check: %w", err)
 	}
 	owned := basicMemoryOwnershipMatches(*state.BasicMemoryProject, projects, a.Paths.Vault)
-	if !owned && state.BasicMemoryProject.Pending && canonicalPath(state.BasicMemoryProject.Path) == canonicalPath(a.Paths.Vault) {
+	if !owned && state.BasicMemoryProject.Pending && fsx.Canonical(state.BasicMemoryProject.Path) == fsx.Canonical(a.Paths.Vault) {
 		matches := 0
 		for _, project := range projects {
-			if project.Name == ProjectName && project.ExternalID != "" && project.CanonicalPath() == canonicalPath(a.Paths.Vault) {
+			if project.Name == ProjectName && project.ExternalID != "" && project.CanonicalPath() == fsx.Canonical(a.Paths.Vault) {
 				matches++
 			}
 		}
@@ -300,7 +291,7 @@ func (a *App) removeManagedBasicMemoryProject(ctx context.Context) error {
 	if !owned {
 		return nil
 	}
-	if _, err := runCommandEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "project", "remove", ProjectName, "--local"); err != nil {
+	if _, err := proc.RunEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "project", "remove", ProjectName, "--local"); err != nil {
 		return fmt.Errorf("Basic Memory project remove: %w", err)
 	}
 	state.BasicMemoryProject = nil
@@ -314,8 +305,8 @@ func (a *App) removeManagedBasicMemoryProject(ctx context.Context) error {
 }
 
 func basicMemoryOwnershipMatches(ownership BasicMemoryOwnership, projects []basicMemoryProject, expectedPath string) bool {
-	want := canonicalPath(expectedPath)
-	if ownership.ExternalID == "" || canonicalPath(ownership.Path) != want {
+	want := fsx.Canonical(expectedPath)
+	if ownership.ExternalID == "" || fsx.Canonical(ownership.Path) != want {
 		return false
 	}
 	for _, project := range projects {

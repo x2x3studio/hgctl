@@ -3,9 +3,12 @@ package hgctl
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/x2x3studio/hgctl/internal/fsx"
+	"github.com/x2x3studio/hgctl/internal/gitx"
+	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
 type doctorCheck struct {
@@ -29,10 +32,10 @@ type doctorCheck struct {
 func (a *App) checkBasicMemoryIndex(ctx context.Context) (bool, string) {
 	project, err := a.resolveBasicMemoryProject(ctx)
 	if err != nil {
-		return false, boundString(err.Error(), 512)
+		return false, fsx.Bound(err.Error(), 512)
 	}
 	if _, err := a.verifyBasicMemoryIndexReceipt(ctx, project); err != nil {
-		return false, boundString(err.Error(), 512)
+		return false, fsx.Bound(err.Error(), 512)
 	}
 	notes := productNoteCount(a.Paths.Vault)
 	if notes == 0 {
@@ -40,7 +43,7 @@ func (a *App) checkBasicMemoryIndex(ctx context.Context) (bool, string) {
 	}
 	indexed, err := basicMemoryIndexedCount(ctx)
 	if err != nil {
-		return false, boundString("index probe failed: "+err.Error(), 512)
+		return false, fsx.Bound("index probe failed: "+err.Error(), 512)
 	}
 	if indexed == 0 {
 		return false, fmt.Sprintf("receipt is current but the index holds nothing for %d notes", notes)
@@ -62,18 +65,18 @@ func (a *App) doctor(ctx context.Context) error {
 		projectOK = true
 		indexedOK, indexNote = a.checkBasicMemoryIndex(checkCtx)
 	} else {
-		projectNote = boundString(projectErr.Error(), 512)
+		projectNote = fsx.Bound(projectErr.Error(), 512)
 	}
 	cancel()
 	checks := []doctorCheck{
-		{"git", commandExists("git"), "required transport"},
-		{"basic-memory", commandExists("basic-memory"), "required MCP-backed memory helper"},
+		{"git", proc.Exists("git"), "required transport"},
+		{"basic-memory", proc.Exists("basic-memory"), "required MCP-backed memory helper"},
 		{"memory project", projectOK, projectNote},
 		{"memory index", indexedOK, indexNote},
 		{"stable binary", managedStableSymlink(filepath.Join(a.Paths.Bin, "hgctl"), a.Paths.Versions), filepath.Join(a.Paths.Bin, "hgctl")},
-		{"control checkout", isGitWorktree(a.Paths.Control), a.Paths.Control},
-		{"queue worktree", isGitWorktree(a.Paths.Queue), a.Paths.Queue},
-		{"shared worktree", isGitWorktree(a.Paths.Shared), a.Paths.Shared},
+		{"control checkout", gitx.IsWorktree(a.Paths.Control), a.Paths.Control},
+		{"queue worktree", gitx.IsWorktree(a.Paths.Queue), a.Paths.Queue},
+		{"shared worktree", gitx.IsWorktree(a.Paths.Shared), a.Paths.Shared},
 	}
 	checks = append(checks, a.basicMemoryMCPDoctorChecks(ctx)...)
 	checks = append(checks,
@@ -97,9 +100,4 @@ func (a *App) doctor(ctx context.Context) error {
 		return fmt.Errorf("%d doctor check(s) failed", failed)
 	}
 	return nil
-}
-
-func isGitWorktree(path string) bool {
-	_, err := os.Stat(filepath.Join(path, ".git"))
-	return err == nil
 }
