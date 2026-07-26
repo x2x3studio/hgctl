@@ -11,10 +11,29 @@ import (
 )
 
 const (
-	MaxEventBytes      = 512 * 1024
-	MaxTextBytes       = 120 * 1024
-	MaxSyncEvents      = 4
-	MaxSyncBytes       = 512 * 1024
+	MaxEventBytes = 512 * 1024
+	MaxTextBytes  = 120 * 1024
+	// Steady-state transport bounds: how much moves outbox -> queue in one sync.
+	//
+	// They protect nothing downstream. The queue is append-only storage and reflect
+	// draws its own slice from it under HG_MAX_BYTES, so how fast the queue FILLS
+	// cannot affect how much the model reads. The only justification was keeping a
+	// per-turn Stop-hook sync small, and per-turn capture is retired - intake is
+	// per-session ingest driven by the scheduler.
+	//
+	// At 4 events they were what starved catch-up: one sync parses up to
+	// syncIngestLimit sessions and can emit dozens of chunk events while transport
+	// moved four, so the outbox grew without bound (measured on another machine:
+	// 635 events queued behind a 4-per-minute drain). Both have to rise together -
+	// they are OR'd, first one wins - or raising the count alone just moves the
+	// stall to the byte cap.
+	//
+	// Measured event sizes: median 4.8KB, mean 14KB, ceiling 120KB. So 1024 events
+	// is ~5MB typical and ~14MB at the mean, and the count is what binds; the byte
+	// cap only catches a batch that is unusually large end to end, which is what
+	// keeps one commit and push finite.
+	MaxSyncEvents      = 1024
+	MaxSyncBytes       = 32 * 1024 * 1024
 	MaxClient          = 64
 	MaxMachineHostname = 255
 	// MaxMetaField bounds the session/project/title frontmatter values so a long

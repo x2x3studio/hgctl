@@ -154,9 +154,10 @@ type queueBatch struct {
 }
 
 // copyOutboxToQueue moves up to a bounded steady-state batch of raw outbox events
-// into the queue worktree. The MaxSyncEvents/MaxSyncBytes bounds keep automatic
-// Stop-hook syncs small; the operator-invoked bulk import deliberately bypasses
-// them via copyOutboxBatch (see drainOutboxToQueue).
+// into the queue worktree. The MaxSyncEvents/MaxSyncBytes bounds exist only to
+// keep a single commit and push finite - see protocol.go for why they are not a
+// throttle. The operator-invoked bulk import removes them entirely via
+// copyOutboxBatch (see drainOutboxToQueue).
 func (a *App) copyOutboxToQueue() (queueBatch, error) {
 	return a.copyOutboxBatch(MaxSyncEvents, MaxSyncBytes)
 }

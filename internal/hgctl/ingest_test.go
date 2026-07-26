@@ -579,12 +579,24 @@ func TestCopyOutboxBatchBoundsAreOptIn(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	bounded, err := app.copyOutboxBatch(MaxSyncEvents, MaxSyncBytes)
+	// An explicit bound is honoured. Written with a literal rather than
+	// MaxSyncEvents so the test keeps checking the MECHANISM when the constant
+	// moves - it used to assert batch == MaxSyncEvents, which silently stopped
+	// testing anything the moment the bound rose above the events seeded.
+	bounded, err := app.copyOutboxBatch(4, MaxSyncBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bounded.EventPaths) != MaxSyncEvents {
-		t.Fatalf("steady-state batch = %d, want the MaxSyncEvents bound %d", len(bounded.EventPaths), MaxSyncEvents)
+	if len(bounded.EventPaths) != 4 {
+		t.Fatalf("bounded batch = %d, want the explicit bound 4", len(bounded.EventPaths))
+	}
+	// A byte bound binds before the event bound when it is the smaller of the two.
+	byteBounded, err := app.copyOutboxBatch(9, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byteBounded.EventPaths) != 1 {
+		t.Fatalf("byte-bounded batch = %d, want 1 (the first event always goes)", len(byteBounded.EventPaths))
 	}
 	unbounded, err := app.copyOutboxBatch(0, 0)
 	if err != nil {
@@ -592,6 +604,25 @@ func TestCopyOutboxBatchBoundsAreOptIn(t *testing.T) {
 	}
 	if len(unbounded.EventPaths) != 9 {
 		t.Fatalf("bulk batch = %d, want all 9 events", len(unbounded.EventPaths))
+	}
+}
+
+// The steady-state bound has to outpace what one sync can INGEST, or the outbox
+// grows without bound and the machine never catches up on its own. It sat at 4
+// events while a single sync parses up to syncIngestLimit sessions, each able to
+// emit many chunk events; the outbox on one machine reached 635 behind that
+// drain. This is a floor on the constant, not on the mechanism.
+func TestSteadyStateTransportOutpacesIngest(t *testing.T) {
+	worstCaseEventsPerSync := syncIngestLimit * 32 // 32 chunk events per session is already generous
+	if MaxSyncEvents < worstCaseEventsPerSync {
+		t.Fatalf("MaxSyncEvents = %d cannot drain %d events one sync can produce; the outbox will grow",
+			MaxSyncEvents, worstCaseEventsPerSync)
+	}
+	// And the byte cap must not quietly become the binding term at the measured
+	// mean event size (~14KB), or raising the count achieved nothing.
+	if want := MaxSyncEvents * 14 * 1024; MaxSyncBytes < want {
+		t.Fatalf("MaxSyncBytes = %d binds before %d events at the measured mean size; want >= %d",
+			MaxSyncBytes, MaxSyncEvents, want)
 	}
 }
 
