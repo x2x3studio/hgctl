@@ -80,6 +80,15 @@ self-updates.
   with the Go standard library (no `gh` needed); the check is throttled to once
   an hour and `hgctl update` forces it now.
 
+- A FIRST install backfills the machine's whole session history in one unbounded
+  pass, because the scheduled path cannot: one sync parses at most
+  syncIngestLimit transcripts, so a machine with thousands of sessions would need
+  hours of ticks to finish it, and nobody should have to remember to run `hgctl
+  ingest` on a machine that was just connected. A re-run of install is repair,
+  not onboarding - a populated ledger takes the ordinary bounded sync. The
+  backfill is never fatal: a machine whose backfill fails is still installed and
+  still scheduled, it just catches up over ticks.
+
 ## Intake protocol (loose)
 
 An event is just a Markdown file with closed frontmatter (`captured_at`,
