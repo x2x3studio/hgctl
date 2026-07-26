@@ -11,6 +11,10 @@ import (
 	"github.com/x2x3studio/hgctl/internal/fsx"
 
 	"github.com/x2x3studio/hgctl/internal/config"
+
+	"github.com/x2x3studio/hgctl/internal/event"
+
+	"github.com/x2x3studio/hgctl/internal/ingest"
 )
 
 func (a *App) Run(ctx context.Context, args []string) int {
@@ -35,7 +39,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		// driven by the scheduler. A stale client hook registration may still
 		// invoke this during the prune window, so drain stdin and exit clean so
 		// no client session is disrupted.
-		_, _ = io.Copy(io.Discard, io.LimitReader(a.In, MaxEventBytes+1))
+		_, _ = io.Copy(io.Discard, io.LimitReader(a.In, event.MaxEventBytes+1))
 	case "sync":
 		err = a.runSync(ctx, args[1:])
 	case "ingest":
@@ -191,7 +195,7 @@ func (a *App) install(ctx context.Context, repo string) error {
 // Never fatal. A machine whose backfill fails is still installed and still
 // scheduled; it just catches up over ticks instead of in one pass.
 func (a *App) initialIntake(ctx context.Context, id config.Identity) error {
-	marks, err := a.loadIngestedSessions()
+	marks, err := a.ingester().LoadLedger()
 	if err != nil {
 		return err
 	}
@@ -199,10 +203,10 @@ func (a *App) initialIntake(ctx context.Context, id config.Identity) error {
 		return a.sync(ctx)
 	}
 	_, _ = fmt.Fprintln(a.Out, "First install: reading this machine's session history. This can take a while.")
-	clients, _ := ingestClients("all")
+	clients, _ := ingest.Clients("all")
 	// limit 0, parseCap 0, minInterval 0: every eligible transcript, once.
-	enqueued, _, ingestErr := a.ingestGrownSessions(id, marks, clients, 0, 0, 0)
-	if err := a.saveIngestedSessions(marks); err != nil {
+	enqueued, _, ingestErr := a.ingester().Run(id, marks, clients, 0, 0, 0)
+	if err := a.ingester().SaveLedger(marks); err != nil {
 		return errors.Join(ingestErr, err)
 	}
 	if ingestErr != nil {

@@ -1,31 +1,21 @@
-package hgctl
+package ingest
 
 import (
-	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
-	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/x2x3studio/hgctl/internal/config"
+	"github.com/x2x3studio/hgctl/internal/event"
+
 	"github.com/x2x3studio/hgctl/internal/fsx"
 
-	"github.com/x2x3studio/hgctl/internal/config"
-)
+	"reflect"
 
-func writeSessionFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
+	"fmt"
+)
 
 func TestExtractClaudeSessionUsesEarliestTimestamp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "claude-sess-1.jsonl")
@@ -142,7 +132,7 @@ func TestCapturedTimeEncodedInEventFilename(t *testing.T) {
 	if !ok {
 		t.Fatal("parseIngestTime failed on fractional-second RFC3339")
 	}
-	name := rawEvent{CapturedAt: captured}.filename()
+	name := event.Raw{CapturedAt: captured}.Filename()
 	// The reflect backlog orders by this filename timestamp, so it must encode
 	// the real session time, not the ingest run time.
 	if !strings.HasPrefix(name, "20260605T034112Z-") {
@@ -167,19 +157,19 @@ func TestIngestKeyIsClientNamespaced(t *testing.T) {
 // overwrite the same outbox file rather than pile up duplicates under fresh
 // random names (which would waste reflect compute downstream).
 func TestReenqueueWithDedupCollapsesInsteadOfDuplicating(t *testing.T) {
-	app := testApp(t)
-	if err := os.MkdirAll(app.Paths.Outbox, 0o700); err != nil {
+	ing := testIngester(t)
+	if err := os.MkdirAll(ing.Paths.Outbox, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	captured := time.Date(2026, 6, 5, 3, 41, 12, 0, time.UTC)
-	ev := rawEvent{CapturedAt: captured, Client: "claude", Machine: "m", Body: "session body", Dedup: ingestKey("claude", "sess-1")}
+	ev := event.Raw{CapturedAt: captured, Client: "claude", Machine: "m", Body: "session body", Dedup: ingestKey("claude", "sess-1")}
 	for i := 0; i < 3; i++ {
-		if err := app.enqueue(ev); err != nil {
+		if err := event.Enqueue(ing.Paths.Outbox, ev); err != nil {
 			t.Fatal(err)
 		}
 	}
 	md := 0
-	entries, err := os.ReadDir(app.Paths.Outbox)
+	entries, err := os.ReadDir(ing.Paths.Outbox)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,23 +184,23 @@ func TestReenqueueWithDedupCollapsesInsteadOfDuplicating(t *testing.T) {
 
 	// Same session id + client at the same second is stable; a different session
 	// at that second gets a distinct suffix; steady-state (no Dedup) stays random.
-	if ev.filename() != (rawEvent{CapturedAt: captured, Body: "grown body", Dedup: ingestKey("claude", "sess-1")}).filename() {
+	if ev.Filename() != (event.Raw{CapturedAt: captured, Body: "grown body", Dedup: ingestKey("claude", "sess-1")}).Filename() {
 		t.Fatal("same session produced different filenames")
 	}
-	if ev.filename() == (rawEvent{CapturedAt: captured, Dedup: ingestKey("claude", "sess-2")}).filename() {
+	if ev.Filename() == (event.Raw{CapturedAt: captured, Dedup: ingestKey("claude", "sess-2")}).Filename() {
 		t.Fatal("distinct sessions collided on filename")
 	}
-	if (rawEvent{CapturedAt: captured}).filename() == (rawEvent{CapturedAt: captured}).filename() {
+	if (event.Raw{CapturedAt: captured}).Filename() == (event.Raw{CapturedAt: captured}).Filename() {
 		t.Fatal("expected a random suffix for a capture without Dedup")
 	}
 }
 
 func TestLoadIngestedSessionsMigratesLegacyLedger(t *testing.T) {
-	app := testApp(t)
-	if err := fsx.WriteJSON(app.ingestedSessionsPath(), []string{"legacy-claude", "codex:known"}, 0o600); err != nil {
+	ing := testIngester(t)
+	if err := fsx.WriteJSON(ing.ingestedSessionsPath(), []string{"legacy-claude", "codex:known"}, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	marks, err := app.loadIngestedSessions()
+	marks, err := ing.LoadLedger()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,15 +219,15 @@ func TestLoadIngestedSessionsMigratesLegacyLedger(t *testing.T) {
 }
 
 func TestIngestedSessionsMarkerRoundTrips(t *testing.T) {
-	app := testApp(t)
-	want := map[string]ingestMark{
+	ing := testIngester(t)
+	want := map[string]Mark{
 		"claude:a": {Size: 4096, Turns: 12, IngestedAt: time.Date(2026, 7, 7, 1, 2, 3, 0, time.UTC)},
 		"codex:b":  {Size: 128, Turns: 3, IngestedAt: time.Date(2026, 7, 8, 4, 5, 6, 0, time.UTC)},
 	}
-	if err := app.saveIngestedSessions(want); err != nil {
+	if err := ing.SaveLedger(want); err != nil {
 		t.Fatal(err)
 	}
-	got, err := app.loadIngestedSessions()
+	got, err := ing.LoadLedger()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,49 +236,48 @@ func TestIngestedSessionsMarkerRoundTrips(t *testing.T) {
 	}
 }
 
-// A scheduler-driven sync re-ingests at most syncIngestLimit new-or-grown
+// A scheduler-driven sync re-ingests at most SyncLimit new-or-grown
 // sessions, leaving the remainder for the next run; an unchanged session is not
 // re-ingested, and a grown one produces a fresh snapshot.
 func TestIngestForSyncBoundsAndReingestsOnGrowth(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	app := testApp(t)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 
-	total := syncIngestLimit + 2
+	total := SyncLimit + 2
 	paths := make([]string, total)
 	for i := 0; i < total; i++ {
 		paths[i] = filepath.Join(home, ".claude", "projects", "proj", fmt.Sprintf("s-%02d.jsonl", i))
 		writeSessionFile(t, paths[i], fmt.Sprintf(`{"type":"user","sessionId":"s-%02d","timestamp":"2026-07-07T02:%02d:00.000Z","message":{"role":"user","content":"A question long enough to qualify for ingest number %02d here."}}`+"\n", i, i, i))
 	}
 
-	id, err := config.LoadIdentity(app.Paths, app.Now)
+	id, err := config.LoadIdentity(ing.Paths, ing.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := app.ingestForSync(id); err != nil {
+	if err := ing.Sync(id); err != nil {
 		t.Fatal(err)
 	}
-	if got := countOutboxMD(t, app); got != syncIngestLimit {
-		t.Fatalf("first sync enqueued %d, want the bounded %d", got, syncIngestLimit)
+	if got := countOutboxMD(t, ing); got != SyncLimit {
+		t.Fatalf("first sync enqueued %d, want the bounded %d", got, SyncLimit)
 	}
 	// The remainder drains on the next run.
-	if err := app.ingestForSync(id); err != nil {
+	if err := ing.Sync(id); err != nil {
 		t.Fatal(err)
 	}
-	if got := countOutboxMD(t, app); got != total {
+	if got := countOutboxMD(t, ing); got != total {
 		t.Fatalf("after two syncs enqueued %d, want all %d", got, total)
 	}
 	// A third sync re-ingests nothing: every session is unchanged since its marker.
-	if err := app.ingestForSync(id); err != nil {
+	if err := ing.Sync(id); err != nil {
 		t.Fatal(err)
 	}
-	if got := countOutboxMD(t, app); got != total {
+	if got := countOutboxMD(t, ing); got != total {
 		t.Fatalf("unchanged sessions were re-ingested: %d, want %d", got, total)
 	}
 
 	// Grow one session past its marker and advance the clock past the min interval;
 	// it is re-snapshotted as a distinct event (new latest-activity time).
-	app.Now = func() time.Time {
+	ing.Now = func() time.Time {
 		return time.Date(2026, 7, 21, 1, 2, 3, 0, time.UTC).Add(2 * defaultIngestMinInterval)
 	}
 	grow := "\n" + `{"type":"user","sessionId":"s-00","timestamp":"2026-07-07T06:00:00.000Z","message":{"role":"user","content":"A follow-up question that grows this session well past its marker size."}}` + "\n"
@@ -300,17 +289,17 @@ func TestIngestForSyncBoundsAndReingestsOnGrowth(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if err := app.ingestForSync(id); err != nil {
+	if err := ing.Sync(id); err != nil {
 		t.Fatal(err)
 	}
-	if got := countOutboxMD(t, app); got != total+1 {
+	if got := countOutboxMD(t, ing); got != total+1 {
 		t.Fatalf("grown session did not produce a fresh snapshot: %d, want %d", got, total+1)
 	}
 }
 
-func countOutboxMD(t *testing.T, app *App) int {
+func countOutboxMD(t *testing.T, ing *Ingester) int {
 	t.Helper()
-	entries, err := os.ReadDir(app.Paths.Outbox)
+	entries, err := os.ReadDir(ing.Paths.Outbox)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,19 +315,18 @@ func countOutboxMD(t *testing.T, app *App) int {
 // A bounded gather (parseCap > 0) parses only the oldest few eligible transcripts
 // by file mtime, so one scheduler-driven sync stays within its context budget.
 func TestGatherSessionsParseCapSelectsOldestByMtime(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	app := testApp(t)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 	for i := 0; i < 5; i++ {
 		p := filepath.Join(home, ".claude", "projects", "proj", fmt.Sprintf("s%02d.jsonl", i))
 		writeSessionFile(t, p, fmt.Sprintf(`{"type":"user","sessionId":"s%02d","timestamp":"2026-07-07T09:00:00.000Z","message":{"role":"user","content":"A completed question long enough to qualify for ingest number %02d."}}`+"\n", i, i))
 		// s00 is the oldest by mtime, s04 the newest; content time is identical.
-		mtime := app.Now().Add(-time.Duration(10-i) * time.Hour)
+		mtime := ing.Now().Add(-time.Duration(10-i) * time.Hour)
 		if err := os.Chtimes(p, mtime, mtime); err != nil {
 			t.Fatal(err)
 		}
 	}
-	got, _, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 2)
+	got, _, err := ing.gatherSessions("claude", map[string]Mark{}, 0, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,8 +340,8 @@ func TestGatherSessionsParseCapSelectsOldestByMtime(t *testing.T) {
 }
 
 func TestGatherSessionsIsClientNamespaced(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 	// A Claude and a Codex session that happen to share the same id string.
 	claudePath := filepath.Join(home, ".claude", "projects", "proj", "shared.jsonl")
 	writeSessionFile(t, claudePath,
@@ -365,24 +353,23 @@ func TestGatherSessionsIsClientNamespaced(t *testing.T) {
 			`{"timestamp":"2026-07-07T02:30:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"A Codex question long enough to qualify for ingest here."}]}}`,
 		}, "\n")+"\n")
 
-	app := testApp(t)
 	// The Claude session is already ingested at a size no smaller than its current
 	// one, so it is not re-ingested; the codex sibling shares the id string but has
 	// its own namespaced marker (absent) and must ingest. The ledger unit is the
 	// file (relative path for Claude, rollout id for Codex), so mark the Claude file
 	// by its own key.
-	marks := map[string]ingestMark{
-		ingestUnitKey("claude", claudePath): {Size: 1 << 20, IngestedAt: app.Now().Add(-time.Hour)},
+	marks := map[string]Mark{
+		ingestUnitKey("claude", claudePath): {Size: 1 << 20, IngestedAt: ing.Now().Add(-time.Hour)},
 	}
 
-	claude, _, err := app.gatherSessions("claude", marks, 0, 0)
+	claude, _, err := ing.gatherSessions("claude", marks, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(claude) != 0 {
 		t.Fatalf("claude sessions = %d, want 0 (already ingested, not grown)", len(claude))
 	}
-	codex, _, err := app.gatherSessions("codex", marks, 0, 0)
+	codex, _, err := ing.gatherSessions("codex", marks, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,9 +385,8 @@ func TestGatherSessionsIsClientNamespaced(t *testing.T) {
 // A new session ingests regardless of recency; a session that has not grown past
 // its marker is skipped; one that renders empty is never enqueued.
 func TestGatherSessionsGrowthAndSkipsEmpty(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	app := testApp(t)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 
 	fresh := filepath.Join(home, ".claude", "projects", "proj", "fresh.jsonl")
 	writeSessionFile(t, fresh,
@@ -420,11 +406,11 @@ func TestGatherSessionsGrowthAndSkipsEmpty(t *testing.T) {
 	}
 	// "unchanged" is marked at exactly its current size, so it is not re-ingested.
 	// The ledger unit is the file, so mark it by its per-file key.
-	marks := map[string]ingestMark{
-		ingestUnitKey("claude", unchanged): {Size: info.Size(), IngestedAt: app.Now().Add(-time.Hour)},
+	marks := map[string]Mark{
+		ingestUnitKey("claude", unchanged): {Size: info.Size(), IngestedAt: ing.Now().Add(-time.Hour)},
 	}
 
-	got, _, err := app.gatherSessions("claude", marks, 0, 0)
+	got, _, err := ing.gatherSessions("claude", marks, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,9 +436,8 @@ func mustStatSize(t *testing.T, path string) int64 {
 // ingest unit (a distinct per-file key), so all sub-agent work reaches the queue and
 // its cursor never collides with the parent session.
 func TestGatherSessionsIngestsNestedSubagentAsOwnUnit(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	app := testApp(t)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 
 	const parent = "parent-sess-id"
 	top := filepath.Join(home, ".claude", "projects", "proj", parent+".jsonl")
@@ -464,7 +449,7 @@ func TestGatherSessionsIngestsNestedSubagentAsOwnUnit(t *testing.T) {
 	writeSessionFile(t, sub,
 		`{"type":"user","sessionId":"`+parent+`","isSidechain":true,"cwd":"/tmp/p","timestamp":"2026-07-07T03:00:00.000Z","message":{"role":"user","content":"A sub-agent question long enough to qualify for ingest here too."}}`+"\n")
 
-	got, _, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 0)
+	got, _, err := ing.gatherSessions("claude", map[string]Mark{}, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,9 +473,8 @@ func TestGatherSessionsIngestsNestedSubagentAsOwnUnit(t *testing.T) {
 // Two sub-agent transcripts with the same basename under different parent sessions
 // must get distinct keys (a basename-only key would collide) and both ingest.
 func TestGatherSessionsSameBasenameDifferentParentsDistinctKeys(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	app := testApp(t)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 
 	a := filepath.Join(home, ".claude", "projects", "proj", "parent-A", "subagents", "foo.jsonl")
 	writeSessionFile(t, a,
@@ -499,7 +483,7 @@ func TestGatherSessionsSameBasenameDifferentParentsDistinctKeys(t *testing.T) {
 	writeSessionFile(t, b,
 		`{"type":"user","sessionId":"parent-B","timestamp":"2026-07-07T02:30:00.000Z","message":{"role":"user","content":"Sub-agent B question long enough to qualify for ingest here."}}`+"\n")
 
-	got, _, err := app.gatherSessions("claude", map[string]ingestMark{}, 0, 0)
+	got, _, err := ing.gatherSessions("claude", map[string]Mark{}, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -515,30 +499,29 @@ func TestGatherSessionsSameBasenameDifferentParentsDistinctKeys(t *testing.T) {
 // own event whose `session:` frontmatter is the CONTENT (parent) sessionId, and its
 // cursor is stored under the per-file key, never colliding with the parent session.
 func TestIngestNestedSubagentEndToEnd(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	app := testApp(t)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 
 	const parent = "parent-xyz"
 	sub := filepath.Join(home, ".claude", "projects", "proj", parent, "subagents", "workflows", "reflect.jsonl")
 	writeSessionFile(t, sub,
 		`{"type":"user","sessionId":"`+parent+`","isSidechain":true,"cwd":"/tmp/p","timestamp":"2026-07-07T03:00:00.000Z","message":{"role":"user","content":"A sub-agent workflow question long enough to qualify for ingest here."}}`+"\n")
 
-	id, err := config.LoadIdentity(app.Paths, app.Now)
+	id, err := config.LoadIdentity(ing.Paths, ing.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := app.ingestForSync(id); err != nil {
+	if err := ing.Sync(id); err != nil {
 		t.Fatal(err)
 	}
-	evs := readOutboxEvents(t, app)
+	evs := readOutboxEvents(t, ing)
 	if len(evs) != 1 {
 		t.Fatalf("sub-agent transcript produced %d events, want 1", len(evs))
 	}
 	if evs[0].meta["session"] != parent {
 		t.Fatalf("event session = %q, want the content (parent) sessionId %q", evs[0].meta["session"], parent)
 	}
-	marks, _ := app.loadIngestedSessions()
+	marks, _ := ing.LoadLedger()
 	if marks[ingestUnitKey("claude", sub)].Turns == 0 {
 		t.Fatal("sub-agent cursor was not stored under its per-file key")
 	}
@@ -551,337 +534,27 @@ func TestShouldReingest(t *testing.T) {
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
 	interval := 5 * time.Minute
 	// No marker: a new session ingests once regardless of interval.
-	if !shouldReingest(ingestMark{}, 100, now, interval) {
+	if !shouldReingest(Mark{}, 100, now, interval) {
 		t.Fatal("a new session should ingest")
 	}
 	// Not grown: skip.
-	if shouldReingest(ingestMark{Size: 100, IngestedAt: now.Add(-time.Hour)}, 100, now, interval) {
+	if shouldReingest(Mark{Size: 100, IngestedAt: now.Add(-time.Hour)}, 100, now, interval) {
 		t.Fatal("an unchanged session should not re-ingest")
 	}
 	// Grown but within the min interval: throttled.
-	if shouldReingest(ingestMark{Size: 100, IngestedAt: now.Add(-time.Minute)}, 200, now, interval) {
+	if shouldReingest(Mark{Size: 100, IngestedAt: now.Add(-time.Minute)}, 200, now, interval) {
 		t.Fatal("a grown session within the min interval should be throttled")
 	}
 	// Grown and past the min interval: re-ingest.
-	if !shouldReingest(ingestMark{Size: 100, IngestedAt: now.Add(-time.Hour)}, 200, now, interval) {
+	if !shouldReingest(Mark{Size: 100, IngestedAt: now.Add(-time.Hour)}, 200, now, interval) {
 		t.Fatal("a grown session past the min interval should re-ingest")
 	}
 	// Grown, with a zero interval (bulk ingest): re-ingest immediately.
-	if !shouldReingest(ingestMark{Size: 100, IngestedAt: now}, 200, now, 0) {
+	if !shouldReingest(Mark{Size: 100, IngestedAt: now}, 200, now, 0) {
 		t.Fatal("a grown session with no throttle should re-ingest")
 	}
 }
 
-func TestCopyOutboxBatchBoundsAreOptIn(t *testing.T) {
-	app := testApp(t)
-	if err := os.MkdirAll(filepath.Join(app.Paths.Queue, "events"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 9; i++ {
-		captured := time.Date(2026, 6, 5, 0, 0, i, 0, time.UTC)
-		if err := app.enqueue(rawEvent{CapturedAt: captured, Client: "codex", Machine: "m", Body: "event body long enough"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// An explicit bound is honoured. Written with a literal rather than
-	// MaxSyncEvents so the test keeps checking the MECHANISM when the constant
-	// moves - it used to assert batch == MaxSyncEvents, which silently stopped
-	// testing anything the moment the bound rose above the events seeded.
-	bounded, err := app.copyOutboxBatch(4, MaxSyncBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(bounded.EventPaths) != 4 {
-		t.Fatalf("bounded batch = %d, want the explicit bound 4", len(bounded.EventPaths))
-	}
-	// A byte bound binds before the event bound when it is the smaller of the two.
-	byteBounded, err := app.copyOutboxBatch(9, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(byteBounded.EventPaths) != 1 {
-		t.Fatalf("byte-bounded batch = %d, want 1 (the first event always goes)", len(byteBounded.EventPaths))
-	}
-	unbounded, err := app.copyOutboxBatch(0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(unbounded.EventPaths) != 9 {
-		t.Fatalf("bulk batch = %d, want all 9 events", len(unbounded.EventPaths))
-	}
-}
-
-// The steady-state bound has to outpace what one sync can INGEST, or the outbox
-// grows without bound and the machine never catches up on its own. It sat at 4
-// events while a single sync parses up to syncIngestLimit sessions, each able to
-// emit many chunk events; the outbox on one machine reached 635 behind that
-// drain. This is a floor on the constant, not on the mechanism.
-func TestSteadyStateTransportOutpacesIngest(t *testing.T) {
-	worstCaseEventsPerSync := syncIngestLimit * 32 // 32 chunk events per session is already generous
-	if MaxSyncEvents < worstCaseEventsPerSync {
-		t.Fatalf("MaxSyncEvents = %d cannot drain %d events one sync can produce; the outbox will grow",
-			MaxSyncEvents, worstCaseEventsPerSync)
-	}
-	// And the byte cap must not quietly become the binding term at the measured
-	// mean event size (~14KB), or raising the count achieved nothing.
-	if want := MaxSyncEvents * 14 * 1024; MaxSyncBytes < want {
-		t.Fatalf("MaxSyncBytes = %d binds before %d events at the measured mean size; want >= %d",
-			MaxSyncBytes, MaxSyncEvents, want)
-	}
-}
-
-func setupBulkQueue(t *testing.T) (*App, string, string) {
-	t.Helper()
-	dir := t.TempDir()
-	origin := filepath.Join(dir, "origin.git")
-	runGitTest(t, "", "init", "--bare", origin)
-
-	app := testApp(t)
-	control := app.Paths.Control
-	runGitTest(t, "", "init", "-b", "main", control)
-	runGitTest(t, control, "config", "user.name", "chinaboard")
-	runGitTest(t, control, "config", "user.email", "chinaboard@gmail.com")
-	runGitTest(t, control, "remote", "add", "origin", origin)
-
-	id, err := config.LoadIdentity(app.Paths, app.Now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	branch := "queue/" + id.ID
-	if err := app.seedOrphanQueueBranch(testContext(t), branch); err != nil {
-		t.Fatal(err)
-	}
-	if err := app.ensureWorktree(testContext(t), app.Paths.Queue, branch, branch); err != nil {
-		t.Fatal(err)
-	}
-	return app, origin, branch
-}
-
-func TestDrainOutboxToQueuePublishesEntireBacklog(t *testing.T) {
-	app, origin, branch := setupBulkQueue(t)
-	state := config.State{RepoURL: origin, QueueBranch: branch}
-
-	const events = 9 // more than MaxSyncEvents, so a steady-state sync could not do this in one push
-	for i := 0; i < events; i++ {
-		captured := time.Date(2026, 6, 5, 0, 0, i, 0, time.UTC)
-		if err := app.enqueue(rawEvent{CapturedAt: captured, Client: "codex", Machine: "m", Body: "backlog event body"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	delivered, err := app.drainOutboxToQueue(testContext(t), state)
-	if err != nil {
-		t.Fatalf("drain: %v", err)
-	}
-	if delivered != events {
-		t.Fatalf("delivered = %d, want %d", delivered, events)
-	}
-
-	// Every event committed under events/ alongside the orphan .gitkeep seed.
-	tracked := strings.Fields(runGitTest(t, app.Paths.Queue, "ls-tree", "-r", "--name-only", "HEAD"))
-	md := 0
-	for _, name := range tracked {
-		if strings.HasPrefix(name, "events/") && strings.HasSuffix(name, ".md") {
-			md++
-		}
-	}
-	if md != events {
-		t.Fatalf("committed %d event files, want %d (tracked: %v)", md, events, tracked)
-	}
-
-	// The whole backlog landed on origin, not just a bounded batch.
-	local := strings.TrimSpace(runGitTest(t, app.Paths.Queue, "rev-parse", "HEAD"))
-	remote := strings.TrimSpace(runGitTest(t, origin, "rev-parse", "refs/heads/"+branch))
-	if local != remote {
-		t.Fatalf("origin not updated: local=%s remote=%s", local, remote)
-	}
-
-	// It fit in a few commits (seed + bulk), not one commit per event.
-	commits := strings.TrimSpace(runGitTest(t, app.Paths.Queue, "rev-list", "--count", "HEAD"))
-	if commits != "2" {
-		t.Fatalf("commit count = %s, want 2 (orphan seed + one bulk commit)", commits)
-	}
-
-	// Outbox drained.
-	entries, err := os.ReadDir(app.Paths.Outbox)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".md") {
-			t.Fatalf("outbox still holds %s after bulk delivery", e.Name())
-		}
-	}
-}
-
-func TestBulkPublishQueueRejectsForeignBranch(t *testing.T) {
-	app := testApp(t)
-	if err := config.SaveState(app.Paths, config.State{RepoURL: "x", QueueBranch: "queue/not-this-machine"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := app.bulkPublishQueue(testContext(t)); err == nil {
-		t.Fatal("expected a branch/identity mismatch error")
-	}
-}
-
-// A bulk ingest stages up to bulkQueueCommitChunk events before committing, so an
-// interruption after copy/stage but before commit leaves more than MaxSyncEvents
-// events in the queue worktree. Recovery must fold the whole validated batch, not
-// wedge on the steady-state caps.
-func TestRecoverInterruptedQueueBatchExceedsSteadyStateCaps(t *testing.T) {
-	app, _, _ := setupBulkQueue(t)
-
-	const events = 9 // more than MaxSyncEvents
-	for i := 0; i < events; i++ {
-		captured := time.Date(2026, 6, 5, 0, 0, i, 0, time.UTC)
-		if err := app.enqueue(rawEvent{CapturedAt: captured, Client: "codex", Machine: "m", Body: "interrupted batch body"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Copy and stage the batch into the worktree, then stop short of the commit to
-	// simulate a crash mid-bulk-ingest.
-	batch, err := app.copyOutboxBatch(bulkQueueCommitChunk, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(batch.EventPaths) != events {
-		t.Fatalf("staged %d events, want %d", len(batch.EventPaths), events)
-	}
-	runGitTest(t, app.Paths.Queue, append([]string{"add", "--"}, batch.EventPaths...)...)
-
-	recovered, err := app.recoverInterruptedQueueBatch(testContext(t))
-	if err != nil {
-		t.Fatalf("recovery of a >MaxSyncEvents interrupted batch failed: %v", err)
-	}
-	if len(recovered.EventPaths) != events {
-		t.Fatalf("recovered %d events, want the full %d", len(recovered.EventPaths), events)
-	}
-	if len(recovered.OutboxPaths) != events {
-		t.Fatalf("recovered %d outbox paths, want %d", len(recovered.OutboxPaths), events)
-	}
-}
-
-// ---- delta + complete + chunked model ----
-
-func repeatText(n int) string {
-	return strings.Repeat("a", n)
-}
-
-// claudeLine renders one Claude transcript line. User content is a plain string;
-// assistant content is a text-block array, matching real transcripts.
-func claudeLine(t *testing.T, id, cwd, role, ts, text string) string {
-	t.Helper()
-	var content any = text
-	if role == "assistant" {
-		content = []any{map[string]any{"type": "text", "text": text}}
-	}
-	rec := map[string]any{
-		"type":      role,
-		"sessionId": id,
-		"timestamp": ts,
-		"message":   map[string]any{"role": role, "content": content},
-	}
-	if cwd != "" {
-		rec["cwd"] = cwd
-	}
-	b, err := json.Marshal(rec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(b)
-}
-
-// writeClaudeSession writes a Claude transcript of alternating user/assistant turns
-// (turn i is user when i is even) with the given per-turn texts, optionally led by
-// an ai-title line.
-func writeClaudeSession(t *testing.T, path, id, cwd, title string, texts []string) {
-	t.Helper()
-	var lines []string
-	if title != "" {
-		lines = append(lines, fmt.Sprintf(`{"type":"ai-title","aiTitle":%q}`, title))
-	}
-	for i, text := range texts {
-		role := "user"
-		if i%2 == 1 {
-			role = "assistant"
-		}
-		ts := fmt.Sprintf("2026-07-07T02:%02d:00.000Z", i)
-		lines = append(lines, claudeLine(t, id, cwd, role, ts, text))
-	}
-	writeSessionFile(t, path, strings.Join(lines, "\n")+"\n")
-}
-
-type outboxEvent struct {
-	name string
-	meta map[string]string
-	body string
-}
-
-// readOutboxEvents reads every outbox .md event, parses its closed frontmatter and
-// body, and returns them sorted by filename (the reflect backlog order).
-func readOutboxEvents(t *testing.T, app *App) []outboxEvent {
-	t.Helper()
-	entries, err := os.ReadDir(app.Paths.Outbox)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var evs []outboxEvent
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".md") {
-			continue
-		}
-		content, err := os.ReadFile(filepath.Join(app.Paths.Outbox, e.Name()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		meta, body := splitEventFrontmatter(t, string(content))
-		evs = append(evs, outboxEvent{name: e.Name(), meta: meta, body: body})
-	}
-	sort.Slice(evs, func(i, j int) bool { return evs[i].name < evs[j].name })
-	return evs
-}
-
-func splitEventFrontmatter(t *testing.T, content string) (map[string]string, string) {
-	t.Helper()
-	if !strings.HasPrefix(content, "---\n") {
-		t.Fatal("event is missing opening frontmatter")
-	}
-	rest := content[len("---\n"):]
-	idx := strings.Index(rest, "\n---\n")
-	if idx < 0 {
-		t.Fatal("event has unterminated frontmatter")
-	}
-	meta := map[string]string{}
-	for _, line := range strings.Split(rest[:idx], "\n") {
-		if line == "" {
-			continue
-		}
-		key, value, _ := strings.Cut(line, ":")
-		meta[strings.TrimSpace(key)] = strings.TrimSpace(value)
-	}
-	return meta, strings.TrimSpace(rest[idx+len("\n---\n"):])
-}
-
-func parseTurnsRange(t *testing.T, value string) (int, int) {
-	t.Helper()
-	lo, hi, ok := strings.Cut(value, "-")
-	if !ok {
-		t.Fatalf("turns range %q is not <start>-<end>", value)
-	}
-	start, err := strconv.Atoi(lo)
-	if err != nil {
-		t.Fatalf("turns start %q: %v", lo, err)
-	}
-	end, err := strconv.Atoi(hi)
-	if err != nil {
-		t.Fatalf("turns end %q: %v", hi, err)
-	}
-	return start, end
-}
-
-// A delta is split into ordered chunks whose bodies stay within the bound, cover
-// the whole delta contiguously, and never truncate a turn.
 func TestChunkDeltaTurnsCompleteContiguousBounded(t *testing.T) {
 	const n = 6
 	turns := make([]ingestTurn, n)
@@ -892,7 +565,7 @@ func TestChunkDeltaTurnsCompleteContiguousBounded(t *testing.T) {
 		}
 		turns[i] = ingestTurn{role: role, text: repeatText(20000), ts: fmt.Sprintf("2026-07-07T02:%02d:00.000Z", i)}
 	}
-	chunks := chunkDeltaTurns("", 0, turns, ingestChunkBytes)
+	chunks := chunkDeltaTurns("", 0, turns, chunkBytes)
 	if len(chunks) < 2 {
 		t.Fatalf("expected the delta to split into multiple chunks, got %d", len(chunks))
 	}
@@ -906,8 +579,8 @@ func TestChunkDeltaTurnsCompleteContiguousBounded(t *testing.T) {
 		if i > 0 && ch.start != chunks[i-1].end {
 			t.Fatalf("chunk %d starts at %d, want contiguous with previous end %d", i, ch.start, chunks[i-1].end)
 		}
-		if ch.end-ch.start > 1 && len(ch.body) > ingestChunkBytes {
-			t.Fatalf("multi-turn chunk %d body = %d bytes, exceeds bound %d", i, len(ch.body), ingestChunkBytes)
+		if ch.end-ch.start > 1 && len(ch.body) > chunkBytes {
+			t.Fatalf("multi-turn chunk %d body = %d bytes, exceeds bound %d", i, len(ch.body), chunkBytes)
 		}
 		if strings.Contains(ch.body, "truncated") {
 			t.Fatalf("chunk %d body was truncated:\n%s", i, ch.body[:80])
@@ -917,13 +590,13 @@ func TestChunkDeltaTurnsCompleteContiguousBounded(t *testing.T) {
 
 // A single turn larger than the chunk bound is emitted whole in its own chunk.
 func TestChunkDeltaTurnsOversizedTurnEmittedWhole(t *testing.T) {
-	big := repeatText(ingestChunkBytes * 2)
+	big := repeatText(chunkBytes * 2)
 	turns := []ingestTurn{
 		{role: "user", text: "short lead-in turn", ts: "2026-07-07T02:00:00.000Z"},
 		{role: "assistant", text: big, ts: "2026-07-07T02:01:00.000Z"},
 		{role: "user", text: "short trailing turn", ts: "2026-07-07T02:02:00.000Z"},
 	}
-	chunks := chunkDeltaTurns("", 0, turns, ingestChunkBytes)
+	chunks := chunkDeltaTurns("", 0, turns, chunkBytes)
 	if len(chunks) != 3 {
 		t.Fatalf("chunks = %d, want 3 (lead, whole big turn, trailing)", len(chunks))
 	}
@@ -944,9 +617,8 @@ func TestChunkDeltaTurnsOversizedTurnEmittedWhole(t *testing.T) {
 // the turn ranges are contiguous and cover 0..N, the filename order is chunk order,
 // and nothing is truncated.
 func TestFirstIngestEmitsCompleteChunkedFrontmatterOrdered(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	app := testApp(t)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 
 	const n = 6
 	texts := make([]string, n)
@@ -956,15 +628,15 @@ func TestFirstIngestEmitsCompleteChunkedFrontmatterOrdered(t *testing.T) {
 	path := filepath.Join(home, ".claude", "projects", "proj", "big.jsonl")
 	writeClaudeSession(t, path, "big-sess", "/tmp/proj", "My Session", texts)
 
-	id, err := config.LoadIdentity(app.Paths, app.Now)
+	id, err := config.LoadIdentity(ing.Paths, ing.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := app.ingestForSync(id); err != nil {
+	if err := ing.Sync(id); err != nil {
 		t.Fatal(err)
 	}
 
-	evs := readOutboxEvents(t, app)
+	evs := readOutboxEvents(t, ing)
 	if len(evs) < 2 {
 		t.Fatalf("expected a chunked delta of multiple events, got %d", len(evs))
 	}
@@ -1009,9 +681,8 @@ func TestFirstIngestEmitsCompleteChunkedFrontmatterOrdered(t *testing.T) {
 // After a session is ingested, growing it by K turns emits only those K new turns
 // (the delta) and advances the turn cursor; a run with no growth emits nothing.
 func TestIngestEmitsOnlyDeltaOnGrowth(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	app := testApp(t)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 
 	path := filepath.Join(home, ".claude", "projects", "proj", "grow.jsonl")
 	writeClaudeSession(t, path, "grow-sess", "/tmp/g", "", []string{
@@ -1021,20 +692,20 @@ func TestIngestEmitsOnlyDeltaOnGrowth(t *testing.T) {
 	// The turn cursor lives under the per-file key, not the content sessionId.
 	fileKey := ingestUnitKey("claude", path)
 
-	id, err := config.LoadIdentity(app.Paths, app.Now)
+	id, err := config.LoadIdentity(ing.Paths, ing.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := app.ingestForSync(id); err != nil {
+	if err := ing.Sync(id); err != nil {
 		t.Fatal(err)
 	}
-	if got := countOutboxMD(t, app); got != 1 {
+	if got := countOutboxMD(t, ing); got != 1 {
 		t.Fatalf("first ingest events = %d, want 1", got)
 	}
-	if evs := readOutboxEvents(t, app); evs[0].meta["turns"] != "0-2" {
+	if evs := readOutboxEvents(t, ing); evs[0].meta["turns"] != "0-2" {
 		t.Fatalf("first event turns = %q, want 0-2", evs[0].meta["turns"])
 	}
-	marks, _ := app.loadIngestedSessions()
+	marks, _ := ing.LoadLedger()
 	if marks[fileKey].Turns != 2 {
 		t.Fatalf("cursor after first ingest = %d, want 2", marks[fileKey].Turns)
 	}
@@ -1053,16 +724,16 @@ func TestIngestEmitsOnlyDeltaOnGrowth(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	app.Now = func() time.Time {
+	ing.Now = func() time.Time {
 		return time.Date(2026, 7, 21, 1, 2, 3, 0, time.UTC).Add(2 * defaultIngestMinInterval)
 	}
-	if err := app.ingestForSync(id); err != nil {
+	if err := ing.Sync(id); err != nil {
 		t.Fatal(err)
 	}
-	if got := countOutboxMD(t, app); got != 2 {
+	if got := countOutboxMD(t, ing); got != 2 {
 		t.Fatalf("after growth events = %d, want 2 (original + one delta)", got)
 	}
-	evs := readOutboxEvents(t, app)
+	evs := readOutboxEvents(t, ing)
 	delta := evs[len(evs)-1]
 	if delta.meta["turns"] != "2-4" {
 		t.Fatalf("delta event turns = %q, want 2-4 (only the new turns)", delta.meta["turns"])
@@ -1073,15 +744,15 @@ func TestIngestEmitsOnlyDeltaOnGrowth(t *testing.T) {
 	if !strings.Contains(delta.body, "follow-up question") {
 		t.Fatal("delta event is missing the new turn")
 	}
-	if marks, _ := app.loadIngestedSessions(); marks[fileKey].Turns != 4 {
+	if marks, _ := ing.LoadLedger(); marks[fileKey].Turns != 4 {
 		t.Fatalf("cursor after growth = %d, want 4", marks[fileKey].Turns)
 	}
 
 	// A run with no growth emits nothing more.
-	if err := app.ingestForSync(id); err != nil {
+	if err := ing.Sync(id); err != nil {
 		t.Fatal(err)
 	}
-	if got := countOutboxMD(t, app); got != 2 {
+	if got := countOutboxMD(t, ing); got != 2 {
 		t.Fatalf("unchanged session re-ingested: events = %d, want 2", got)
 	}
 }
@@ -1102,7 +773,7 @@ func TestAssignChunkCapturedNudgesSameSecondCollisions(t *testing.T) {
 
 	names := make([]string, len(chunks))
 	for i, ch := range chunks {
-		names[i] = rawEvent{CapturedAt: ch.captured, Dedup: fmt.Sprintf("claude:s:%d-%d", ch.start, ch.end)}.filename()
+		names[i] = event.Raw{CapturedAt: ch.captured, Dedup: fmt.Sprintf("claude:s:%d-%d", ch.start, ch.end)}.Filename()
 	}
 	for i := 1; i < len(names); i++ {
 		if !(names[i-1] < names[i]) {
@@ -1117,21 +788,21 @@ func TestAssignChunkCapturedNudgesSameSecondCollisions(t *testing.T) {
 // The session-identity frontmatter is present only for a real chunk; a steady-state
 // event (no session, zero turn range) keeps the base frontmatter unchanged.
 func TestMarshalSessionFrontmatterGated(t *testing.T) {
-	chunk := rawEvent{
+	chunk := event.Raw{
 		CapturedAt: time.Date(2026, 6, 5, 3, 41, 12, 0, time.UTC),
 		Client:     "claude", Machine: "m",
 		Session: "sess-1", Project: "/tmp/p", Title: "T",
 		TurnStart: 2, TurnEnd: 5, Body: "USER: hi",
 	}
-	got := string(chunk.marshal())
+	got := string(chunk.Marshal())
 	for _, want := range []string{"session: sess-1\n", "project: /tmp/p\n", "title: T\n", "turns: 2-5\n"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("chunk frontmatter missing %q:\n%s", want, got)
 		}
 	}
 
-	steady := rawEvent{CapturedAt: chunk.CapturedAt, Client: "codex", Machine: "m", Body: "raw"}
-	base := string(steady.marshal())
+	steady := event.Raw{CapturedAt: chunk.CapturedAt, Client: "codex", Machine: "m", Body: "raw"}
+	base := string(steady.Marshal())
 	for _, absent := range []string{"session:", "project:", "title:", "turns:"} {
 		if strings.Contains(base, absent) {
 			t.Fatalf("steady-state event should not carry %q:\n%s", absent, base)
@@ -1140,8 +811,8 @@ func TestMarshalSessionFrontmatterGated(t *testing.T) {
 
 	// A title with an embedded newline cannot break the closed frontmatter: it is
 	// folded onto one line, so no new "evil:" key appears at a line start.
-	injected := rawEvent{CapturedAt: chunk.CapturedAt, Client: "claude", Machine: "m", Session: "s", Title: "line1\nevil: x", TurnStart: 0, TurnEnd: 1, Body: "b"}
-	if strings.Contains(string(injected.marshal()), "\nevil: x") {
+	injected := event.Raw{CapturedAt: chunk.CapturedAt, Client: "claude", Machine: "m", Session: "s", Title: "line1\nevil: x", TurnStart: 0, TurnEnd: 1, Body: "b"}
+	if strings.Contains(string(injected.Marshal()), "\nevil: x") {
 		t.Fatal("newline in title leaked a frontmatter line")
 	}
 }
@@ -1163,8 +834,8 @@ func codexTurn(ts, role, want, text string) string {
 // COUNT would make the second one skip its own opening turns. Hence content
 // matching, which this test pins.
 func TestCodexForkReplayIsNotReingested(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	ing := testIngester(t)
+	home := ing.Paths.Home
 	dir := filepath.Join(home, ".codex", "sessions", "2026", "07", "18")
 
 	parentBody := []string{
@@ -1192,17 +863,16 @@ func TestCodexForkReplayIsNotReingested(t *testing.T) {
 			strings.Join(body, "\n")+"\n")
 	}
 
-	app := testApp(t)
-	if err := os.MkdirAll(app.Paths.Outbox, 0o700); err != nil {
+	if err := os.MkdirAll(ing.Paths.Outbox, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	marks := map[string]ingestMark{}
-	if _, _, err := app.ingestGrownSessions(config.Identity{ID: "m1"}, marks, []string{"codex"}, 0, 0, 0); err != nil {
+	marks := map[string]Mark{}
+	if _, _, err := ing.Run(config.Identity{ID: "m1"}, marks, []string{"codex"}, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 
 	var bodies []string
-	for _, ev := range readOutboxEvents(t, app) {
+	for _, ev := range readOutboxEvents(t, ing) {
 		bodies = append(bodies, ev.body)
 	}
 	joined := strings.Join(bodies, "\n---\n")

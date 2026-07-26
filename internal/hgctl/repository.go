@@ -285,7 +285,7 @@ func (a *App) sync(ctx context.Context) error {
 		// idle-complete ingest in before the queue drain so live sessions land in
 		// the outbox per-session with no per-turn hooks. Non-fatal: still drain and
 		// publish whatever is already queued.
-		if err := a.ingestForSync(identity); err != nil {
+		if err := a.ingester().Sync(identity); err != nil {
 			errs = append(errs, fmt.Errorf("session ingest: %w", err))
 		}
 		if err := a.syncQueueUnlocked(syncCtx, state); err != nil {

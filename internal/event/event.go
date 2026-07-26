@@ -1,10 +1,20 @@
-package hgctl
+// Package event owns the on-disk shape of one captured event and the outbox it
+// lands in.
+//
+// An event is deliberately dumb: closed frontmatter plus a free-form body, with
+// no kinds, no schema, and no validation. Intake is loose on purpose - every
+// judgement about what deserves to be remembered happens later, in the one
+// central reflect step - so the only rules here are the ones that keep a file
+// parseable: bounded fields, no frontmatter injection, and a filename that sorts
+// chronologically.
+package event
 
 import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -44,13 +54,13 @@ const (
 	MaxMetaField = 1024
 )
 
-// rawEvent is one captured intake item. The thin protocol has no schema, kinds,
+// Raw is one captured intake item. The thin protocol has no schema, kinds,
 // canonical identity, or validation: an event is a Markdown file with closed
 // frontmatter (captured_at, client, machine[, hostname]) and a free-form body.
 // Session-intake chunks additionally carry the session identity (session, project,
 // title) and the half-open turn range this chunk covers within the session (turns);
 // steady-state captures leave those zero and emit only the base frontmatter.
-type rawEvent struct {
+type Raw struct {
 	CapturedAt time.Time
 	Client     string
 	Machine    string
@@ -74,8 +84,11 @@ type rawEvent struct {
 }
 
 // filename is timestamp-ordered and collision-free. The suffix is random for
-// steady-state captures but deterministic when Dedup is set (see rawEvent.Dedup).
-func (e rawEvent) filename() string {
+// steady-state captures but deterministic when Dedup is set (see Raw.Dedup).
+// Filename sorts chronologically and is unique per event: the capture time to
+// millisecond precision plus random bytes, because two events in one
+// millisecond are ordinary during a bulk backfill.
+func (e Raw) Filename() string {
 	suffix := randHex(4)
 	if e.Dedup != "" {
 		sum := sha256.Sum256([]byte(e.Dedup))
@@ -85,7 +98,8 @@ func (e rawEvent) filename() string {
 }
 
 // marshal renders the event as a Markdown file.
-func (e rawEvent) marshal() []byte {
+// Marshal renders the event as Markdown with closed frontmatter.
+func (e Raw) Marshal() []byte {
 	var b strings.Builder
 	b.WriteString("---\n")
 	fmt.Fprintf(&b, "captured_at: %s\n", e.CapturedAt.UTC().Format(time.RFC3339))
@@ -156,4 +170,15 @@ func validLowerHex(value string, length int) bool {
 		}
 	}
 	return true
+}
+
+// Enqueue atomically writes one event into the outbox.
+//
+// The outbox exists so intake never has to touch git: ingest writes here, and
+// the next sync moves a batch into the queue worktree and pushes. Nothing is
+// deleted until that push succeeds, so a failed push replays rather than losing
+// the event - which is the whole of the delivery guarantee. There is no content
+// identity or receipt; dedup is git's job downstream.
+func Enqueue(outbox string, e Raw) error {
+	return fsx.WriteAtomic(filepath.Join(outbox, e.Filename()), e.Marshal(), 0o600)
 }

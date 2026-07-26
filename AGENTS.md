@@ -26,6 +26,30 @@ using Basic Memory), never here. hgctl only ingests raw session transcripts,
 moves them between the machine and Git, keeps Basic Memory indexed, and
 self-updates.
 
+## Package layout
+
+One binary, packages layered so a dependency can only ever point downward:
+
+    cmd/hgctl          main
+    internal/hgctl     the CLI: App, command dispatch, sync, queue transport,
+                       repository/worktrees, Basic Memory, scheduler, update
+    internal/ingest    transcripts -> events (the single intake path)
+    internal/event     the on-disk shape of one event, and the outbox
+    internal/config    where things live and what is persisted there
+    internal/gitx      git plumbing            \
+    internal/proc      running external commands > leaves: no dependency on us
+    internal/fsx       atomic writes, JSON, locks, schema probe
+
+Everything used to live in one package, and the file every other file imported
+was a grab-bag holding five unrelated things. The rule that replaced it: a
+package is a boundary, so put a thing where its INVARIANT lives, not where it is
+called from. proc owns "a subprocess is not trusted" (bounded output, redacted
+errors); fsx owns "this process can die right now" (atomic writes, released
+locks, refused future schemas); gitx owns "git answers through the exit status";
+event owns "frontmatter stays closed"; ingest owns "intake is incremental per
+transcript file". Each package's doc comment states its invariant, and its tests
+pin that invariant rather than its implementation.
+
 ## Endpoint invariants
 
 - Use Go and the standard library. Do not add Python, a project virtualenv, a

@@ -17,6 +17,8 @@ import (
 	"github.com/x2x3studio/hgctl/internal/proc"
 
 	"github.com/x2x3studio/hgctl/internal/config"
+
+	"github.com/x2x3studio/hgctl/internal/event"
 )
 
 func (a *App) syncQueueUnlocked(ctx context.Context, state config.State) error {
@@ -159,19 +161,19 @@ type queueBatch struct {
 }
 
 // copyOutboxToQueue moves up to a bounded steady-state batch of raw outbox events
-// into the queue worktree. The MaxSyncEvents/MaxSyncBytes bounds exist only to
+// into the queue worktree. The event.MaxSyncEvents/event.MaxSyncBytes bounds exist only to
 // keep a single commit and push finite - see protocol.go for why they are not a
 // throttle. The operator-invoked bulk import removes them entirely via
 // copyOutboxBatch (see drainOutboxToQueue).
 func (a *App) copyOutboxToQueue() (queueBatch, error) {
-	return a.copyOutboxBatch(MaxSyncEvents, MaxSyncBytes)
+	return a.copyOutboxBatch(event.MaxSyncEvents, event.MaxSyncBytes)
 }
 
 // copyOutboxBatch moves outbox events into the queue worktree under events/,
 // oldest first (filenames are timestamp-ordered). Events are opaque Markdown;
 // there is no decode, canonicalization, admission, or quarantine. maxEvents and
 // maxBytes cap the batch; a non-positive bound disables that cap. The per-event
-// MaxEventBytes ceiling always applies.
+// event.MaxEventBytes ceiling always applies.
 func (a *App) copyOutboxBatch(maxEvents, maxBytes int) (queueBatch, error) {
 	entries, err := os.ReadDir(a.Paths.Outbox)
 	if err != nil {
@@ -229,7 +231,7 @@ const bulkQueueCommitChunk = 500
 // chronological commits and pushes once, so an operator-invoked historical import
 // lands on origin/queue/<machine> before the command returns. It reuses every
 // steady-state queue guard (orphan/append-only, events/ path, per-event byte
-// ceiling) but deliberately bypasses the MaxSyncEvents/MaxSyncBytes capture bounds
+// ceiling) but deliberately bypasses the event.MaxSyncEvents/event.MaxSyncBytes capture bounds
 // that keep automatic Stop-hook syncs small. It waits for, rather than skips, a
 // held sync lock so the operator's import is never silently dropped.
 func (a *App) bulkPublishQueue(ctx context.Context) (int, error) {
@@ -396,12 +398,12 @@ func readOutboxFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	content, err := io.ReadAll(io.LimitReader(f, MaxEventBytes+1))
+	content, err := io.ReadAll(io.LimitReader(f, event.MaxEventBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(content) > MaxEventBytes {
-		return nil, fmt.Errorf("event exceeds %d bytes", MaxEventBytes)
+	if len(content) > event.MaxEventBytes {
+		return nil, fmt.Errorf("event exceeds %d bytes", event.MaxEventBytes)
 	}
 	return content, nil
 }
@@ -508,7 +510,7 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 			return queueBatch{}, err
 		}
 	}
-	// No MaxSyncEvents/MaxSyncBytes cap here: bulk ingest (drainOutboxToQueue)
+	// No event.MaxSyncEvents/event.MaxSyncBytes cap here: bulk ingest (drainOutboxToQueue)
 	// stages up to bulkQueueCommitChunk events per commit, so an interrupted bulk
 	// batch legitimately exceeds the steady-state capture bounds. The recovered
 	// files are byte-validated against their outbox source and restricted to
