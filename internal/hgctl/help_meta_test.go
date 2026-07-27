@@ -69,3 +69,35 @@ func TestMachineMetaIsAnUpsert(t *testing.T) {
 		}
 	}
 }
+
+// An unstamped build must announce itself as one. The release stamps a
+// timestamp version through -ldflags, and Go SILENTLY IGNORES an -X whose
+// package path does not resolve, so "what does an unstamped binary say" is a
+// question that gets asked for real whenever this package moves.
+//
+// "dev" and not a plausible semver: versionIsNewer already treats it as older
+// than every release, so an unstamped endpoint repairs itself on the next check
+// instead of sitting at a version number nobody ever cut - which a reader
+// comparing two machines would take at face value.
+func TestUnstampedVersionIsDevAndAlwaysUpdates(t *testing.T) {
+	if Version != "dev" {
+		t.Fatalf("built-in Version = %q; an unstamped build must say dev, not a version that looks released", Version)
+	}
+	newer, err := versionIsNewer(Version, "v0.20260726.67057")
+	if err != nil {
+		t.Fatalf("comparing a dev build against a timestamp release: %v", err)
+	}
+	if !newer {
+		t.Fatal("a dev build did not consider a real release newer; it would never self-repair")
+	}
+	// The release scheme is v0.<YYYYMMDD>.<second-of-day>, which must keep
+	// comparing correctly as dates advance.
+	older, err := versionIsNewer("v0.20260726.67057", "v0.20260727.100")
+	if err != nil || !older {
+		t.Fatalf("a later timestamp release was not newer: %v %v", older, err)
+	}
+	same, err := versionIsNewer("v0.20260727.100", "v0.20260726.67057")
+	if err != nil || same {
+		t.Fatalf("an earlier release was treated as newer: %v %v", same, err)
+	}
+}

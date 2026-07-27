@@ -11,8 +11,16 @@ import (
 	"github.com/x2x3studio/hgctl/internal/fsx"
 )
 
-// Version is stamped at build time by the release workflow.
-var Version = "v0.2.0"
+// Version is stamped at build time by the release workflow, which builds a
+// timestamp version (v0.<YYYYMMDD>.<second-of-day>).
+//
+// The default is "dev", not a plausible-looking semver. versionIsNewer already
+// treats "dev" as "older than any real release", so an unstamped build updates
+// itself on the next check instead of claiming to be v0.2.0 - a string that
+// looks like a release nobody ever cut, and that a reader comparing two machines
+// would take at face value. CI asserts the stamp actually reaches the binary,
+// because Go silently ignores an -X whose package path does not resolve.
+var Version = "dev"
 
 // App is the CLI's context, not a god object: the paths this machine uses, the
 // three streams, and a clock the tests replace. Everything else is behaviour

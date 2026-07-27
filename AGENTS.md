@@ -133,15 +133,15 @@ Supported clients today are Claude Code and Codex. Everything downstream of
 ingest is client-agnostic: the event `client` field is a free-form string, and
 the queue, the reflect step, `sources`, and recall never enumerate clients. So a
 new agent (for example a Hermes agent) is added ENTIRELY at the ingest boundary
-in `internal/hgctl/ingest.go`, in three small steps:
+in `internal/ingest/ingest.go`, in three small steps:
 
 1. `<client>SessionFiles()` - return that client's transcript files on disk via
    its own glob/walk, mirroring `claudeSessionFiles` / `codexSessionFiles`.
 2. `extract<Client>Session(path) (ingestSession, bool)` - parse that client's
    transcript format into `ingestSession` turns (role + text + timestamp),
    dropping tool noise; return false when nothing qualifies.
-3. Register the client string in `ingestClients` and wire its files + extractor
-   into the `gatherSessions` switch.
+3. Register the client string in `Clients` and wire its files + extractor into
+   the `gatherSessions` switch.
 
 Everything else is reused unchanged: the per-file ledger keying, the delta
 cursor, chunking, the `session`/`project`/`title`/`turns` frontmatter, the queue,
