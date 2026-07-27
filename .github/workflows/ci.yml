@@ -38,6 +38,32 @@ jobs:
         run: go test ./...
       - name: Vet
         run: go vet ./...
+      # The release stamps the version with `-X <pkg>.Version=...`, and Go
+      # SILENTLY IGNORES an -X whose package path does not resolve. So a refactor
+      # that moves Version to another package - and internal/config is where it
+      # arguably belongs, next to the rest of the machine's identity - would ship
+      # every build as the hardcoded default with CI fully green. The endpoint
+      # would then compare that default against every release forever and either
+      # never update or update on a loop.
+      #
+      # Asserting the path textually would only re-encode the same assumption, so
+      # this builds with the release's exact flag and asks the binary what it is.
+      - name: Version stamping actually reaches the binary
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          stamp="v0.0.0-ci-stamp-probe"
+          ldflags="$(grep -oE '\-X [^"]+\.Version=' .github/workflows/release.yml | head -1)"
+          test -n "$ldflags" || { echo "release.yml has no -X ...Version= flag to mirror" >&2; exit 1; }
+          go build -ldflags "-s -w ${ldflags}${stamp}" -o "$RUNNER_TEMP/hgctl_stamped" ./cmd/hgctl
+          got="$("$RUNNER_TEMP/hgctl_stamped" version)"
+          if [ "$got" != "$stamp" ]; then
+            echo "version stamping is broken: binary reports '${got}', want '${stamp}'" >&2
+            echo "the -X package path in release.yml no longer resolves to the package holding Version" >&2
+            exit 1
+          fi
+          echo "version stamping reaches the binary via: ${ldflags}"
+
       - name: Cross-build supported targets
         env:
           CGO_ENABLED: "0"
