@@ -143,10 +143,10 @@ func randHex(n int) string {
 }
 
 func boundText(value string) string {
-	value = strings.ToValidUTF8(value, "�")
+	value = strings.ToValidUTF8(value, "\uFFFD")
 	value = strings.Map(func(r rune) rune {
 		if r < 0x20 && r != '\n' && r != '\r' && r != '\t' {
-			return '�'
+			return '\uFFFD'
 		}
 		return r
 	}, value)

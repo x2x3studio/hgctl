@@ -167,14 +167,16 @@ func TestWithLockSkipsWhenHeldAndWaitBlocks(t *testing.T) {
 }
 
 func TestBoundNeverSplitsARune(t *testing.T) {
-	// Three bytes each, so a naive cut at 4 lands mid-rune.
-	value := "中文字"
+	// Three bytes each, so a naive cut at 4 lands mid-rune. Escaped rather than
+	// literal: the contract keeps source ASCII, and the property under test is
+	// the byte width, not which script it is.
+	value := "\u4e2d\u6587\u5b57"
 	got := Bound(value, 4)
 	if len(got) > 4 {
 		t.Fatalf("Bound returned %d bytes, over the limit", len(got))
 	}
 	for _, r := range got {
-		if r == '�' {
+		if r == '\uFFFD' {
 			t.Fatalf("Bound produced a replacement char: %q", got)
 		}
 	}

@@ -204,7 +204,7 @@ func Canonical(path string) string {
 // replaces invalid UTF-8 first. Callers bound text that reaches frontmatter and
 // error messages, where a split rune would corrupt the file that carries it.
 func Bound(value string, limit int) string {
-	value = strings.ToValidUTF8(value, "�")
+	value = strings.ToValidUTF8(value, "\uFFFD")
 	if len(value) <= limit {
 		return value
 	}
