@@ -95,6 +95,160 @@ func TestExtractCodexSessionMessageExtraction(t *testing.T) {
 	}
 }
 
+func TestExtractCopilotSessionKeepsOnlyRootConversation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "copilot-session-1")
+	path := filepath.Join(dir, "events.jsonl")
+	writeSessionFile(t, filepath.Join(dir, "workspace.yaml"), "name: Copilot App Session\n")
+	writeSessionFile(t, path, strings.Join([]string{
+		`{"id":"e0","timestamp":"2026-08-06T01:00:00.000Z","type":"session.start","data":{"sessionId":"copilot-session-1","startTime":"2026-08-06T01:00:00.000Z","context":{"cwd":"/tmp/copilot-project","gitRoot":"/tmp/copilot-project"}}}`,
+		`{"id":"e1","timestamp":"2026-08-06T01:00:01.000Z","type":"user.message","data":{"content":"Please inspect the Copilot session parser and add complete focused tests.","transformedContent":"SYSTEM NOISE THAT MUST NOT BE INGESTED"}}`,
+		`{"id":"e2","agentId":"research-agent","timestamp":"2026-08-06T01:00:02.000Z","type":"assistant.message","data":{"content":"SUBAGENT INTERNAL RESULT","apiCallId":"sub-call","chunkIndex":0,"chunkCount":1}}`,
+		`{"id":"e2-old","timestamp":"2026-08-06T01:00:02.500Z","type":"assistant.message","data":{"content":"LEGACY SUBAGENT INTERNAL RESULT","parentToolCallId":"tool-call","apiCallId":"old-sub-call","chunkIndex":0,"chunkCount":1}}`,
+		`{"id":"e3","timestamp":"2026-08-06T01:00:03.000Z","type":"tool.execution_complete","data":{"result":"TOOL RESULT NOISE"}}`,
+		`{"id":"e4","timestamp":"2026-08-06T01:00:04.000Z","type":"assistant.message","data":{"content":"First response section.","apiCallId":"root-call","chunkIndex":0,"chunkCount":2}}`,
+		`{"id":"e5","timestamp":"2026-08-06T01:00:05.000Z","type":"assistant.message","data":{"content":"Second response section.","apiCallId":"root-call","chunkIndex":1,"chunkCount":2}}`,
+		`{"id":"e6","timestamp":"2026-08-06T01:00:06.000Z","type":"assistant.message","data":{"content":"A visible progress update.","apiCallId":"progress-call","chunkIndex":0,"chunkCount":1,"phase":"commentary"}}`,
+		`{"id":"e7","timestamp":"2026-08-06T01:00:07.000Z","type":"session.title_changed","data":{"title":"Renamed Copilot Session"}}`,
+		`{"id":"e8","timestamp":"2026-08-06T01:00:08.000Z","type":"assistant.message","data":{"content":"INCOMPLETE RESPONSE MUST NOT LEAK","apiCallId":"partial-call","chunkIndex":0,"chunkCount":2}}`,
+		`{not-json`,
+	}, "\n")+"\n")
+
+	session, ok := extractCopilotSession(path)
+	if !ok {
+		t.Fatal("expected Copilot session to qualify")
+	}
+	if session.id != "copilot-session-1" {
+		t.Fatalf("id = %q", session.id)
+	}
+	if session.cwd != "/tmp/copilot-project" {
+		t.Fatalf("cwd = %q", session.cwd)
+	}
+	if session.title != "Renamed Copilot Session" {
+		t.Fatalf("title = %q", session.title)
+	}
+	if session.firstTS != "2026-08-06T01:00:00.000Z" {
+		t.Fatalf("firstTS = %q", session.firstTS)
+	}
+	if session.lastTS != "2026-08-06T01:00:06.000Z" {
+		t.Fatalf("lastTS = %q", session.lastTS)
+	}
+	if len(session.turns) != 3 {
+		t.Fatalf("turns = %d (%+v), want user + grouped response + progress", len(session.turns), session.turns)
+	}
+	if session.turns[1].text != "First response section.\nSecond response section." {
+		t.Fatalf("grouped assistant response = %q", session.turns[1].text)
+	}
+	body := session.render()
+	for _, noise := range []string{"SYSTEM NOISE", "SUBAGENT INTERNAL", "LEGACY SUBAGENT", "TOOL RESULT", "INCOMPLETE RESPONSE"} {
+		if strings.Contains(body, noise) {
+			t.Fatalf("noise %q leaked into body:\n%s", noise, body)
+		}
+	}
+}
+
+func TestCopilotSessionsHaveDistinctFileKeys(t *testing.T) {
+	ing := testIngester(t)
+	for _, sessionID := range []string{"app-session-a", "cli-session-b"} {
+		path := filepath.Join(ing.Paths.Home, ".copilot", "session-state", sessionID, "events.jsonl")
+		writeSessionFile(t, path,
+			fmt.Sprintf(`{"timestamp":"2026-08-06T01:00:00Z","type":"session.start","data":{"sessionId":%q}}`, sessionID)+"\n"+
+				`{"timestamp":"2026-08-06T01:00:01Z","type":"user.message","data":{"content":"A Copilot question long enough to qualify for session discovery."}}`+"\n")
+	}
+
+	files, err := copilotSessionFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("discovered %d Copilot sessions, want 2: %v", len(files), files)
+	}
+	first := ingestUnitKey("copilot", files[0])
+	second := ingestUnitKey("copilot", files[1])
+	if first == second {
+		t.Fatalf("Copilot session keys collided: %q", first)
+	}
+	if first != "copilot:app-session-a" || second != "copilot:cli-session-b" {
+		t.Fatalf("Copilot keys = %q, %q", first, second)
+	}
+}
+
+func TestCopilotIngestEmitsOnlyNewRootTurns(t *testing.T) {
+	ing := testIngester(t)
+	sessionID := "app-session-grow"
+	dir := filepath.Join(ing.Paths.Home, ".copilot", "session-state", sessionID)
+	path := filepath.Join(dir, "events.jsonl")
+	writeSessionFile(t, filepath.Join(dir, "workspace.yaml"), "name: Growing App Session\n")
+	writeSessionFile(t, path, strings.Join([]string{
+		`{"timestamp":"2026-08-06T01:00:00Z","type":"session.start","data":{"sessionId":"app-session-grow","context":{"cwd":"/tmp/app"}}}`,
+		`{"timestamp":"2026-08-06T01:00:01Z","type":"user.message","data":{"content":"A first Copilot App question long enough to qualify for ingest."}}`,
+		`{"timestamp":"2026-08-06T01:00:02Z","type":"assistant.message","data":{"content":"The first root answer.","apiCallId":"call-1","chunkIndex":0,"chunkCount":1}}`,
+	}, "\n")+"\n")
+
+	id, err := config.LoadIdentity(ing.Paths, ing.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ing.Sync(id); err != nil {
+		t.Fatal(err)
+	}
+	evs := readOutboxEvents(t, ing)
+	if len(evs) != 1 {
+		t.Fatalf("first ingest emitted %d events, want 1", len(evs))
+	}
+	if evs[0].meta["client"] != "copilot" || evs[0].meta["session"] != sessionID ||
+		evs[0].meta["project"] != "/tmp/app" || evs[0].meta["title"] != "Growing App Session" ||
+		evs[0].meta["turns"] != "0-2" {
+		t.Fatalf("unexpected Copilot event metadata: %+v", evs[0].meta)
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	growth := strings.Join([]string{
+		`{"agentId":"subagent","timestamp":"2026-08-06T01:01:00Z","type":"assistant.message","data":{"content":"SUBAGENT DELTA","apiCallId":"sub-call","chunkIndex":0,"chunkCount":1}}`,
+		`{"timestamp":"2026-08-06T01:01:01Z","type":"tool.execution_complete","data":{"result":"TOOL DELTA"}}`,
+		`{"timestamp":"2026-08-06T01:01:02Z","type":"user.message","data":{"content":"A follow-up Copilot App question that should be the only new user turn."}}`,
+		`{"timestamp":"2026-08-06T01:01:03Z","type":"assistant.message","data":{"content":"The follow-up root answer.","apiCallId":"call-2","chunkIndex":0,"chunkCount":1}}`,
+	}, "\n") + "\n"
+	if _, err := f.WriteString(growth); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ing.Now = func() time.Time {
+		return time.Date(2026, 7, 21, 1, 2, 3, 0, time.UTC).Add(2 * defaultIngestMinInterval)
+	}
+	if err := ing.Sync(id); err != nil {
+		t.Fatal(err)
+	}
+	evs = readOutboxEvents(t, ing)
+	if len(evs) != 2 {
+		t.Fatalf("growth emitted %d total events, want original + one delta", len(evs))
+	}
+	delta := evs[len(evs)-1]
+	if delta.meta["turns"] != "2-4" {
+		t.Fatalf("delta turns = %q, want 2-4", delta.meta["turns"])
+	}
+	for _, oldOrNoise := range []string{"first Copilot App question", "first root answer", "SUBAGENT DELTA", "TOOL DELTA"} {
+		if strings.Contains(delta.body, oldOrNoise) {
+			t.Fatalf("%q leaked into Copilot delta:\n%s", oldOrNoise, delta.body)
+		}
+	}
+	if !strings.Contains(delta.body, "follow-up Copilot App question") || !strings.Contains(delta.body, "follow-up root answer") {
+		t.Fatalf("Copilot delta is missing new root turns:\n%s", delta.body)
+	}
+	marks, err := ing.LoadLedger()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marks[ingestUnitKey("copilot", path)].Turns != 4 {
+		t.Fatalf("Copilot cursor = %d, want 4", marks[ingestUnitKey("copilot", path)].Turns)
+	}
+}
+
 func TestCodexIDFromPathFallback(t *testing.T) {
 	got := codexIDFromPath("/x/.codex/sessions/2026/06/05/rollout-2026-06-05T11-41-12-019e95de-e099-7200-abb4-afc33f21aea3.jsonl")
 	if got != "019e95de-e099-7200-abb4-afc33f21aea3" {
@@ -144,11 +298,17 @@ func TestIngestKeyIsClientNamespaced(t *testing.T) {
 	if ingestKey("claude", "abc") == ingestKey("codex", "abc") {
 		t.Fatal("claude and codex keys collided for the same id")
 	}
+	if ingestKey("copilot", "abc") == ingestKey("codex", "abc") {
+		t.Fatal("copilot and codex keys collided for the same id")
+	}
 	if got := normalizeIngestKey("bare-legacy-id"); got != "claude:bare-legacy-id" {
 		t.Fatalf("legacy migration = %q, want claude-namespaced", got)
 	}
 	if got := normalizeIngestKey("codex:x"); got != "codex:x" {
 		t.Fatalf("already-namespaced key mutated to %q", got)
+	}
+	if got := normalizeIngestKey("copilot:x"); got != "copilot:x" {
+		t.Fatalf("already-namespaced Copilot key mutated to %q", got)
 	}
 }
 

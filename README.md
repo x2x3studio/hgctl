@@ -7,7 +7,7 @@ from shell scripts plus the official Claude Action, not from any tool here.
 ## Minimal loop
 
 ```text
-Claude Code / Codex             (sessions persist as transcripts on disk)
+Claude Code / Codex / Copilot   (sessions persist as transcripts on disk)
   -> hgctl per-session ingest    (scheduler-driven; live + historical)
   -> queue/<machine-id>
   -> GitHub Action (reflect: official Claude + Basic Memory)
@@ -25,7 +25,7 @@ must not run Git automation.
 ```text
 hgctl install [--repo <git-url>]
 hgctl sync [--update]
-hgctl ingest [--client all|claude|codex] [--limit N]
+hgctl ingest [--client all|claude|codex|copilot] [--limit N]
 hgctl update
 hgctl doctor
 hgctl uninstall
@@ -35,10 +35,11 @@ hgctl version
 Intake, sync, and update failures are non-fatal: disk, Git, network, Basic
 Memory, and update errors are retried by the next scheduled sync.
 
-Supported session clients are Claude Code and Codex. Onboarding a machine that
-already runs one of them needs no code - just `hgctl install`. Teaching hgctl a
-brand-new transcript format (another agent as a data source) is a small
-ingest-side change - see "Adding a new client" in [AGENTS.md](AGENTS.md).
+Supported session clients are Claude Code, Codex, and GitHub Copilot App/CLI.
+Onboarding a machine that already runs one of them needs no code - just `hgctl
+install`. Teaching hgctl a brand-new transcript format (another agent as a data
+source) is a small ingest-side change - see "Adding a new client" in
+[AGENTS.md](AGENTS.md).
 
 ## Install
 
@@ -76,8 +77,8 @@ Install creates:
 ```
 
 It also installs one scheduler, the Basic Memory project `hourglass`, and the
-`hourglass-memory` MCP server in every installed client, and prunes any stale
-hgctl capture hook left in a Claude Code or Codex config by an older version. It
+`hourglass-memory` MCP server in every installed Claude Code or Codex client, and
+prunes any stale hgctl capture hook left in their config by an older version. It
 verifies the exact MCP command, arguments, environment, project identity, and
 indexed `shared` revision. Run `hgctl doctor` until all managed checks pass.
 
@@ -90,13 +91,16 @@ application daemon or a Go/Python runtime. The scheduler runs `hgctl sync
 
 Per-session transcript ingest is the single intake path, for both live and
 historical sessions - there are no per-turn capture hooks. `hgctl ingest` and
-every scheduled `hgctl sync` read the local Claude Code and Codex transcripts on
-disk (`~/.claude/projects/**`, `~/.codex/sessions/**`) and enqueue only the NEW
-turns of each session since it was last ingested, stamped with those turns'
-latest-activity time. An event is just a Markdown file with closed frontmatter
-(`captured_at`, `client`, `machine`, and the origin `session`/`project`/`title`
-with a `turns` range) and a free-form body - the intake protocol has no kinds or
-validation.
+every scheduled `hgctl sync` read the local Claude Code, Codex, and GitHub
+Copilot App/CLI transcripts on disk (`~/.claude/projects/**`,
+`~/.codex/sessions/**`, `~/.copilot/session-state/*/events.jsonl`) and enqueue
+only the NEW turns of each session since it was last ingested, stamped with
+those turns' latest-activity time. Copilot intake keeps only the root
+`user.message` and `assistant.message` conversation, grouping multi-part
+assistant responses and dropping tool, reasoning, hook, system, and sub-agent
+events. An event is just a Markdown file with closed frontmatter (`captured_at`,
+`client`, `machine`, and the origin `session`/`project`/`title` with a `turns`
+range) and a free-form body - the intake protocol has no kinds or validation.
 
 Intake is incremental and complete: knowledge flows in while a session is live. A
 per-session ledger marker records the emitted-turn cursor (with transcript size
@@ -114,10 +118,10 @@ distillation accumulates as the session grows.
 session's new turns, drains the whole backlog in one batch, and pushes once so it
 lands on
 origin before the command returns. `--client` selects the source (`all`,
-`claude`, or `codex`); `--limit` caps a run. Each scheduled `hgctl sync` folds in
-a small, bounded re-ingest before it drains the outbox - filtering cheaply by the
-ledger marker and file size first, and capping how many it parses per run - so
-live sessions land per-session with no per-turn hooks.
+`claude`, `codex`, or `copilot`); `--limit` caps a run. Each scheduled `hgctl
+sync` folds in a small, bounded re-ingest before it drains the outbox - filtering
+cheaply by the ledger marker and file size first, and capping how many it parses
+per run - so live sessions land per-session with no per-turn hooks.
 
 `hgctl sync` atomically drains the outbox, appends bounded queue commits, pushes
 only the machine branch, requests reconciliation, pulls `shared`, and reindexes

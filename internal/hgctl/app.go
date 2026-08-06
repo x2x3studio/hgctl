@@ -95,7 +95,8 @@ usage: hgctl <command> [flags]
              path 'install' runs on a first connect, so it is rarely needed by
              hand: use it when the scheduled path is behind and you want
              everything pending emitted in one go.
-      --client all|claude|codex   Limit to one source (default all).
+      --client all|claude|codex|copilot
+                                     Limit to one source (default all).
       --limit N                   Cap sessions this run. Candidates are ordered
                                   OLDEST first, so a small limit reports 0 when
                                   the oldest candidates have no new turns - it

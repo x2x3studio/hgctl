@@ -119,7 +119,7 @@ An event is just a Markdown file with closed frontmatter (`captured_at`,
 `client`, `machine`) and a free-form body. There are no kinds, schema, or
 validation: intake is deliberately dumb and liberal (loose in, strict out) -
 all strictness lives in the one central reflect step, not at intake.
-`hgctl ingest [--client all|claude|codex]` is the operator/bulk entry point;
+`hgctl ingest [--client all|claude|codex|copilot]` is the operator/bulk entry point;
 every scheduled `hgctl sync` folds in a small, bounded re-ingest of new-or-grown
 sessions before draining the outbox. Each event carries a chunk of a session's
 NEW turns (complete, never truncated), stamped with those turns' latest-activity
@@ -129,14 +129,15 @@ than duplicating.
 
 ## Adding a new client (data source)
 
-Supported clients today are Claude Code and Codex. Everything downstream of
-ingest is client-agnostic: the event `client` field is a free-form string, and
-the queue, the reflect step, `sources`, and recall never enumerate clients. So a
-new agent (for example a Hermes agent) is added ENTIRELY at the ingest boundary
-in `internal/ingest/ingest.go`, in three small steps:
+Supported clients today are Claude Code, Codex, and GitHub Copilot App/CLI.
+Everything downstream of ingest is client-agnostic: the event `client` field is
+a free-form string, and the queue, the reflect step, `sources`, and recall never
+enumerate clients. So a new agent (for example a Hermes agent) is added ENTIRELY
+at the ingest boundary in `internal/ingest/ingest.go`, in three small steps:
 
 1. `<client>SessionFiles()` - return that client's transcript files on disk via
-   its own glob/walk, mirroring `claudeSessionFiles` / `codexSessionFiles`.
+   its own glob/walk, mirroring `claudeSessionFiles` / `codexSessionFiles` /
+   `copilotSessionFiles`.
 2. `extract<Client>Session(path) (ingestSession, bool)` - parse that client's
    transcript format into `ingestSession` turns (role + text + timestamp),
    dropping tool noise; return false when nothing qualifies.

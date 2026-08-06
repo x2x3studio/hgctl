@@ -27,14 +27,14 @@ func (a *App) ingester() *ingest.Ingester {
 func (a *App) runIngest(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
-	client := fs.String("client", "all", "session source to ingest: all, claude, or codex")
+	client := fs.String("client", "all", "session source to ingest: all, claude, codex, or copilot")
 	limit := fs.Int("limit", 0, "optional cap on sessions this run (0 = no cap, oldest first)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	clients, ok := ingest.Clients(*client)
 	if fs.NArg() != 0 || !ok || *limit < 0 {
-		return errors.New("usage: hgctl ingest [--client all|claude|codex] [--limit N]")
+		return errors.New("usage: hgctl ingest [--client all|claude|codex|copilot] [--limit N]")
 	}
 	id, err := config.LoadIdentity(a.Paths, a.Now)
 	if err != nil {

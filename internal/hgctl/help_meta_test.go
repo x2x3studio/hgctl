@@ -30,6 +30,9 @@ func TestHelpFlagsWorkAndUsageDescribesEveryCommand(t *testing.T) {
 		if !strings.Contains(text, "THROTTLED") {
 			t.Errorf("%q does not warn that `sync --update` is throttled", arg)
 		}
+		if !strings.Contains(text, "copilot") {
+			t.Errorf("%q does not list Copilot as an ingest source", arg)
+		}
 	}
 }
 

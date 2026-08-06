@@ -23,10 +23,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -287,8 +289,8 @@ func (i *Ingester) Sync(id config.Identity) error {
 func Clients(client string) ([]string, bool) {
 	switch client {
 	case "all":
-		return []string{"claude", "codex"}, true
-	case "claude", "codex":
+		return []string{"claude", "codex", "copilot"}, true
+	case "claude", "codex", "copilot":
 		return []string{client}, true
 	}
 	return nil, false
@@ -397,6 +399,9 @@ func (i *Ingester) gatherSessions(client string, marks map[string]Mark, minInter
 	case "codex":
 		files, err = codexSessionFiles()
 		extract = extractCodexSession
+	case "copilot":
+		files, err = copilotSessionFiles()
+		extract = extractCopilotSession
 	default:
 		return nil, nil, nil
 	}
@@ -502,14 +507,20 @@ func shouldReingest(mark Mark, size int64, now time.Time, minInterval time.Durat
 //   - Codex: the rollout id. Codex writes exactly one transcript per session, so the
 //     id is already one-to-one with the file; keeping it avoids churning the Codex
 //     ledger and matches the id derived from a well-formed rollout filename.
+//   - Copilot: the session-state directory name. Both the Copilot app and Copilot
+//     CLI persist one events.jsonl under ~/.copilot/session-state/<session-id>/.
 //
 // It is derived from the path alone so the cheap pre-filter can key the ledger
 // without parsing the file; the post-parse cursor lookup uses the same key.
 func ingestUnitKey(client, path string) string {
-	if client == "codex" {
+	switch client {
+	case "codex":
 		return ingestKey(client, codexIDFromPath(path))
+	case "copilot":
+		return ingestKey(client, copilotIDFromPath(path))
+	default:
+		return ingestKey(client, claudeFileKey(path))
 	}
-	return ingestKey(client, claudeFileKey(path))
 }
 
 // claudeFileKey is a stable, unique-per-file id: the transcript path relative to
@@ -578,6 +589,10 @@ func claudeSessionFiles() ([]string, error) {
 
 func codexSessionFiles() ([]string, error) {
 	return globSessionFiles(filepath.Join(".codex", "sessions", "*", "*", "*", "rollout-*.jsonl"))
+}
+
+func copilotSessionFiles() ([]string, error) {
+	return globSessionFiles(filepath.Join(".copilot", "session-state", "*", "events.jsonl"))
 }
 
 func globSessionFiles(pattern string) ([]string, error) {
@@ -778,6 +793,187 @@ func extractCodexSession(path string) (ingestSession, bool) {
 	return session, true
 }
 
+// copilotRecord is one event from the shared Copilot app/CLI session log. The
+// public Copilot SDK defines this envelope and marks AgentID as present only for
+// sub-agent events. Intake keeps the root conversation and drops tool, reasoning,
+// hook, system, and sub-agent traffic.
+type copilotRecord struct {
+	AgentID   string      `json:"agentId"`
+	Timestamp string      `json:"timestamp"`
+	Type      string      `json:"type"`
+	Data      copilotData `json:"data"`
+}
+
+type copilotData struct {
+	SessionID        string `json:"sessionId"`
+	StartTime        string `json:"startTime"`
+	Title            string `json:"title"`
+	Content          string `json:"content"`
+	APICallID        string `json:"apiCallId"`
+	ParentToolCallID string `json:"parentToolCallId"`
+	ChunkIndex       int    `json:"chunkIndex"`
+	ChunkCount       int    `json:"chunkCount"`
+	Context          struct {
+		CWD     string `json:"cwd"`
+		GitRoot string `json:"gitRoot"`
+	} `json:"context"`
+}
+
+type copilotAssistantChunks struct {
+	count  int
+	seen   map[int]struct{}
+	parts  map[int]string
+	lastTS string
+}
+
+func extractCopilotSession(path string) (ingestSession, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return ingestSession{}, false
+	}
+	defer f.Close()
+
+	session := ingestSession{
+		id:    copilotIDFromPath(path),
+		title: copilotWorkspaceTitle(path),
+	}
+	pending := make(map[string]*copilotAssistantChunks)
+	reader := bufio.NewReader(f)
+	for {
+		line, readErr := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line != "" {
+			var record copilotRecord
+			if json.Unmarshal([]byte(line), &record) == nil && record.AgentID == "" {
+				switch record.Type {
+				case "session.start":
+					if record.Data.SessionID != "" {
+						session.id = record.Data.SessionID
+					}
+					if session.cwd == "" {
+						session.cwd = record.Data.Context.CWD
+						if session.cwd == "" {
+							session.cwd = record.Data.Context.GitRoot
+						}
+					}
+					if session.firstTS == "" {
+						session.firstTS = record.Timestamp
+						if session.firstTS == "" {
+							session.firstTS = record.Data.StartTime
+						}
+					}
+				case "session.title_changed":
+					if title := strings.TrimSpace(record.Data.Title); title != "" {
+						session.title = title
+					}
+				case "user.message":
+					appendCopilotTurn(&session, "user", record.Data.Content, record.Timestamp)
+				case "assistant.message":
+					appendCopilotAssistant(&session, pending, record)
+				}
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return ingestSession{}, false
+			}
+			break
+		}
+	}
+	if !ingestSessionQualifies(session) {
+		return ingestSession{}, false
+	}
+	return session, true
+}
+
+func appendCopilotAssistant(session *ingestSession, pending map[string]*copilotAssistantChunks, record copilotRecord) {
+	data := record.Data
+	if data.ParentToolCallID != "" {
+		return
+	}
+	if data.ChunkCount <= 1 || data.APICallID == "" || data.ChunkIndex < 0 || data.ChunkIndex >= data.ChunkCount {
+		appendCopilotTurn(session, "assistant", data.Content, record.Timestamp)
+		return
+	}
+
+	chunks := pending[data.APICallID]
+	if chunks == nil || chunks.count != data.ChunkCount {
+		chunks = &copilotAssistantChunks{
+			count: data.ChunkCount,
+			seen:  make(map[int]struct{}, data.ChunkCount),
+			parts: make(map[int]string, data.ChunkCount),
+		}
+		pending[data.APICallID] = chunks
+	}
+	chunks.seen[data.ChunkIndex] = struct{}{}
+	if text := cleanIngestText(data.Content); text != "" {
+		chunks.parts[data.ChunkIndex] = text
+	}
+	if record.Timestamp != "" {
+		chunks.lastTS = record.Timestamp
+	}
+	if len(chunks.seen) != chunks.count {
+		return
+	}
+
+	parts := make([]string, 0, len(chunks.parts))
+	for index := 0; index < chunks.count; index++ {
+		if text := chunks.parts[index]; text != "" {
+			parts = append(parts, text)
+		}
+	}
+	appendCopilotTurn(session, "assistant", strings.Join(parts, "\n"), chunks.lastTS)
+	delete(pending, data.APICallID)
+}
+
+func appendCopilotTurn(session *ingestSession, role, content, timestamp string) {
+	text := cleanIngestText(content)
+	if text == "" {
+		return
+	}
+	if session.firstTS == "" {
+		session.firstTS = timestamp
+	}
+	session.turns = append(session.turns, ingestTurn{role: role, text: text, ts: timestamp})
+	if timestamp != "" {
+		session.lastTS = timestamp
+	}
+}
+
+func copilotWorkspaceTitle(eventsPath string) string {
+	f, err := os.Open(filepath.Join(filepath.Dir(eventsPath), "workspace.yaml"))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		value, ok := strings.CutPrefix(strings.TrimSpace(scanner.Text()), "name:")
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+			if unquoted, err := strconv.Unquote(value); err == nil {
+				return strings.TrimSpace(unquoted)
+			}
+		}
+		if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+			return strings.TrimSpace(strings.ReplaceAll(value[1:len(value)-1], "''", "'"))
+		}
+		return value
+	}
+	return ""
+}
+
+func copilotIDFromPath(path string) string {
+	if filepath.Base(path) == "events.jsonl" {
+		return filepath.Base(filepath.Dir(path))
+	}
+	return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+}
+
 // codexIDFromPath recovers the rollout UUID from the filename when a session has
 // no session_meta line. Names are rollout-<ISO8601>-<uuid>.jsonl and the UUID is
 // always the trailing 36 characters.
@@ -969,7 +1165,7 @@ func (i *Ingester) LoadLedger() (map[string]Mark, error) {
 // normalizeIngestKey migrates the pre-namespace ledger: bare UUIDs written before
 // Codex support were all Claude sessions, so they gain the claude: prefix on load.
 func normalizeIngestKey(key string) string {
-	if strings.HasPrefix(key, "claude:") || strings.HasPrefix(key, "codex:") {
+	if strings.HasPrefix(key, "claude:") || strings.HasPrefix(key, "codex:") || strings.HasPrefix(key, "copilot:") {
 		return key
 	}
 	return ingestKey("claude", key)
