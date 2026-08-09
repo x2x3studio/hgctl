@@ -42,8 +42,9 @@ import (
 // Ingester carries only what intake needs: where things live and a clock the
 // tests replace.
 type Ingester struct {
-	Paths config.Paths
-	Now   func() time.Time
+	Paths      config.Paths
+	Now        func() time.Time
+	LedgerPath string
 }
 
 const (
@@ -1123,6 +1124,9 @@ func assignChunkCaptured(chunks []ingestChunk, sessionBase time.Time) {
 }
 
 func (i *Ingester) ingestedSessionsPath() string {
+	if i.LedgerPath != "" {
+		return i.LedgerPath
+	}
 	return filepath.Join(i.Paths.Data, "ingested-sessions.json")
 }
 

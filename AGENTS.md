@@ -33,8 +33,8 @@ One binary, packages layered so a dependency can only ever point downward:
     cmd/hgctl          main
     internal/hgctl     the CLI: App, command dispatch, sync, queue transport,
                        repository/worktrees, Basic Memory, scheduler, update
-    internal/ingest    transcripts -> events (the single intake path)
-    internal/event     the on-disk shape of one event, and the outbox
+    internal/ingest    transcripts -> events (one parser, independent product ledgers)
+    internal/event     the on-disk event shape and lane outboxes
     internal/config    where things live and what is persisted there
     internal/gitx      git plumbing            \
     internal/proc      running external commands > leaves: no dependency on us
@@ -64,8 +64,10 @@ pin that invariant rather than its implementation.
   needs privilege, install instructs to run `sudo loginctl enable-linger <uid>`
   once). Either runs `sync --update` about once a minute (systemd timer is
   `Persistent=true`, so a missed fire catches up); neither needs a resident daemon.
-- Per-session transcript ingest is the single intake path (live + historical);
-  there are no per-turn capture hooks. Intake is INCREMENTAL: a per-session ledger
+- Per-session transcript ingest is the single parser (live + historical); there
+  are no per-turn capture hooks. Memory and Knowledge own independent ledgers and
+  outboxes, so each product can backfill and advance without swallowing the
+  other's turns. Intake is INCREMENTAL: a per-product, per-session ledger
   marker (emitted-turn cursor + transcript size + time) drives emission of only
   the NEW turns since the last ingest, throttled to at most once per
   `HG_INGEST_MIN_INTERVAL` (default 5 minutes). Turns are emitted COMPLETE (never
@@ -76,12 +78,11 @@ pin that invariant rather than its implementation.
   are never enqueued. Install, background repair, and uninstall prune any stale
   hgctl hook left in a client config; the `hook` subcommand is a clean no-op kept
   only so a stale registration disrupts nothing.
-- On the endpoint, only `sync` writes Git: it APPENDS raw events to
-  `queue/<machine-id>`'s `events/` and fast-forwards its local `shared` and
-  `queue` worktrees; it never commits to `main` or `shared`, and never archives.
-  The reflect Action owns archiving a queue branch's CONSUMED events (moving
-  `events/` into `archive/<YYYY-MM>/` - or `archive/poison/<YYYY-MM>/` for a
-  skipped, never-distilled slice - fast-forward-only); the endpoint only
+- On the endpoint, only `sync` writes Git: it APPENDS Memory events under
+  `events/` and Knowledge events under `knowledge/events/` on the same machine
+  queue, and fast-forwards its local `shared` and `queue` worktrees; it never
+  commits to `main` or `shared`, and never archives. The two Actions own their
+  disjoint archive trees; the endpoint only
   fast-forwards through those archive commits. If a local committed-but-unpushed
   append races an archive and the branches diverge, `sync` self-heals by
   resetting onto the remote and replaying the event from the outbox (retained
@@ -90,7 +91,7 @@ pin that invariant rather than its implementation.
   `shared` history: adopted when the remote already carries this machine's
   branch, otherwise self-seeded locally. All later commits are append-only
   event commits.
-- Events under `events/` are CREATE-ONLY; a modified event means captured
+- Events under `events/` and `knowledge/events/` are CREATE-ONLY; a modified event means captured
   evidence was altered and the guards must keep refusing it. `machine.json` at
   the branch root is the one tracked file rewritten in place (a hostname edit,
   an OS upgrade, an hgctl release), so it is the one path where a modification
@@ -118,8 +119,9 @@ pin that invariant rather than its implementation.
 An event is just a Markdown file with closed frontmatter (`captured_at`,
 `client`, `machine`) and a free-form body. There are no kinds, schema, or
 validation: intake is deliberately dumb and liberal (loose in, strict out) -
-all strictness lives in the one central reflect step, not at intake.
-`hgctl ingest [--client all|claude|codex|copilot]` is the operator/bulk entry point;
+all semantic strictness lives in the two product Actions, not at intake.
+`hgctl ingest [--client all|claude|codex|copilot]
+[--target memory|knowledge|all]` is the operator/bulk entry point;
 every scheduled `hgctl sync` folds in a small, bounded re-ingest of new-or-grown
 sessions before draining the outbox. Each event carries a chunk of a session's
 NEW turns (complete, never truncated), stamped with those turns' latest-activity
