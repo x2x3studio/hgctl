@@ -20,7 +20,7 @@ const vaultMirrorSchemaVersion = 1
 // else in the vault - Basic Memory's own scratch, an .obsidian/ directory - is
 // left alone, because the vault is Basic Memory's working copy and only this
 // subset is ours to own.
-var productSubset = []string{"memory", "Home.md", "Hourglass.canvas"}
+var productSubset = []string{"memory", "knowledge", "Home.md", "Hourglass.canvas"}
 
 // vaultMirror records the sha256 of each SOURCE file as of the last mirror.
 //

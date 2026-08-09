@@ -92,12 +92,12 @@ usage: hgctl <command> [flags]
                  an immediate second call is a silent no-op. To force an update
                  now, use the 'update' command instead.
   ingest     Operator-path ingest of session transcripts, unbounded. The same
-             path 'install' runs on a first connect, so it is rarely needed by
-             hand: use it when the scheduled path is behind and you want
-             everything pending emitted in one go.
+             path 'install' runs for both products on a first connect, so it is
+             rarely needed by hand: use it when a scheduled lane is behind.
       --client all|claude|codex|copilot
-                                     Limit to one source (default all).
-      --limit N                   Cap sessions this run. Candidates are ordered
+                                         Limit to one source (default all).
+      --target memory|knowledge|all       Select the product ledger (default memory).
+      --limit N                           Cap sessions per target. Candidates are ordered
                                   OLDEST first, so a small limit reports 0 when
                                   the oldest candidates have no new turns - it
                                   is a poor probe for "is ingest working".
@@ -196,29 +196,42 @@ func (a *App) install(ctx context.Context, repo string) error {
 // Never fatal. A machine whose backfill fails is still installed and still
 // scheduled; it just catches up over ticks instead of in one pass.
 func (a *App) initialIntake(ctx context.Context, id config.Identity) error {
-	marks, err := a.ingester().LoadLedger()
-	if err != nil {
-		return err
-	}
-	if len(marks) > 0 {
-		return a.sync(ctx)
-	}
-	_, _ = fmt.Fprintln(a.Out, "First install: reading this machine's session history. This can take a while.")
+	lanes := a.allIngestLanes()
 	clients, _ := ingest.Clients("all")
-	// limit 0, parseCap 0, minInterval 0: every eligible transcript, once.
-	enqueued, _, ingestErr := a.ingester().Run(id, marks, clients, 0, 0, 0)
-	if err := a.ingester().SaveLedger(marks); err != nil {
-		return errors.Join(ingestErr, err)
+	total := 0
+	backfilled := false
+	var backfillErrs []error
+	for _, lane := range lanes {
+		marks, err := lane.ingester.LoadLedger()
+		if err != nil {
+			backfillErrs = append(backfillErrs, fmt.Errorf("%s ledger: %w", lane.name, err))
+			continue
+		}
+		if len(marks) > 0 {
+			continue
+		}
+		backfilled = true
+		_, _ = fmt.Fprintf(a.Out, "Reading local session history for %s. This can take a while.\n", lane.name)
+		// Empty ledger means this product has never seen the machine. Parse every
+		// transcript once; later scheduler runs use the ordinary bounded delta path.
+		enqueued, _, ingestErr := lane.ingester.Run(id, marks, clients, 0, 0, 0)
+		total += enqueued
+		if err := lane.ingester.SaveLedger(marks); err != nil {
+			ingestErr = errors.Join(ingestErr, err)
+		}
+		if ingestErr != nil {
+			backfillErrs = append(backfillErrs, fmt.Errorf("%s backfill: %w", lane.name, ingestErr))
+		}
 	}
-	if ingestErr != nil {
-		return ingestErr
+	if !backfilled {
+		return errors.Join(errors.Join(backfillErrs...), a.sync(ctx))
 	}
-	delivered, err := a.bulkPublishQueue(ctx)
-	if err != nil {
-		return fmt.Errorf("publish backfill: %w", err)
+	delivered, publishErr := a.bulkPublishQueue(ctx)
+	var reportErr error
+	if publishErr == nil {
+		_, reportErr = fmt.Fprintf(a.Out, "Backfilled %d event(s) from local history; published %d.\n", total, delivered)
 	}
-	_, err = fmt.Fprintf(a.Out, "Backfilled %d event(s) from history; published %d.\n", enqueued, delivered)
-	return err
+	return errors.Join(errors.Join(backfillErrs...), publishErr, reportErr)
 }
 
 func (a *App) runSync(ctx context.Context, args []string) error {

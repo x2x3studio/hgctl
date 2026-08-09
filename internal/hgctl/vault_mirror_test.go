@@ -53,17 +53,19 @@ func vaultMTimes(t *testing.T, app *App) map[string]time.Time {
 func TestMirrorLeavesUnchangedProductUntouched(t *testing.T) {
 	app := testApp(t)
 	seedProduct(t, app, map[string]string{
-		"Home.md":                 "# Home\n",
-		"memory/world/a.md":       "note a\n",
-		"memory/experiences/b.md": "note b\n",
-		"memory/models/deep/c.md": "note c\n",
+		"Home.md":                          "# Home\n",
+		"memory/world/a.md":                "note a\n",
+		"memory/experiences/b.md":          "note b\n",
+		"memory/models/deep/c.md":          "note c\n",
+		"knowledge/concepts/system/api.md": "knowledge concept\n",
+		"knowledge/index.md":               "# Knowledge\n",
 	})
 	if err := app.mirrorProductToVault(); err != nil {
 		t.Fatal(err)
 	}
 	before := vaultMTimes(t, app)
-	if len(before) != 4 {
-		t.Fatalf("expected 4 mirrored files, got %d", len(before))
+	if len(before) != 6 {
+		t.Fatalf("expected 6 mirrored files, got %d", len(before))
 	}
 
 	// A scheduled sync where shared did not move.

@@ -161,6 +161,7 @@ func TestDefaultHonoursEnvironmentOverrides(t *testing.T) {
 	// test's writes into the real machine's state.
 	for name, path := range map[string]string{
 		"Control": p.Control, "Queue": p.Queue, "Outbox": p.Outbox, "Shared": p.Shared,
+		"KnowledgeOutbox": p.KnowledgeOutbox, "KnowledgeLedger": p.KnowledgeLedger,
 		"Identity": p.Identity, "State": p.State, "IndexedSHA": p.IndexedSHA,
 		"VaultMirror": p.VaultMirror, "UpdateCheck": p.UpdateCheck,
 		"SyncLock": p.SyncLock, "LifecycleLock": p.LifecycleLock, "UpdateLock": p.UpdateLock,

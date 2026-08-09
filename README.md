@@ -8,10 +8,10 @@ from shell scripts plus the official Claude Action, not from any tool here.
 
 ```text
 Claude Code / Codex / Copilot   (sessions persist as transcripts on disk)
-  -> hgctl per-session ingest    (scheduler-driven; live + historical)
-  -> queue/<machine-id>
-  -> GitHub Action (reflect: official Claude + Basic Memory)
-  -> shared
+  -> hgctl two-ledger ingest     (Memory + Knowledge, live + historical)
+  -> queue/<machine-id>          (events/ + knowledge/events/)
+  -> independent GitHub Actions  (Memory reflect + OKF Knowledge compile)
+  -> shared                      (memory/** + knowledge/**)
   -> hgctl pull and Basic Memory reindex
   -> Basic Memory MCP recall
 ```
@@ -25,7 +25,7 @@ must not run Git automation.
 ```text
 hgctl install [--repo <git-url>]
 hgctl sync [--update]
-hgctl ingest [--client all|claude|codex|copilot] [--limit N]
+hgctl ingest [--client all|claude|codex|copilot] [--target memory|knowledge|all] [--limit N]
 hgctl update
 hgctl doctor
 hgctl uninstall
@@ -71,7 +71,8 @@ Install creates:
   identity.json      stable random machine UUID
   state.json         repo URL + queue branch
   repo/              control clone (main, shared, queue/<machine-id>)
-  outbox/ queue/ shared/
+  outbox/ knowledge-outbox/ queue/ shared/
+  ingested-sessions.json  knowledge-ingested-sessions.json
 
 ~/hourglass-vault/   Basic Memory project (recall mirror)
 ```
@@ -89,18 +90,16 @@ application daemon or a Go/Python runtime. The scheduler runs `hgctl sync
 
 ## Ingest and sync
 
-Per-session transcript ingest is the single intake path, for both live and
-historical sessions - there are no per-turn capture hooks. `hgctl ingest` and
-every scheduled `hgctl sync` read the local Claude Code, Codex, and GitHub
-Copilot App/CLI transcripts on disk (`~/.claude/projects/**`,
-`~/.codex/sessions/**`, `~/.copilot/session-state/*/events.jsonl`) and enqueue
-only the NEW turns of each session since it was last ingested, stamped with
-those turns' latest-activity time. Copilot intake keeps only the root
-`user.message` and `assistant.message` conversation, grouping multi-part
-assistant responses and dropping tool, reasoning, hook, system, and sub-agent
-events. An event is just a Markdown file with closed frontmatter (`captured_at`,
-`client`, `machine`, and the origin `session`/`project`/`title` with a `turns`
-range) and a free-form body - the intake protocol has no kinds or validation.
+Per-session transcript ingest is the single parser for live and historical
+sessions - there are no per-turn capture hooks. Memory and Knowledge each own an
+independent turn ledger and outbox, so either product can backfill and advance
+without making the other skip a session. `hgctl ingest` and every scheduled
+`hgctl sync` read local Claude Code, Codex, and GitHub Copilot App/CLI transcripts
+(`~/.claude/projects/**`, `~/.codex/sessions/**`,
+`~/.copilot/session-state/*/events.jsonl`) and enqueue only the NEW turns for each
+product. Copilot intake keeps the root user/assistant conversation and drops tool,
+reasoning, hook, system, and sub-agent events. An event is Markdown with closed
+origin frontmatter and a free-form body; intake has no semantic kinds.
 
 Intake is incremental and complete: knowledge flows in while a session is live. A
 per-session ledger marker records the emitted-turn cursor (with transcript size
@@ -118,19 +117,18 @@ distillation accumulates as the session grows.
 session's new turns, drains the whole backlog in one batch, and pushes once so it
 lands on
 origin before the command returns. `--client` selects the source (`all`,
-`claude`, `codex`, or `copilot`); `--limit` caps a run. Each scheduled `hgctl
-sync` folds in a small, bounded re-ingest before it drains the outbox - filtering
-cheaply by the ledger marker and file size first, and capping how many it parses
-per run - so live sessions land per-session with no per-turn hooks.
+`claude`, `codex`, or `copilot`); `--target` selects `memory`, `knowledge`, or
+`all`; and `--limit` caps each selected target. Each scheduled `hgctl sync` folds
+in a bounded re-ingest before it drains both outboxes.
 
 `hgctl sync` atomically drains the outbox, appends bounded queue commits, pushes
 only the machine branch, requests reconciliation, pulls `shared`, and reindexes
 Basic Memory only after a fast-forward. A new machine's queue branch is
 self-seeded as an orphan root, never inheriting `main` or `shared`; all later
 endpoint
-commits are append-only events. The reflect Action separately archives a queue
-branch's consumed events into `archive/<YYYY-MM>/` - or `archive/poison/<YYYY-MM>/`
-for a skipped, never-distilled slice - fast-forward-only; `hgctl
+commits are append-only events under `events/` for Memory and
+`knowledge/events/` for Knowledge. Their Actions archive consumed input into
+separate archive trees, fast-forward-only; `hgctl
 sync` fast-forwards through those archive commits, and self-heals a divergence (a
 local unpushed append that raced an archive) by resetting onto the remote and
 replaying the event from the retained outbox.

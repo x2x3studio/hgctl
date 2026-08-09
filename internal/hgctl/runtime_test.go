@@ -26,8 +26,10 @@ func testApp(t *testing.T) *App {
 	paths := config.Paths{
 		Home: home, Data: data,
 		Control: filepath.Join(data, "repo"), Queue: filepath.Join(data, "queue"),
-		Outbox: filepath.Join(data, "outbox"),
-		Vault:  filepath.Join(home, "hourglass-vault"), Shared: filepath.Join(data, "shared"), Bin: filepath.Join(home, ".local", "bin"),
+		Outbox:          filepath.Join(data, "outbox"),
+		KnowledgeOutbox: filepath.Join(data, "knowledge-outbox"),
+		KnowledgeLedger: filepath.Join(data, "knowledge-ingested-sessions.json"),
+		Vault:           filepath.Join(home, "hourglass-vault"), Shared: filepath.Join(data, "shared"), Bin: filepath.Join(home, ".local", "bin"),
 		Versions: filepath.Join(home, ".local", "lib", "hgctl", "versions"),
 		Identity: filepath.Join(data, "identity.json"), State: filepath.Join(data, "state.json"),
 		IndexedSHA:    filepath.Join(data, "indexed-shared"),

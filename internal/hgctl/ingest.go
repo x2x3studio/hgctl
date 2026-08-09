@@ -11,54 +11,94 @@ import (
 	"github.com/x2x3studio/hgctl/internal/ingest"
 )
 
-// ingester binds the intake package to this App's paths and clock.
+// ingester binds the intake package to this App's memory lane.
 func (a *App) ingester() *ingest.Ingester {
 	return &ingest.Ingester{Paths: a.Paths, Now: a.Now}
 }
 
-// runIngest reads local agent session transcripts and publishes each session's new
-// turns as complete, chunked delta events, oldest first, stamped with their turn
-// times. It is the operator/bulk entry point for per-session intake (live +
-// historical): intake only, never a Basic Memory write. Unlike the steady-state
-// sync, it drains the whole outbox to the machine queue branch in large batches and
-// pushes once, so an operator-invoked import lands on origin before the command
-// returns. It does not throttle (minInterval 0): an explicit run always emits any
-// pending delta, while the size+turn markers keep unchanged sessions idempotent.
+// knowledgeIngester reuses the same transcript parser with an independent
+// ledger and outbox, so either product can replay and advance a session without
+// making the other product skip it.
+func (a *App) knowledgeIngester() *ingest.Ingester {
+	paths := a.Paths
+	paths.Outbox = a.Paths.KnowledgeOutbox
+	return &ingest.Ingester{Paths: paths, Now: a.Now, LedgerPath: a.Paths.KnowledgeLedger}
+}
+
+type ingestLane struct {
+	name     string
+	ingester *ingest.Ingester
+}
+
+func (a *App) allIngestLanes() []ingestLane {
+	return []ingestLane{
+		{name: "memory", ingester: a.ingester()},
+		{name: "knowledge", ingester: a.knowledgeIngester()},
+	}
+}
+
+func (a *App) ingestLanes(target string) ([]ingestLane, bool) {
+	lanes := a.allIngestLanes()
+	if target == "all" {
+		return lanes, true
+	}
+	for _, lane := range lanes {
+		if lane.name == target {
+			return []ingestLane{lane}, true
+		}
+	}
+	return nil, false
+}
+
+// runIngest parses local session transcripts into one or both product lanes. Each
+// lane owns an independent turn ledger and outbox, while both reuse the exact same
+// Claude/Codex parsers and complete-turn chunker.
 func (a *App) runIngest(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
 	client := fs.String("client", "all", "session source to ingest: all, claude, codex, or copilot")
-	limit := fs.Int("limit", 0, "optional cap on sessions this run (0 = no cap, oldest first)")
+	target := fs.String("target", "memory", "product target: memory, knowledge, or all")
+	limit := fs.Int("limit", 0, "optional cap on sessions per target (0 = no cap, oldest first)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	clients, ok := ingest.Clients(*client)
-	if fs.NArg() != 0 || !ok || *limit < 0 {
-		return errors.New("usage: hgctl ingest [--client all|claude|codex|copilot] [--limit N]")
+	clients, clientsOK := ingest.Clients(*client)
+	lanes, targetOK := a.ingestLanes(*target)
+	if fs.NArg() != 0 || !clientsOK || !targetOK || *limit < 0 {
+		return errors.New("usage: hgctl ingest [--client all|claude|codex|copilot] [--target memory|knowledge|all] [--limit N]")
 	}
 	id, err := config.LoadIdentity(a.Paths, a.Now)
 	if err != nil {
 		return err
 	}
-	marks, err := a.ingester().LoadLedger()
-	if err != nil {
+	total := 0
+	var ingestErrs []error
+	for _, lane := range lanes {
+		marks, err := lane.ingester.LoadLedger()
+		if err != nil {
+			ingestErrs = append(ingestErrs, fmt.Errorf("%s ledger: %w", lane.name, err))
+			continue
+		}
+		enqueued, _, runErr := lane.ingester.Run(id, marks, clients, *limit, 0, 0)
+		total += enqueued
+		if err := lane.ingester.SaveLedger(marks); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+		if runErr != nil {
+			ingestErrs = append(ingestErrs, fmt.Errorf("%s ingest: %w", lane.name, runErr))
+		}
+	}
+	if err := errors.Join(ingestErrs...); err != nil {
 		return err
-	}
-	enqueued, _, ingestErr := a.ingester().Run(id, marks, clients, *limit, 0, 0)
-	if err := a.ingester().SaveLedger(marks); err != nil {
-		return errors.Join(ingestErr, err)
-	}
-	if ingestErr != nil {
-		return ingestErr
 	}
 	delivered, derr := a.bulkPublishQueue(ctx)
 	if errors.Is(derr, os.ErrNotExist) {
-		_, err = fmt.Fprintf(a.Out, "ingested %d session event(s) into the outbox; run 'hgctl sync' to publish\n", enqueued)
+		_, err = fmt.Fprintf(a.Out, "ingested %d session event(s) into local outboxes; run 'hgctl sync' to publish\n", total)
 		return err
 	}
 	if derr != nil {
 		return derr
 	}
-	_, err = fmt.Fprintf(a.Out, "ingested %d session event(s); published %d queued event(s) to queue/%s\n", enqueued, delivered, id.ID)
+	_, err = fmt.Fprintf(a.Out, "ingested %d session event(s); published %d queued event(s) to queue/%s\n", total, delivered, id.ID)
 	return err
 }

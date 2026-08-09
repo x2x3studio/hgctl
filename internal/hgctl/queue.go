@@ -38,10 +38,11 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state config.State) error {
 		}
 	}
 	batch := recovered
+	var laneErrs []error
 	if len(batch.EventPaths) == 0 {
-		batch, err = a.copyOutboxToQueue()
+		batch, err = a.copySteadyOutboxes(event.MaxSyncEvents, event.MaxSyncBytes)
 		if err != nil {
-			return err
+			laneErrs = append(laneErrs, err)
 		}
 	}
 	if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, batch.EventPaths, false); err != nil {
@@ -101,7 +102,7 @@ func (a *App) syncQueueUnlocked(ctx context.Context, state config.State) error {
 			return err
 		}
 	}
-	return nil
+	return errors.Join(laneErrs...)
 }
 
 // reconcileQueueWithRemote fast-forwards the local queue branch onto its remote
@@ -158,6 +159,44 @@ func shortMachine(branch string) string {
 type queueBatch struct {
 	OutboxPaths []string
 	EventPaths  []string
+	Bytes       int
+}
+
+const (
+	memoryQueueDir    = "events"
+	knowledgeQueueDir = "knowledge/events"
+)
+
+type queueLane struct {
+	outbox   string
+	queueDir string
+}
+
+func (a *App) memoryQueueLane() queueLane {
+	return queueLane{outbox: a.Paths.Outbox, queueDir: memoryQueueDir}
+}
+
+func (a *App) knowledgeQueueLane() queueLane {
+	return queueLane{outbox: a.Paths.KnowledgeOutbox, queueDir: knowledgeQueueDir}
+}
+
+func appendQueueBatch(dst *queueBatch, src queueBatch) {
+	dst.OutboxPaths = append(dst.OutboxPaths, src.OutboxPaths...)
+	dst.EventPaths = append(dst.EventPaths, src.EventPaths...)
+	dst.Bytes += src.Bytes
+}
+
+func (a *App) queueLaneForTarget(path string) (queueLane, bool) {
+	for _, lane := range []queueLane{a.memoryQueueLane(), a.knowledgeQueueLane()} {
+		if strings.HasPrefix(path, lane.queueDir+"/") {
+			return lane, true
+		}
+	}
+	return queueLane{}, false
+}
+
+func isQueueEventTarget(path string) bool {
+	return strings.HasPrefix(path, memoryQueueDir+"/") || strings.HasPrefix(path, knowledgeQueueDir+"/")
 }
 
 // copyOutboxToQueue moves up to a bounded steady-state batch of raw outbox events
@@ -166,7 +205,31 @@ type queueBatch struct {
 // throttle. The operator-invoked bulk import removes them entirely via
 // copyOutboxBatch (see drainOutboxToQueue).
 func (a *App) copyOutboxToQueue() (queueBatch, error) {
-	return a.copyOutboxBatch(event.MaxSyncEvents, event.MaxSyncBytes)
+	return a.copyOutboxBatchForLane(a.memoryQueueLane(), event.MaxSyncEvents, event.MaxSyncBytes)
+}
+
+func (a *App) copyKnowledgeOutboxToQueue() (queueBatch, error) {
+	return a.copyOutboxBatchForLane(a.knowledgeQueueLane(), event.MaxSyncEvents, event.MaxSyncBytes)
+}
+
+func (a *App) copySteadyOutboxes(maxEvents, maxBytes int) (queueBatch, error) {
+	var combined queueBatch
+	var errs []error
+	remainingEvents, remainingBytes := maxEvents, maxBytes
+	for _, lane := range []queueLane{a.memoryQueueLane(), a.knowledgeQueueLane()} {
+		if remainingEvents <= 0 || remainingBytes <= 0 {
+			break
+		}
+		part, err := a.copyOutboxBatchForLane(lane, remainingEvents, remainingBytes)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		appendQueueBatch(&combined, part)
+		remainingEvents -= len(part.EventPaths)
+		remainingBytes -= part.Bytes
+	}
+	return combined, errors.Join(errs...)
 }
 
 // copyOutboxBatch moves outbox events into the queue worktree under events/,
@@ -175,51 +238,85 @@ func (a *App) copyOutboxToQueue() (queueBatch, error) {
 // maxBytes cap the batch; a non-positive bound disables that cap. The per-event
 // event.MaxEventBytes ceiling always applies.
 func (a *App) copyOutboxBatch(maxEvents, maxBytes int) (queueBatch, error) {
-	entries, err := os.ReadDir(a.Paths.Outbox)
+	return a.copyOutboxBatchForLane(a.memoryQueueLane(), maxEvents, maxBytes)
+}
+
+func (a *App) copyOutboxBatchForLane(lane queueLane, maxEvents, maxBytes int) (queueBatch, error) {
+	return a.copyOutboxBatchForLaneSkipping(lane, maxEvents, maxBytes, nil)
+}
+
+func sortedOutboxEntries(lane queueLane) ([]os.DirEntry, error) {
+	entries, err := os.ReadDir(lane.outbox)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	return entries, nil
+}
+
+func (a *App) copyOutboxBatchForLaneSkipping(lane queueLane, maxEvents, maxBytes int, skip map[string]struct{}) (queueBatch, error) {
+	entries, err := sortedOutboxEntries(lane)
 	if err != nil {
 		return queueBatch{}, err
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	batch, _, err := a.copyOutboxEntries(lane, entries, 0, maxEvents, maxBytes, skip)
+	return batch, err
+}
+
+func (a *App) copyOutboxEntries(lane queueLane, entries []os.DirEntry, start, maxEvents, maxBytes int, skip map[string]struct{}) (queueBatch, int, error) {
 	var batch queueBatch
 	selectedBytes := 0
-	for _, entry := range entries {
+	next := start
+	for next < len(entries) {
+		entry := entries[next]
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			next++
 			continue
 		}
-		sourcePath := filepath.Join(a.Paths.Outbox, entry.Name())
+		sourcePath := filepath.Join(lane.outbox, entry.Name())
+		if _, alreadySelected := skip[sourcePath]; alreadySelected {
+			next++
+			continue
+		}
 		content, err := readOutboxFile(sourcePath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
+				next++
 				continue
 			}
-			return queueBatch{}, err
+			return batch, next, err
 		}
 		if (maxEvents > 0 && len(batch.EventPaths) == maxEvents) || (maxBytes > 0 && selectedBytes > 0 && selectedBytes+len(content) > maxBytes) {
 			break
 		}
-		rel := filepath.ToSlash(filepath.Join("events", entry.Name()))
-		if err := ensureQueueTargetDirectory(a.Paths.Queue, "events"); err != nil {
-			return batch, err
+		rel := filepath.ToSlash(filepath.Join(lane.queueDir, entry.Name()))
+		if err := ensureQueueTargetDirectory(a.Paths.Queue, lane.queueDir); err != nil {
+			return batch, next, err
 		}
 		target := filepath.Join(a.Paths.Queue, filepath.FromSlash(rel))
 		info, statErr := os.Lstat(target)
 		if statErr == nil && !info.Mode().IsRegular() {
-			return batch, fmt.Errorf("queue event target is not a regular file: %s", target)
+			return batch, next, fmt.Errorf("queue event target is not a regular file: %s", target)
 		}
 		if existing, err := os.ReadFile(target); err == nil {
 			if !bytes.Equal(existing, content) {
-				return batch, fmt.Errorf("queue event collision: %s", target)
+				return batch, next, fmt.Errorf("queue event collision: %s", target)
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return batch, err
+			return batch, next, err
 		} else if err := fsx.WriteAtomic(target, content, 0o600); err != nil {
-			return batch, err
+			return batch, next, err
 		}
 		batch.OutboxPaths = append(batch.OutboxPaths, sourcePath)
 		batch.EventPaths = append(batch.EventPaths, rel)
+		batch.Bytes += len(content)
 		selectedBytes += len(content)
+		next++
 	}
-	return batch, nil
+	return batch, next, nil
 }
 
 // bulkQueueCommitChunk bounds how many events land in one ingest commit so the
@@ -284,6 +381,7 @@ func (a *App) drainOutboxToQueue(ctx context.Context, state config.State) (int, 
 		}
 	}
 	delivered := 0
+	selectedOutbox := make(map[string]struct{})
 	commit := func(batch queueBatch) error {
 		if len(batch.EventPaths) == 0 {
 			return nil
@@ -291,27 +389,37 @@ func (a *App) drainOutboxToQueue(ctx context.Context, state config.State) (int, 
 		if err := a.stageAndCommitQueueBatch(ctx, state, batch); err != nil {
 			return err
 		}
-		if err := removeOutboxPaths(batch.OutboxPaths); err != nil {
-			return err
+		for _, path := range batch.OutboxPaths {
+			selectedOutbox[path] = struct{}{}
 		}
 		delivered += len(batch.EventPaths)
 		return nil
 	}
 	// Fold any interrupted steady-state batch first; recoverInterruptedQueueBatch
-	// already verified its worktree files against the outbox.
+	// already verified its worktree files against the matching lane's outbox.
 	if err := commit(recovered); err != nil {
 		return delivered, err
 	}
-	for {
-		batch, err := a.copyOutboxBatch(bulkQueueCommitChunk, 0)
+	var laneErrs []error
+	for _, lane := range []queueLane{a.memoryQueueLane(), a.knowledgeQueueLane()} {
+		entries, err := sortedOutboxEntries(lane)
 		if err != nil {
-			return delivered, err
+			laneErrs = append(laneErrs, err)
+			continue
 		}
-		if len(batch.EventPaths) == 0 {
-			break
-		}
-		if err := commit(batch); err != nil {
-			return delivered, err
+		for next := 0; next < len(entries); {
+			batch, after, err := a.copyOutboxEntries(lane, entries, next, bulkQueueCommitChunk, 0, selectedOutbox)
+			if err != nil {
+				laneErrs = append(laneErrs, err)
+				break
+			}
+			if len(batch.EventPaths) == 0 {
+				break
+			}
+			if err := commit(batch); err != nil {
+				return delivered, err
+			}
+			next = after
 		}
 	}
 	if err := requireOnlyQueueTargets(ctx, a.Paths.Queue, nil, false); err != nil {
@@ -326,7 +434,12 @@ func (a *App) drainOutboxToQueue(ctx context.Context, state config.State) (int, 
 			return delivered, err
 		}
 	}
-	return delivered, nil
+	// The outboxes are the recovery source for a committed-but-unpushed append.
+	// Delete from either lane only after origin contains every commit above.
+	if err := removeOutboxSet(selectedOutbox); err != nil {
+		return delivered, err
+	}
+	return delivered, errors.Join(laneErrs...)
 }
 
 // stageAndCommitQueueBatch stages and commits one already-copied batch, enforcing
@@ -352,8 +465,8 @@ func (a *App) stageAndCommitQueueBatch(ctx context.Context, state config.State, 
 	return err
 }
 
-func removeOutboxPaths(paths []string) error {
-	for _, path := range paths {
+func removeOutboxSet(paths map[string]struct{}) error {
+	for path := range paths {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -409,27 +522,29 @@ func readOutboxFile(path string) ([]byte, error) {
 }
 
 func cleanupQueueTemps(queue string) error {
-	root := filepath.Join(queue, "events")
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), ".hgctl-") {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
+	for _, relative := range []string{"events", "knowledge/events"} {
+		root := filepath.Join(queue, filepath.FromSlash(relative))
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() || !strings.HasPrefix(entry.Name(), ".hgctl-") {
+				return nil
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("refusing non-regular queue temp %s", path)
+			}
+			return os.Remove(path)
+		})
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("refusing non-regular queue temp %s", path)
-		}
-		return os.Remove(path)
-	})
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
 	}
-	return err
+	return nil
 }
 
 func requireQueueTrackedClean(ctx context.Context, queue string) error {
@@ -480,11 +595,12 @@ func (a *App) recoverInterruptedQueueBatch(ctx context.Context) (queueBatch, err
 		if code != "A " && code != "??" {
 			return queueBatch{}, errors.New("queue has staged or tracked worktree changes")
 		}
-		if clean != rel || !strings.HasPrefix(clean, "events/") || !strings.HasSuffix(clean, ".md") {
+		lane, ok := a.queueLaneForTarget(clean)
+		if clean != rel || !ok || !strings.HasSuffix(clean, ".md") {
 			return queueBatch{}, fmt.Errorf("queue has unexpected change %q at %s", code, rel)
 		}
 		base := filepath.Base(clean)
-		outboxPath := filepath.Join(a.Paths.Outbox, base)
+		outboxPath := filepath.Join(lane.outbox, base)
 		outbox, err := readOutboxFile(outboxPath)
 		if err != nil {
 			return queueBatch{}, fmt.Errorf("staged queue event has no matching outbox entry: %s", rel)
@@ -522,10 +638,11 @@ func requireOnlyQueueTargets(ctx context.Context, queue string, targets []string
 	allowed := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		clean := filepath.ToSlash(filepath.Clean(target))
-		// events/ plus the single machine metadata file at the root; see
-		// machine_meta.go for why that one exception is worth making.
+		// The two append-only event lanes plus the single machine metadata file at
+		// the root; see machine_meta.go for why that exception is worth making.
+		eventTarget := isQueueEventTarget(clean)
 		if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") ||
-			(!strings.HasPrefix(clean, "events/") && clean != machineMetaFile) {
+			(!eventTarget && clean != machineMetaFile) {
 			return fmt.Errorf("invalid queue target %q", target)
 		}
 		allowed[clean] = struct{}{}

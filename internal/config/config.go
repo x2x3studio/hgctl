@@ -43,23 +43,25 @@ const (
 )
 
 type Paths struct {
-	Home          string
-	Data          string
-	Control       string
-	Queue         string
-	Outbox        string
-	Vault         string
-	Shared        string
-	Bin           string
-	Versions      string
-	Identity      string
-	State         string
-	IndexedSHA    string
-	VaultMirror   string
-	UpdateCheck   string
-	LifecycleLock string
-	SyncLock      string
-	UpdateLock    string
+	Home            string
+	Data            string
+	Control         string
+	Queue           string
+	Outbox          string
+	KnowledgeOutbox string
+	KnowledgeLedger string
+	Vault           string
+	Shared          string
+	Bin             string
+	Versions        string
+	Identity        string
+	State           string
+	IndexedSHA      string
+	VaultMirror     string
+	UpdateCheck     string
+	LifecycleLock   string
+	SyncLock        string
+	UpdateLock      string
 }
 
 // Default resolves the layout, honouring HGCTL_HOME, HGCTL_DATA_DIR and
@@ -82,23 +84,25 @@ func Default() (Paths, error) {
 		vault = filepath.Join(home, "hourglass-vault")
 	}
 	return Paths{
-		Home:          home,
-		Data:          data,
-		Control:       filepath.Join(data, "repo"),
-		Queue:         filepath.Join(data, "queue"),
-		Outbox:        filepath.Join(data, "outbox"),
-		Vault:         vault,
-		Shared:        filepath.Join(data, "shared"),
-		Bin:           filepath.Join(home, ".local", "bin"),
-		Versions:      filepath.Join(home, ".local", "lib", "hgctl", "versions"),
-		Identity:      filepath.Join(data, "identity.json"),
-		State:         filepath.Join(data, "state.json"),
-		IndexedSHA:    filepath.Join(data, "indexed-shared"),
-		VaultMirror:   filepath.Join(data, "vault-mirror.json"),
-		UpdateCheck:   filepath.Join(data, "update-check.json"),
-		LifecycleLock: filepath.Join(data, "lifecycle.lock"),
-		SyncLock:      filepath.Join(data, "sync.lock"),
-		UpdateLock:    filepath.Join(data, "update.lock"),
+		Home:            home,
+		Data:            data,
+		Control:         filepath.Join(data, "repo"),
+		Queue:           filepath.Join(data, "queue"),
+		Outbox:          filepath.Join(data, "outbox"),
+		KnowledgeOutbox: filepath.Join(data, "knowledge-outbox"),
+		KnowledgeLedger: filepath.Join(data, "knowledge-ingested-sessions.json"),
+		Vault:           vault,
+		Shared:          filepath.Join(data, "shared"),
+		Bin:             filepath.Join(home, ".local", "bin"),
+		Versions:        filepath.Join(home, ".local", "lib", "hgctl", "versions"),
+		Identity:        filepath.Join(data, "identity.json"),
+		State:           filepath.Join(data, "state.json"),
+		IndexedSHA:      filepath.Join(data, "indexed-shared"),
+		VaultMirror:     filepath.Join(data, "vault-mirror.json"),
+		UpdateCheck:     filepath.Join(data, "update-check.json"),
+		LifecycleLock:   filepath.Join(data, "lifecycle.lock"),
+		SyncLock:        filepath.Join(data, "sync.lock"),
+		UpdateLock:      filepath.Join(data, "update.lock"),
 	}, nil
 }
 
@@ -133,7 +137,7 @@ type State struct {
 
 // EnsureDirs creates the directories the endpoint writes into.
 func (p Paths) EnsureDirs() error {
-	for _, dir := range []string{p.Data, p.Outbox} {
+	for _, dir := range []string{p.Data, p.Outbox, p.KnowledgeOutbox} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
 		}
