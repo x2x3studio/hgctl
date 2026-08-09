@@ -768,6 +768,32 @@ func TestManagedStableSymlinkRequiresVersionTree(t *testing.T) {
 	}
 }
 
+func TestRepairBasicMemoryPermalinksIsIdempotent(t *testing.T) {
+	app := testApp(t)
+	path := filepath.Join(app.Paths.Home, ".basic-memory", "config.json")
+	if err := fsx.WriteJSON(path, map[string]any{
+		"disable_permalinks":      true,
+		"semantic_search_enabled": true,
+	}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := app.repairBasicMemoryPermalinks()
+	if err != nil || !changed {
+		t.Fatalf("repair changed=%v err=%v", changed, err)
+	}
+	var configBody map[string]any
+	if err := fsx.ReadJSON(path, &configBody); err != nil {
+		t.Fatal(err)
+	}
+	if configBody["disable_permalinks"] != false || configBody["semantic_search_enabled"] != true {
+		t.Fatalf("repaired config=%v", configBody)
+	}
+	changed, err = app.repairBasicMemoryPermalinks()
+	if err != nil || changed {
+		t.Fatalf("second repair changed=%v err=%v", changed, err)
+	}
+}
+
 func TestBasicMemoryReindexIsReadOnlyAndReceiptBound(t *testing.T) {
 	app := testApp(t)
 	if err := os.MkdirAll(app.Paths.Shared, 0o700); err != nil {

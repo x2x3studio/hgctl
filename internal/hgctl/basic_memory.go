@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
@@ -44,7 +45,36 @@ func (a *App) setupBasicMemory(ctx context.Context) error {
 // harmless and never dirty tracked history.
 var basicMemoryReadOnlyEnv []string
 
+// repairBasicMemoryPermalinks removes the legacy global switch older Hourglass
+// installs set. Without permalinks Basic Memory indexes entities but project-scoped
+// recall and the wikilink graph return zero results. The bool reports that the
+// incremental file manifest is now stale and the caller must force one full scan.
+func (a *App) repairBasicMemoryPermalinks() (bool, error) {
+	path := filepath.Join(a.Paths.Home, ".basic-memory", "config.json")
+	content, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(content, &settings); err != nil {
+		return false, fmt.Errorf("parse Basic Memory config: %w", err)
+	}
+	disabled, _ := settings["disable_permalinks"].(bool)
+	if !disabled {
+		return false, nil
+	}
+	settings["disable_permalinks"] = false
+	return true, fsx.WriteJSON(path, settings, 0o600)
+}
+
 func (a *App) reindexBasicMemory(ctx context.Context) error {
+	forceFull, err := a.repairBasicMemoryPermalinks()
+	if err != nil {
+		return err
+	}
 	head, err := proc.Run(ctx, a.Paths.Shared, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return err
@@ -60,7 +90,7 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 	}
 	projectID := state.BasicMemoryProject.ExternalID
 	indexed, indexedErr := config.LoadIndexReceipt(a.Paths)
-	if indexedErr == nil &&
+	if !forceFull && indexedErr == nil &&
 		indexed.SharedSHA == head && indexed.ProjectExternalID == projectID {
 		return nil
 	}
@@ -76,7 +106,7 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 	// index. Measured 4 of the last 40 shared commits, and a far larger share
 	// while a backlog drains, which is exactly when noop slices are common and
 	// the machine is least able to spare the cores.
-	if indexedErr == nil && indexed.ProjectExternalID == projectID &&
+	if !forceFull && indexedErr == nil && indexed.ProjectExternalID == projectID &&
 		productUnchangedBetween(ctx, a.Paths.Shared, indexed.SharedSHA, head) {
 		return config.SaveIndexReceipt(a.Paths, config.IndexReceipt{
 			SharedSHA:         head,
@@ -91,7 +121,11 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 		return err
 	}
 	projectID = project.ExternalID
-	if _, err := proc.RunEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", "reindex", "--project", config.ProjectName); err != nil {
+	args := []string{"reindex", "--project", config.ProjectName}
+	if forceFull {
+		args = append(args, "--full")
+	}
+	if _, err := proc.RunEnv(ctx, "", basicMemoryReadOnlyEnv, "basic-memory", args...); err != nil {
 		return err
 	}
 	return config.SaveIndexReceipt(a.Paths, config.IndexReceipt{
