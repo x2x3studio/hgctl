@@ -159,10 +159,10 @@ func (a *App) ensureQueueBranch(ctx context.Context, branch string) error {
 }
 
 // seedOrphanQueueBranch creates the machine queue branch as a parentless (orphan)
-// root commit tracking an empty events/.gitkeep, then publishes it to origin. The
-// commit is built through a temporary index so the control worktree, index, and
-// HEAD stay untouched, and it preserves the queue orphan + append-only invariant:
-// the only tracked path lives under events/.
+// root commit tracking an empty memory/events/.gitkeep, then publishes it to origin.
+// The commit is built through a temporary index so the control worktree, index,
+// and HEAD stay untouched, and it preserves the queue orphan + append-only
+// invariant: the only tracked path lives under the Memory event lane.
 func (a *App) seedOrphanQueueBranch(ctx context.Context, branch string) error {
 	scratch, err := os.MkdirTemp("", "hgctl-queue-seed")
 	if err != nil {
@@ -180,7 +180,7 @@ func (a *App) seedOrphanQueueBranch(ctx context.Context, branch string) error {
 	}
 	indexEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(scratch, "index")}
 	if _, err := proc.RunEnv(ctx, a.Paths.Control, indexEnv, "git", "update-index", "--add",
-		"--cacheinfo", "100644,"+strings.TrimSpace(blob)+",events/.gitkeep"); err != nil {
+		"--cacheinfo", "100644,"+strings.TrimSpace(blob)+","+memoryQueueDir+"/.gitkeep"); err != nil {
 		return err
 	}
 	tree, err := proc.RunEnv(ctx, a.Paths.Control, indexEnv, "git", "write-tree")

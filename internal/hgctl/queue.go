@@ -163,8 +163,9 @@ type queueBatch struct {
 }
 
 const (
-	memoryQueueDir    = "events"
-	knowledgeQueueDir = "knowledge/events"
+	memoryQueueDir       = "memory/events"
+	legacyMemoryQueueDir = "events"
+	knowledgeQueueDir    = "knowledge/events"
 )
 
 type queueLane struct {
@@ -174,6 +175,10 @@ type queueLane struct {
 
 func (a *App) memoryQueueLane() queueLane {
 	return queueLane{outbox: a.Paths.Outbox, queueDir: memoryQueueDir}
+}
+
+func (a *App) legacyMemoryQueueLane() queueLane {
+	return queueLane{outbox: a.Paths.Outbox, queueDir: legacyMemoryQueueDir}
 }
 
 func (a *App) knowledgeQueueLane() queueLane {
@@ -187,7 +192,7 @@ func appendQueueBatch(dst *queueBatch, src queueBatch) {
 }
 
 func (a *App) queueLaneForTarget(path string) (queueLane, bool) {
-	for _, lane := range []queueLane{a.memoryQueueLane(), a.knowledgeQueueLane()} {
+	for _, lane := range []queueLane{a.memoryQueueLane(), a.legacyMemoryQueueLane(), a.knowledgeQueueLane()} {
 		if strings.HasPrefix(path, lane.queueDir+"/") {
 			return lane, true
 		}
@@ -196,7 +201,9 @@ func (a *App) queueLaneForTarget(path string) (queueLane, bool) {
 }
 
 func isQueueEventTarget(path string) bool {
-	return strings.HasPrefix(path, memoryQueueDir+"/") || strings.HasPrefix(path, knowledgeQueueDir+"/")
+	return strings.HasPrefix(path, memoryQueueDir+"/") ||
+		strings.HasPrefix(path, legacyMemoryQueueDir+"/") ||
+		strings.HasPrefix(path, knowledgeQueueDir+"/")
 }
 
 // copyOutboxToQueue moves up to a bounded steady-state batch of raw outbox events
@@ -522,7 +529,7 @@ func readOutboxFile(path string) ([]byte, error) {
 }
 
 func cleanupQueueTemps(queue string) error {
-	for _, relative := range []string{"events", "knowledge/events"} {
+	for _, relative := range []string{legacyMemoryQueueDir, memoryQueueDir, knowledgeQueueDir} {
 		root := filepath.Join(queue, filepath.FromSlash(relative))
 		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 			if walkErr != nil {

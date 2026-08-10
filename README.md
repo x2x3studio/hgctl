@@ -9,7 +9,7 @@ from shell scripts plus the official Claude Action, not from any tool here.
 ```text
 Claude Code / Codex / Copilot   (sessions persist as transcripts on disk)
   -> hgctl two-ledger ingest     (Memory + Knowledge, live + historical)
-  -> queue/<machine-id>          (events/ + knowledge/events/)
+  -> queue/<machine-id>          (memory/events/ + knowledge/events/)
   -> independent GitHub Actions  (Memory reflect + OKF Knowledge compile)
   -> shared                      (memory/** + knowledge/**)
   -> hgctl pull and Basic Memory reindex
@@ -126,8 +126,10 @@ only the machine branch, requests reconciliation, pulls `shared`, and reindexes
 Basic Memory only after a fast-forward. A new machine's queue branch is
 self-seeded as an orphan root, never inheriting `main` or `shared`; all later
 endpoint
-commits are append-only events under `events/` for Memory and
-`knowledge/events/` for Knowledge. Their Actions archive consumed input into
+commits are append-only events under `memory/events/` for Memory and
+`knowledge/events/` for Knowledge. During migration, interrupted legacy
+`events/` stages remain recoverable, but new writes are namespaced. Their Actions
+archive consumed input into
 separate archive trees, fast-forward-only; `hgctl
 sync` fast-forwards through those archive commits, and self-heals a divergence (a
 local unpushed append that raced an archive) by resetting onto the remote and

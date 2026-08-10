@@ -79,7 +79,7 @@ pin that invariant rather than its implementation.
   hgctl hook left in a client config; the `hook` subcommand is a clean no-op kept
   only so a stale registration disrupts nothing.
 - On the endpoint, only `sync` writes Git: it APPENDS Memory events under
-  `events/` and Knowledge events under `knowledge/events/` on the same machine
+  `memory/events/` and Knowledge events under `knowledge/events/` on the same machine
   queue, and fast-forwards its local `shared` and `queue` worktrees; it never
   commits to `main` or `shared`, and never archives. The two Actions own their
   disjoint archive trees; the endpoint only
@@ -91,7 +91,8 @@ pin that invariant rather than its implementation.
   `shared` history: adopted when the remote already carries this machine's
   branch, otherwise self-seeded locally. All later commits are append-only
   event commits.
-- Events under `events/` and `knowledge/events/` are CREATE-ONLY; a modified event means captured
+- Events under `memory/events/` and `knowledge/events/` are CREATE-ONLY; legacy
+  `events/` is accepted only for interrupted-stage recovery during migration. A modified event means captured
   evidence was altered and the guards must keep refusing it. `machine.json` at
   the branch root is the one tracked file rewritten in place (a hostname edit,
   an OS upgrade, an hgctl release), so it is the one path where a modification

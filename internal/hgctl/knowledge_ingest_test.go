@@ -109,7 +109,7 @@ func TestQueuePublishesMemoryAndKnowledgeToSeparatePaths(t *testing.T) {
 	tracked := strings.Fields(runGitTest(t, app.Paths.Queue, "ls-tree", "-r", "--name-only", "HEAD"))
 	var memoryPath, knowledgePath bool
 	for _, path := range tracked {
-		memoryPath = memoryPath || strings.HasPrefix(path, "events/") && strings.HasSuffix(path, ".md")
+		memoryPath = memoryPath || strings.HasPrefix(path, "memory/events/") && strings.HasSuffix(path, ".md")
 		knowledgePath = knowledgePath || strings.HasPrefix(path, "knowledge/events/") && strings.HasSuffix(path, ".md")
 	}
 	if !memoryPath || !knowledgePath {
@@ -125,6 +125,17 @@ func TestQueuePublishesMemoryAndKnowledgeToSeparatePaths(t *testing.T) {
 				t.Fatalf("%s retained %s after successful push", dir, entry.Name())
 			}
 		}
+	}
+}
+
+func TestLegacyMemoryQueueTargetUsesMemoryOutboxForCrashRecovery(t *testing.T) {
+	app := testApp(t)
+	lane, ok := app.queueLaneForTarget("events/legacy.md")
+	if !ok {
+		t.Fatal("legacy Memory queue target is not recoverable after upgrade")
+	}
+	if lane.outbox != app.Paths.Outbox || lane.queueDir != legacyMemoryQueueDir {
+		t.Fatalf("legacy lane=%+v, want Memory outbox and %q", lane, legacyMemoryQueueDir)
 	}
 }
 
@@ -173,7 +184,7 @@ func TestBrokenKnowledgeOutboxDoesNotBlockMemoryCopy(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the broken Knowledge lane to be reported")
 	}
-	if len(batch.EventPaths) != 1 || !strings.HasPrefix(batch.EventPaths[0], "events/") {
+	if len(batch.EventPaths) != 1 || !strings.HasPrefix(batch.EventPaths[0], "memory/events/") {
 		t.Fatalf("valid Memory lane was not copied: %+v", batch)
 	}
 }
