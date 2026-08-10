@@ -133,11 +133,11 @@ func TestDrainOutboxToQueuePublishesEntireBacklog(t *testing.T) {
 		t.Fatalf("delivered = %d, want %d", delivered, events)
 	}
 
-	// Every event committed under events/ alongside the orphan .gitkeep seed.
+	// Every event committed under the namespaced Memory lane alongside its seed.
 	tracked := strings.Fields(runGitTest(t, app.Paths.Queue, "ls-tree", "-r", "--name-only", "HEAD"))
 	md := 0
 	for _, name := range tracked {
-		if strings.HasPrefix(name, "events/") && strings.HasSuffix(name, ".md") {
+		if strings.HasPrefix(name, "memory/events/") && strings.HasSuffix(name, ".md") {
 			md++
 		}
 	}

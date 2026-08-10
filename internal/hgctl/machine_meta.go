@@ -14,7 +14,7 @@ import (
 )
 
 // machineMetaFile names the one tracked path a queue branch carries outside
-// events/ and archive/.
+// the memory/ and knowledge/ product lanes (plus legacy root paths during migration).
 //
 // WHY IT EXISTS. A queue branch is identified only by the machine UUID in its
 // name, which says nothing about which machine that is. Reading the product,
@@ -23,8 +23,8 @@ import (
 // recovered from an event's frontmatter, which is gone once the events are
 // archived.
 //
-// WHY IT DOES NOT BREAK THE APPEND-ONLY INVARIANT. Selection reads only
-// events/, and archiving moves only events/, so a file at the branch root is
+// WHY IT DOES NOT BREAK THE APPEND-ONLY INVARIANT. Selection reads only the
+// product event lanes, and archiving moves only those lanes, so a file at the branch root is
 // invisible to both. It is the single exception to "a queue carries raw
 // evidence and nothing else", and it earns that by being the thing you need
 // before you can interpret the evidence.

@@ -185,8 +185,8 @@ func TestSeedOrphanQueueBranchWithoutTemplate(t *testing.T) {
 	if parents := strings.Fields(runGitTest(t, control, "rev-list", "--parents", "-n", "1", branch)); len(parents) != 1 {
 		t.Fatalf("queue seed is not a parentless root commit: %v", parents)
 	}
-	if tracked := strings.TrimSpace(runGitTest(t, control, "ls-tree", "-r", "--name-only", branch)); tracked != "events/.gitkeep" {
-		t.Fatalf("orphan seed tracks %q, want only events/.gitkeep", tracked)
+	if tracked := strings.TrimSpace(runGitTest(t, control, "ls-tree", "-r", "--name-only", branch)); tracked != "memory/events/.gitkeep" {
+		t.Fatalf("orphan seed tracks %q, want only memory/events/.gitkeep", tracked)
 	}
 	local := strings.TrimSpace(runGitTest(t, control, "rev-parse", "refs/heads/"+branch))
 	remote := strings.TrimSpace(runGitTest(t, origin, "rev-parse", "refs/heads/"+branch))

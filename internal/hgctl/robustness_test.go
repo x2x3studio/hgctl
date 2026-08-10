@@ -280,7 +280,10 @@ func TestSyncQueueSelfHealsDivergedRemoteViaOutboxReplay(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(app.Paths.Outbox, appendEvent), appendBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(app.Paths.Queue, "events", appendEvent), appendBody, 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Join(app.Paths.Queue, "memory", "events"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app.Paths.Queue, "memory", "events", appendEvent), appendBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	runGitTest(t, app.Paths.Queue, "add", ".")
@@ -307,10 +310,10 @@ func TestSyncQueueSelfHealsDivergedRemoteViaOutboxReplay(t *testing.T) {
 	if !contains(tree, "archive/2026-03/"+consumed) {
 		t.Fatalf("archive commit was lost by the self-heal: tree=%v", tree)
 	}
-	if !contains(tree, "events/"+appendEvent) {
+	if !contains(tree, "memory/events/"+appendEvent) {
 		t.Fatalf("un-pushed append was lost by the self-heal: tree=%v", tree)
 	}
-	if body := runGitTest(t, app.Paths.Queue, "show", "HEAD:events/"+appendEvent); body != string(appendBody) {
+	if body := runGitTest(t, app.Paths.Queue, "show", "HEAD:memory/events/"+appendEvent); body != string(appendBody) {
 		t.Fatalf("replayed append body = %q, want %q", body, appendBody)
 	}
 	if entries, err := os.ReadDir(app.Paths.Outbox); err != nil {
