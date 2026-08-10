@@ -1,8 +1,9 @@
 # hgctl
 
 `hgctl` is the static endpoint runtime for Hourglass and the only binary this
-repository builds. The companion `x2x3studio/hourglass` runs its reflect step
-from shell scripts plus the official Claude Action, not from any tool here.
+repository builds. The private `x2x3studio/hourglass` repository runs the unified
+Memory and Knowledge Project workflow from shell scripts plus the official Claude
+Action; projection does not run inside this client.
 
 ## Minimal loop
 
@@ -10,8 +11,8 @@ from shell scripts plus the official Claude Action, not from any tool here.
 Claude Code / Codex / Copilot   (sessions persist as transcripts on disk)
   -> hgctl two-ledger ingest     (Memory + Knowledge, live + historical)
   -> queue/<machine-id>          (memory/events/ + knowledge/events/)
-  -> independent GitHub Actions  (Memory reflect + OKF Knowledge compile)
-  -> shared                      (memory/** + knowledge/**)
+  -> one Project workflow        (independent Memory + Knowledge projections)
+  -> one atomic shared commit    (memory/** + knowledge/**)
   -> hgctl pull and Basic Memory reindex
   -> Basic Memory MCP recall
 ```
@@ -60,7 +61,10 @@ authoritative autonomous onboarding contract is
 ```
 
 `--repo` defaults to `git@github.com:x2x3studio/hourglass.git` (override with the
-flag or `HOURGLASS_REPO`). Install is idempotent.
+flag or `HOURGLASS_REPO`). Install is idempotent. On first connect, any empty
+Memory or Knowledge ledger is backfilled from the machine's complete local
+session history and published before the scheduler takes over; a repair install
+skips ledgers that are already populated.
 
 Install creates:
 
@@ -70,16 +74,20 @@ Install creates:
 ~/.local/share/hgctl/
   identity.json      stable random machine UUID
   state.json         repo URL + queue branch
-  repo/              control clone (main, shared, queue/<machine-id>)
-  outbox/ knowledge-outbox/ queue/ shared/
+  repo/              control clone
+  queue/             this machine's queue worktree
+  shared/            product worktree
+  outbox/ knowledge-outbox/
   ingested-sessions.json  knowledge-ingested-sessions.json
+  indexed-shared  vault-mirror.json  update-check.json
 
 ~/hourglass-vault/   Basic Memory project (recall mirror)
 ```
 
 It also installs one scheduler, the Basic Memory project `hourglass`, and the
-`hourglass-memory` MCP server in every installed Claude Code or Codex client, and
-prunes any stale hgctl capture hook left in their config by an older version. It
+`hourglass-memory` recall MCP in every installed Claude Code or Codex client, and
+prunes any stale hgctl capture hook left in their config by an older version.
+Copilot is an ingest source but does not receive this MCP registration. It
 verifies the exact MCP command, arguments, environment, project identity, and
 indexed `shared` revision. Run `hgctl doctor` until all managed checks pass.
 
@@ -121,16 +129,17 @@ origin before the command returns. `--client` selects the source (`all`,
 `all`; and `--limit` caps each selected target. Each scheduled `hgctl sync` folds
 in a bounded re-ingest before it drains both outboxes.
 
-`hgctl sync` atomically drains the outbox, appends bounded queue commits, pushes
-only the machine branch, requests reconciliation, pulls `shared`, and reindexes
-Basic Memory only after a fast-forward. A new machine's queue branch is
+`hgctl sync` drains both outboxes, appends bounded queue commits, pushes only the
+machine branch, pulls `shared`, and reindexes Basic Memory when the shared
+revision changes. A rewritten remote `shared` root is adopted with a guarded hard
+reset because the local mirror is disposable. A new machine's queue branch is
 self-seeded as an orphan root, never inheriting `main` or `shared`; all later
 endpoint
 commits are append-only events under `memory/events/` for Memory and
 `knowledge/events/` for Knowledge. During migration, interrupted legacy
-`events/` stages remain recoverable, but new writes are namespaced. Their Actions
-archive consumed input into
-separate archive trees, fast-forward-only; `hgctl
+`events/` stages remain recoverable, but new writes are namespaced. After one
+atomic product publish, Project archives each lane's consumed input into separate
+archive trees, fast-forward-only; `hgctl
 sync` fast-forwards through those archive commits, and self-heals a divergence (a
 local unpushed append that raced an archive) by resetting onto the remote and
 replaying the event from the retained outbox.
@@ -154,11 +163,11 @@ check per hour): it fetches the latest release, verifies the checksum, and
 atomically retargets the stable `~/.local/bin/hgctl` symlink. `hgctl update`
 forces a check now.
 
-This repository is public, so the self-update fetches the latest release and
-its assets over unauthenticated HTTPS with the Go standard library - no `gh`
-needed. The endpoint never triggers reflect: it only appends events to the
-queue and fast-forwards `shared`; the reflect Action drains on its own
-schedule. Git transport uses SSH.
+This repository is public, so self-update fetches the latest release and assets
+over unauthenticated HTTPS with the Go standard library - no `gh` needed. The
+endpoint does not call the private repository's Actions API: it appends queue
+events and fast-forwards `shared`; Project drains by its gated schedule and
+self-chain. Git transport uses SSH.
 
 ## Development
 
