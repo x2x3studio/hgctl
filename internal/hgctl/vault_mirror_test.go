@@ -118,11 +118,48 @@ func TestMirrorIgnoresBasicMemorysOwnRewrites(t *testing.T) {
 func TestMirrorRendersOKFLinksForTheVault(t *testing.T) {
 	app := testApp(t)
 	knowledge := strings.Join([]string{
+		"---",
+		"description: |",
+		"  ---",
+		`aliases: ["[topic](/concepts/leave-frontmatter.md)"]`,
+		"---",
 		"# Knowledge",
 		"",
 		"[topic](/concepts/demonware/data/topic.md)",
-		"[section](/concepts/demonware/data/topic.md#limits)",
+		`[titled](/concepts/demonware/data/topic.md?view=full#limits "Title")`,
+		`[title-duplicate](/concepts/title.md "literal ](/concepts/title.md in title")`,
+		"[`](/concepts/leave-code-label.md)`](/concepts/real-after-code-label.md)",
+		`[angle](</concepts/angle.md>)`,
+		`[space]( /concepts/space.md)`,
+		"[multi",
+		"line](/concepts/multiline-label.md)",
+		"[first](/concepts/one.md) and [second](/concepts/two.md)",
+		"[already](/knowledge/concepts/already.md)",
+		"[relative](../relative.md)",
+		"[anchor](#local)",
+		"[external](https://example.test/concepts/external.md)",
+		"[similar](/concepts-old/not-a-concept.md)",
+		"![image](/concepts/leave-image.md)",
+		`\[escaped\](/concepts/leave-escaped.md)`,
+		"plain prose ](/concepts/leave-prose.md)",
 		"`[inline](/concepts/leave-inline.md)`",
+		"`` `[multi-inline](/concepts/leave-multi-inline.md)` ``",
+		"<!-- [comment](/concepts/leave-comment.md) -->",
+		"<!--",
+		"```",
+		"[multiline-comment](/concepts/leave-multiline-comment.md)",
+		"-->",
+		"[after-comment-fence](/concepts/after-comment-fence.md)",
+		"`first",
+		"[multiline-code](/concepts/leave-multiline-code.md)",
+		"last`",
+		`![outer [inner]](/concepts/leave-nested-image.md)`,
+		`[![alt](/concepts/leave-wrapped-image.md)](/concepts/wrapped-page.md)`,
+		"    ```",
+		"[after-indented-code](/concepts/after-indented-code.md)",
+		"> ````markdown",
+		"> [quoted-fence](/concepts/leave-quoted-fence.md)",
+		"> ````",
 		"",
 		"````markdown",
 		"[fenced](/concepts/leave-fenced.md)",
@@ -131,6 +168,9 @@ func TestMirrorRendersOKFLinksForTheVault(t *testing.T) {
 		"```` not-a-close",
 		"[still-fenced-again](/concepts/leave-after-nonclosing-fence.md)",
 		"````",
+		"~~~markdown",
+		"[tilde-fenced](/concepts/leave-tilde-fenced.md)",
+		"~~~",
 		"",
 	}, "\n")
 	seedProduct(t, app, map[string]string{
@@ -146,12 +186,20 @@ func TestMirrorRendersOKFLinksForTheVault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := strings.ReplaceAll(knowledge,
-		"](/concepts/demonware/data/topic.md)",
-		"](/knowledge/concepts/demonware/data/topic.md)")
-	want = strings.ReplaceAll(want,
-		"](/concepts/demonware/data/topic.md#limits)",
-		"](/knowledge/concepts/demonware/data/topic.md#limits)")
+	want := strings.NewReplacer(
+		"](/concepts/demonware/data/topic.md)", "](/knowledge/concepts/demonware/data/topic.md)",
+		"](/concepts/demonware/data/topic.md?view=full#limits", "](/knowledge/concepts/demonware/data/topic.md?view=full#limits",
+		"](/concepts/title.md \"literal", "](/knowledge/concepts/title.md \"literal",
+		"](/concepts/real-after-code-label.md)", "](/knowledge/concepts/real-after-code-label.md)",
+		"](</concepts/angle.md>", "](</knowledge/concepts/angle.md>",
+		"]( /concepts/space.md)", "]( /knowledge/concepts/space.md)",
+		"](/concepts/multiline-label.md)", "](/knowledge/concepts/multiline-label.md)",
+		"](/concepts/one.md)", "](/knowledge/concepts/one.md)",
+		"](/concepts/two.md)", "](/knowledge/concepts/two.md)",
+		"](/concepts/after-comment-fence.md)", "](/knowledge/concepts/after-comment-fence.md)",
+		"](/concepts/wrapped-page.md)", "](/knowledge/concepts/wrapped-page.md)",
+		"](/concepts/after-indented-code.md)", "](/knowledge/concepts/after-indented-code.md)",
+	).Replace(knowledge)
 	if string(got) != want {
 		t.Fatalf("Knowledge links were not rendered for the vault:\n%s", got)
 	}
@@ -232,6 +280,49 @@ func TestMirrorSchemaUpgradeRebuildsVaultAndInvalidatesIndexReceipt(t *testing.T
 	_, currentSchema := app.loadVaultMirror()
 	if !currentSchema {
 		t.Fatal("schema upgrade did not write a current manifest")
+	}
+}
+
+func TestMirrorSchemaUpgradeStopsBeforeWritesWhenReceiptCannotBeInvalidated(t *testing.T) {
+	app := testApp(t)
+	const rel = "knowledge/concepts/demonware/data/source.md"
+	seedProduct(t, app, map[string]string{rel: "[topic](/concepts/demonware/data/topic.md)\n"})
+
+	path := filepath.Join(app.Paths.Vault, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const oldVault = "old vault generation\n"
+	if err := os.WriteFile(path, []byte(oldVault), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := scanProductSources(app.Paths.Shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsx.WriteJSON(app.Paths.VaultMirror, vaultMirror{
+		SchemaVersion: vaultMirrorSchemaVersion - 1,
+		Sources:       sources,
+	}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(app.Paths.IndexedSHA, "block-remove"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.mirrorProductToVault(); err == nil {
+		t.Fatal("schema upgrade succeeded without invalidating the old index receipt")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != oldVault {
+		t.Fatalf("schema upgrade wrote the vault before invalidating its receipt: %q", got)
+	}
+	_, currentSchema := app.loadVaultMirror()
+	if currentSchema {
+		t.Fatal("failed schema upgrade advanced the mirror manifest")
 	}
 }
 

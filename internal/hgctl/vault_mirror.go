@@ -1,6 +1,7 @@
 package hgctl
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,13 +9,17 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
 	"github.com/x2x3studio/hgctl/internal/proc"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
 )
 
-const vaultMirrorSchemaVersion = 2
+const vaultMirrorSchemaVersion = 3
 
 // productSubset names the paths mirrored out of the shared worktree. Everything
 // else in the vault - Basic Memory's own scratch, an .obsidian/ directory - is
@@ -62,6 +67,16 @@ func (a *App) mirrorProductToVault() error {
 		return err
 	}
 	previous, currentSchema := a.loadVaultMirror()
+	if !currentSchema {
+		// A schema change alters the rendered bytes without moving shared HEAD. Make
+		// the old index receipt unusable before touching any vault file, so an I/O
+		// failure can leave a recoverable partial mirror but never a partial mirror
+		// that claims to be fully indexed. The next sync sees the stale manifest and
+		// retries every source file.
+		if err := os.Remove(a.Paths.IndexedSHA); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	for rel, sum := range sources {
 		dst := filepath.Join(a.Paths.Vault, filepath.FromSlash(rel))
 		if previous[rel] == sum {
@@ -89,88 +104,167 @@ func (a *App) mirrorProductToVault() error {
 	if err := pruneVault(a.Paths.Vault, sources); err != nil {
 		return err
 	}
-	if !currentSchema {
-		if err := os.Remove(a.Paths.IndexedSHA); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
 	return fsx.WriteJSON(a.Paths.VaultMirror, vaultMirror{
 		SchemaVersion: vaultMirrorSchemaVersion,
 		Sources:       sources,
 	}, 0o600)
 }
 
-// renderVaultFile adapts the canonical OKF bundle to the repository-rooted
-// Obsidian vault without changing shared or its concept IDs.
+type vaultLinkEdit struct {
+	start int
+	stop  int
+}
+
+// renderVaultFile uses a CommonMark parser to decide which nodes are ordinary
+// links, then edits only their destination bytes. Shared stays byte-identical and
+// every unsupported or ambiguous Markdown shape stays untouched in the vault.
 func renderVaultFile(rel string, data []byte) []byte {
 	if !strings.HasPrefix(rel, "knowledge/") || !strings.HasSuffix(rel, ".md") {
 		return data
 	}
-	lines := strings.SplitAfter(string(data), "\n")
-	inFence := false
-	fence := byte(0)
-	fenceLength := 0
-	for i, line := range lines {
-		trimmed := strings.TrimLeft(line, " \t")
-		if marker, length, ok := markdownFenceMarker(trimmed); ok {
-			if !inFence {
-				inFence = true
-				fence = marker
-				fenceLength = length
-			} else if marker == fence && length >= fenceLength && strings.TrimSpace(trimmed[length:]) == "" {
-				inFence = false
-				fence = 0
-				fenceLength = 0
-			}
+	doc := goldmark.DefaultParser().Parse(text.NewReader(data))
+	bodyStart := markdownBodyStart(data)
+	var edits []vaultLinkEdit
+	_ = ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		link, ok := node.(*ast.Link)
+		if !ok || link.Reference != nil || link.Pos() < bodyStart || hasImageAncestor(link) ||
+			!bytes.HasPrefix(link.Destination, []byte("/concepts/")) {
+			return ast.WalkContinue, nil
+		}
+		if edit, ok := locateInlineLinkDestination(data, link); ok {
+			edits = append(edits, edit)
+		}
+		return ast.WalkContinue, nil
+	})
+	if len(edits) == 0 {
+		return data
+	}
+	sort.Slice(edits, func(i, j int) bool { return edits[i].start < edits[j].start })
+	var out bytes.Buffer
+	cursor := 0
+	for _, edit := range edits {
+		if edit.start < cursor || edit.stop > len(data) {
 			continue
 		}
-		if !inFence {
-			lines[i] = rewriteVaultLinksOutsideCode(line)
-		}
+		out.Write(data[cursor:edit.start])
+		out.WriteString("/knowledge/concepts/")
+		cursor = edit.stop
 	}
-	return []byte(strings.Join(lines, ""))
+	out.Write(data[cursor:])
+	return out.Bytes()
 }
 
-func markdownFenceMarker(line string) (byte, int, bool) {
-	if len(line) < 3 || line[0] != line[1] || line[1] != line[2] || (line[0] != '`' && line[0] != '~') {
-		return 0, 0, false
+func markdownBodyStart(source []byte) int {
+	if !bytes.HasPrefix(source, []byte("---\n")) && !bytes.HasPrefix(source, []byte("---\r\n")) {
+		return 0
 	}
-	length := 3
-	for length < len(line) && line[length] == line[0] {
-		length++
+	for offset := bytes.IndexByte(source, '\n') + 1; offset < len(source); {
+		next := bytes.IndexByte(source[offset:], '\n')
+		stop := len(source)
+		if next >= 0 {
+			stop = offset + next + 1
+		}
+		line := bytes.TrimSuffix(source[offset:stop], []byte("\n"))
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		if bytes.Equal(line, []byte("---")) {
+			return stop
+		}
+		offset = stop
 	}
-	return line[0], length, true
+	return 0
 }
 
-func rewriteVaultLinksOutsideCode(line string) string {
-	const from = "](/concepts/"
-	const to = "](/knowledge/concepts/"
-	var out strings.Builder
-	for len(line) > 0 {
-		code := strings.IndexByte(line, '`')
-		if code < 0 {
-			out.WriteString(strings.ReplaceAll(line, from, to))
-			break
+func hasImageAncestor(node ast.Node) bool {
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		if _, ok := parent.(*ast.Image); ok {
+			return true
 		}
-		out.WriteString(strings.ReplaceAll(line[:code], from, to))
+	}
+	return false
+}
+
+func locateInlineLinkDestination(source []byte, link *ast.Link) (vaultLinkEdit, bool) {
+	start := link.Pos()
+	if start < 0 || start >= len(source) || source[start] != '[' {
+		return vaultLinkEdit{}, false
+	}
+	close := findMarkdownLabelClose(source, start)
+	if close < 0 {
+		return vaultLinkEdit{}, false
+	}
+	at := close + 1
+	for at < len(source) && (source[at] == ' ' || source[at] == '\t' || source[at] == '\n' || source[at] == '\r') {
+		at++
+	}
+	if at >= len(source) || source[at] != '(' {
+		return vaultLinkEdit{}, false
+	}
+	at++
+	for at < len(source) && (source[at] == ' ' || source[at] == '\t' || source[at] == '\n' || source[at] == '\r') {
+		at++
+	}
+	if at < len(source) && source[at] == '<' {
+		at++
+	}
+	if at+len("/concepts/") > len(source) || !bytes.Equal(source[at:at+len("/concepts/")], []byte("/concepts/")) {
+		return vaultLinkEdit{}, false
+	}
+	return vaultLinkEdit{start: at, stop: at + len("/concepts/")}, true
+}
+
+func findMarkdownLabelClose(source []byte, start int) int {
+	depth := 0
+	for i := start; i < len(source); i++ {
+		if source[i] == '\\' {
+			i++
+			continue
+		}
+		if source[i] == '`' {
+			run := 1
+			for i+run < len(source) && source[i+run] == '`' {
+				run++
+			}
+			if close := findClosingBacktickRun(source, i+run, run); close >= 0 {
+				i = close - 1
+				continue
+			}
+		}
+		switch source[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func findClosingBacktickRun(source []byte, start, want int) int {
+	for i := start; i < len(source); i++ {
+		if source[i] != '`' {
+			continue
+		}
 		run := 1
-		for code+run < len(line) && line[code+run] == '`' {
+		for i+run < len(source) && source[i+run] == '`' {
 			run++
 		}
-		closing := strings.Index(line[code+run:], strings.Repeat("`", run))
-		if closing < 0 {
-			out.WriteString(line[code:])
-			break
+		if run == want {
+			return i + run
 		}
-		closing += code + run + run
-		out.WriteString(line[code:closing])
-		line = line[closing:]
+		i += run - 1
 	}
-	return out.String()
+	return -1
 }
 
 // scanProductSources maps each product file's slash-separated path, relative to
 // the shared worktree, to the sha256 of its contents.
+
 func scanProductSources(shared string) (map[string]string, error) {
 	sources := make(map[string]string)
 	for _, name := range productSubset {
