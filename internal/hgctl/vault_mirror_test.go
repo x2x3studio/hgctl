@@ -1,12 +1,14 @@
 package hgctl
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/x2x3studio/hgctl/internal/fsx"
 	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
@@ -113,6 +115,126 @@ func TestMirrorIgnoresBasicMemorysOwnRewrites(t *testing.T) {
 	}
 }
 
+func TestMirrorRendersOKFLinksForTheVault(t *testing.T) {
+	app := testApp(t)
+	knowledge := strings.Join([]string{
+		"# Knowledge",
+		"",
+		"[topic](/concepts/demonware/data/topic.md)",
+		"[section](/concepts/demonware/data/topic.md#limits)",
+		"`[inline](/concepts/leave-inline.md)`",
+		"",
+		"````markdown",
+		"[fenced](/concepts/leave-fenced.md)",
+		"```",
+		"[still-fenced](/concepts/leave-after-short-fence.md)",
+		"```` not-a-close",
+		"[still-fenced-again](/concepts/leave-after-nonclosing-fence.md)",
+		"````",
+		"",
+	}, "\n")
+	seedProduct(t, app, map[string]string{
+		"knowledge/concepts/demonware/data/source.md": knowledge,
+		"memory/world/a.md":                           "[memory](/concepts/leave-memory.md)\n",
+		"knowledge/index.json":                        `{"link":"](/concepts/leave-json.md)"}`,
+	})
+	if err := app.mirrorProductToVault(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(app.Paths.Vault, "knowledge", "concepts", "demonware", "data", "source.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.ReplaceAll(knowledge,
+		"](/concepts/demonware/data/topic.md)",
+		"](/knowledge/concepts/demonware/data/topic.md)")
+	want = strings.ReplaceAll(want,
+		"](/concepts/demonware/data/topic.md#limits)",
+		"](/knowledge/concepts/demonware/data/topic.md#limits)")
+	if string(got) != want {
+		t.Fatalf("Knowledge links were not rendered for the vault:\n%s", got)
+	}
+	source, err := os.ReadFile(filepath.Join(app.Paths.Shared, "knowledge", "concepts", "demonware", "data", "source.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(source) != knowledge {
+		t.Fatalf("vault rendering changed the canonical OKF source:\n%s", source)
+	}
+	stamped := string(got) + "<!-- Basic Memory local metadata -->\n"
+	if err := os.WriteFile(filepath.Join(app.Paths.Vault, "knowledge", "concepts", "demonware", "data", "source.md"), []byte(stamped), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.mirrorProductToVault(); err != nil {
+		t.Fatal(err)
+	}
+	preserved, err := os.ReadFile(filepath.Join(app.Paths.Vault, "knowledge", "concepts", "demonware", "data", "source.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(preserved) != stamped {
+		t.Fatalf("no-op mirror clobbered Basic Memory's adapted Knowledge copy:\n%s", preserved)
+	}
+	for rel, wantBody := range map[string]string{
+		"memory/world/a.md":    "[memory](/concepts/leave-memory.md)\n",
+		"knowledge/index.json": `{"link":"](/concepts/leave-json.md)"}`,
+	} {
+		body, err := os.ReadFile(filepath.Join(app.Paths.Vault, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != wantBody {
+			t.Fatalf("mirror rewrote %s outside the Knowledge Markdown adapter: %q", rel, body)
+		}
+	}
+}
+
+func TestMirrorSchemaUpgradeRebuildsVaultAndInvalidatesIndexReceipt(t *testing.T) {
+	app := testApp(t)
+	const rel = "knowledge/concepts/demonware/data/source.md"
+	seedProduct(t, app, map[string]string{rel: "[topic](/concepts/demonware/data/topic.md)\n"})
+
+	path := filepath.Join(app.Paths.Vault, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("old unadapted vault copy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := scanProductSources(app.Paths.Shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsx.WriteJSON(app.Paths.VaultMirror, vaultMirror{
+		SchemaVersion: vaultMirrorSchemaVersion - 1,
+		Sources:       sources,
+	}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(app.Paths.IndexedSHA, []byte("stale receipt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.mirrorProductToVault(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "[topic](/knowledge/concepts/demonware/data/topic.md)\n" {
+		t.Fatalf("schema upgrade did not re-render the vault: %q", got)
+	}
+	if _, err := os.Stat(app.Paths.IndexedSHA); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("schema upgrade kept a receipt for the old vault rendering: %v", err)
+	}
+	_, currentSchema := app.loadVaultMirror()
+	if !currentSchema {
+		t.Fatal("schema upgrade did not write a current manifest")
+	}
+}
+
 func TestMirrorPropagatesRealChanges(t *testing.T) {
 	app := testApp(t)
 	seedProduct(t, app, map[string]string{
@@ -187,7 +309,8 @@ func TestMirrorSelfHeals(t *testing.T) {
 	if err := app.mirrorProductToVault(); err != nil {
 		t.Fatalf("corrupt manifest failed the sync instead of rebuilding: %v", err)
 	}
-	if got := app.loadVaultMirror()["memory/world/a.md"]; got == "" {
+	manifest, currentSchema := app.loadVaultMirror()
+	if !currentSchema || manifest["memory/world/a.md"] == "" {
 		t.Fatal("manifest was not rebuilt")
 	}
 }

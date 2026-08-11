@@ -14,7 +14,7 @@ import (
 	"github.com/x2x3studio/hgctl/internal/proc"
 )
 
-const vaultMirrorSchemaVersion = 1
+const vaultMirrorSchemaVersion = 2
 
 // productSubset names the paths mirrored out of the shared worktree. Everything
 // else in the vault - Basic Memory's own scratch, an .obsidian/ directory - is
@@ -61,7 +61,7 @@ func (a *App) mirrorProductToVault() error {
 	if err != nil {
 		return err
 	}
-	previous := a.loadVaultMirror()
+	previous, currentSchema := a.loadVaultMirror()
 	for rel, sum := range sources {
 		dst := filepath.Join(a.Paths.Vault, filepath.FromSlash(rel))
 		if previous[rel] == sum {
@@ -78,6 +78,7 @@ func (a *App) mirrorProductToVault() error {
 		if err != nil {
 			return err
 		}
+		data = renderVaultFile(rel, data)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 			return err
 		}
@@ -88,10 +89,84 @@ func (a *App) mirrorProductToVault() error {
 	if err := pruneVault(a.Paths.Vault, sources); err != nil {
 		return err
 	}
+	if !currentSchema {
+		if err := os.Remove(a.Paths.IndexedSHA); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	return fsx.WriteJSON(a.Paths.VaultMirror, vaultMirror{
 		SchemaVersion: vaultMirrorSchemaVersion,
 		Sources:       sources,
 	}, 0o600)
+}
+
+// renderVaultFile adapts the canonical OKF bundle to the repository-rooted
+// Obsidian vault without changing shared or its concept IDs.
+func renderVaultFile(rel string, data []byte) []byte {
+	if !strings.HasPrefix(rel, "knowledge/") || !strings.HasSuffix(rel, ".md") {
+		return data
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	inFence := false
+	fence := byte(0)
+	fenceLength := 0
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		if marker, length, ok := markdownFenceMarker(trimmed); ok {
+			if !inFence {
+				inFence = true
+				fence = marker
+				fenceLength = length
+			} else if marker == fence && length >= fenceLength && strings.TrimSpace(trimmed[length:]) == "" {
+				inFence = false
+				fence = 0
+				fenceLength = 0
+			}
+			continue
+		}
+		if !inFence {
+			lines[i] = rewriteVaultLinksOutsideCode(line)
+		}
+	}
+	return []byte(strings.Join(lines, ""))
+}
+
+func markdownFenceMarker(line string) (byte, int, bool) {
+	if len(line) < 3 || line[0] != line[1] || line[1] != line[2] || (line[0] != '`' && line[0] != '~') {
+		return 0, 0, false
+	}
+	length := 3
+	for length < len(line) && line[length] == line[0] {
+		length++
+	}
+	return line[0], length, true
+}
+
+func rewriteVaultLinksOutsideCode(line string) string {
+	const from = "](/concepts/"
+	const to = "](/knowledge/concepts/"
+	var out strings.Builder
+	for len(line) > 0 {
+		code := strings.IndexByte(line, '`')
+		if code < 0 {
+			out.WriteString(strings.ReplaceAll(line, from, to))
+			break
+		}
+		out.WriteString(strings.ReplaceAll(line[:code], from, to))
+		run := 1
+		for code+run < len(line) && line[code+run] == '`' {
+			run++
+		}
+		closing := strings.Index(line[code+run:], strings.Repeat("`", run))
+		if closing < 0 {
+			out.WriteString(line[code:])
+			break
+		}
+		closing += code + run + run
+		out.WriteString(line[code:closing])
+		line = line[closing:]
+	}
+	return out.String()
 }
 
 // scanProductSources maps each product file's slash-separated path, relative to
@@ -198,15 +273,15 @@ func pruneVault(vault string, sources map[string]string) error {
 // wrong-schema manifest degrades to "mirror everything once and rebuild it",
 // which costs one full reindex and then self-heals - strictly better than
 // wedging the sync that keeps recall current.
-func (a *App) loadVaultMirror() map[string]string {
+func (a *App) loadVaultMirror() (map[string]string, bool) {
 	var manifest vaultMirror
 	if err := fsx.ReadJSON(a.Paths.VaultMirror, &manifest); err != nil {
-		return nil
+		return nil, false
 	}
 	if manifest.SchemaVersion != vaultMirrorSchemaVersion {
-		return nil
+		return nil, false
 	}
-	return manifest.Sources
+	return manifest.Sources, true
 }
 
 // productUnchangedBetween reports whether the product subset is identical at two
