@@ -167,7 +167,8 @@ func markdownBodyStart(source []byte) int {
 		if next >= 0 {
 			stop = offset + next + 1
 		}
-		line := bytes.TrimSpace(source[offset:stop])
+		line := bytes.TrimSuffix(source[offset:stop], []byte("\n"))
+		line = bytes.TrimSuffix(line, []byte("\r"))
 		if bytes.Equal(line, []byte("---")) {
 			return stop
 		}
@@ -221,6 +222,16 @@ func findMarkdownLabelClose(source []byte, start int) int {
 			i++
 			continue
 		}
+		if source[i] == '`' {
+			run := 1
+			for i+run < len(source) && source[i+run] == '`' {
+				run++
+			}
+			if close := findClosingBacktickRun(source, i+run, run); close >= 0 {
+				i = close - 1
+				continue
+			}
+		}
 		switch source[i] {
 		case '[':
 			depth++
@@ -230,6 +241,23 @@ func findMarkdownLabelClose(source []byte, start int) int {
 				return i
 			}
 		}
+	}
+	return -1
+}
+
+func findClosingBacktickRun(source []byte, start, want int) int {
+	for i := start; i < len(source); i++ {
+		if source[i] != '`' {
+			continue
+		}
+		run := 1
+		for i+run < len(source) && source[i+run] == '`' {
+			run++
+		}
+		if run == want {
+			return i + run
+		}
+		i += run - 1
 	}
 	return -1
 }
