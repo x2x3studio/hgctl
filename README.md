@@ -132,7 +132,13 @@ in a bounded re-ingest before it drains both outboxes.
 `hgctl sync` drains both outboxes, appends bounded queue commits, pushes only the
 machine branch, pulls `shared`, and reindexes Basic Memory when the shared
 revision changes. A rewritten remote `shared` root is adopted with a guarded hard
-reset because the local mirror is disposable. A new machine's queue branch is
+reset because the local mirror is disposable. `shared/knowledge` remains the
+canonical OKF bundle: its `/concepts/**` links are preserved there. While copying
+that bundle into the repository-rooted `~/hourglass-vault`, hgctl renders those
+links as `/knowledge/concepts/**` so Obsidian resolves the same concepts without
+creating duplicate IDs or writing compatibility changes back to `shared`. A mirror
+rendering-schema change invalidates the local index receipt and forces one rebuild.
+A new machine's queue branch is
 self-seeded as an orphan root, never inheriting `main` or `shared`; all later
 endpoint
 commits are append-only events under `memory/events/` for Memory and
