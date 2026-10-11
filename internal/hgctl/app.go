@@ -46,6 +46,17 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		err = a.runIngest(ctx, args[1:])
 	case "update":
 		err = a.update(ctx, true)
+	case "mcp":
+		if len(args) != 1 {
+			err = errors.New("mcp accepts no arguments")
+		} else {
+			err = fsx.WithLockWait(ctx, a.Paths.LifecycleLock, func() error {
+				if _, err := a.resolveBasicMemoryProject(ctx); err != nil {
+					return err
+				}
+				return a.setupBasicMemoryMCP(ctx)
+			})
+		}
 	case "doctor":
 		err = a.doctor(ctx)
 	case "uninstall":
@@ -102,6 +113,10 @@ usage: hgctl <command> [flags]
                                   the oldest candidates have no new turns - it
                                   is a poor probe for "is ingest working".
   update     Force an update check now, ignoring the hourly throttle.
+  mcp        Start or repair one loopback-only Basic Memory HTTP service and
+             migrate installed clients from per-session stdio to its shared URL.
+             Does not ingest, publish, or change the sync scheduler. Existing
+             client sessions reconnect on their next restart.
   doctor     Check every endpoint invariant and print one line each. A failing
              line names what is wrong, not what to do about it.
   version    Print the installed version.

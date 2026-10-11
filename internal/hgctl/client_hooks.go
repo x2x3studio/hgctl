@@ -52,10 +52,13 @@ func (a *App) repairClientHooks(ctx context.Context) {
 		if _, err := os.Stat(a.Paths.State); err != nil {
 			return nil
 		}
-		return a.pruneClientHooks()
+		if err := a.pruneClientHooks(); err != nil {
+			return err
+		}
+		return a.repairLegacyMemoryMCP(ctx)
 	})
 	if err != nil {
-		_, _ = fmt.Fprintln(a.Err, "hgctl: client hook prune deferred")
+		_, _ = fmt.Fprintln(a.Err, "hgctl: client integration repair deferred")
 	}
 }
 
