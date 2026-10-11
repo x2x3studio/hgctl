@@ -117,6 +117,18 @@ macOS, a user systemd timer on Ubuntu). It runs `hgctl sync --update` about once
 minute; hgctl itself is not a resident daemon. Basic Memory remains the only
 Python runtime dependency.
 
+## SQLite vector cleanup compatibility
+
+Basic Memory 0.23.2 ships a correlated sqlite-vec orphan-cleanup DELETE that can
+exceed the 30-minute reindex timeout on a large vault even after all embeddings
+are complete. hgctl backports the exact upstream fix from
+`basicmachines-co/basic-memory@1ad049c704a51ca5477b2cdb814cdc0121578f82` before
+reindex and shared-service setup. It changes only the matching SQL block in a
+standard uv/virtualenv installation, preserves the original source beside it as
+`.hgctl-before-vector-cleanup`, and leaves already-fixed or unknown source alone.
+No vectors, notes, model settings, or index receipts are bypassed or discarded.
+A future Basic Memory release carrying the fix needs no compatibility rewrite.
+
 ## Ingest and sync
 
 Per-session transcript ingest is the single parser for live and historical

@@ -117,6 +117,10 @@ func (a *App) installMemoryService(ctx context.Context, binary string) error {
 	if err := a.verifyMemoryServiceOwnership(); err != nil {
 		return err
 	}
+	repaired, err := a.repairBasicMemoryVectorCleanup(ctx)
+	if err != nil {
+		return err
+	}
 	path := a.memoryServicePath()
 	previous, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -145,7 +149,7 @@ func (a *App) installMemoryService(ctx context.Context, binary string) error {
 			return err
 		}
 	}
-	if changed || !loaded {
+	if changed || repaired || !loaded {
 		if runtime.GOOS == "darwin" {
 			domain := "gui/" + strconv.Itoa(os.Getuid())
 			if loaded {
@@ -163,7 +167,7 @@ func (a *App) installMemoryService(ctx context.Context, binary string) error {
 			if _, err := proc.Run(ctx, "", "systemctl", "--user", "enable", "--now", memoryServiceLabel+".service"); err != nil {
 				return err
 			}
-			if changed && loaded {
+			if (changed || repaired) && loaded {
 				if _, err := proc.Run(ctx, "", "systemctl", "--user", "restart", memoryServiceLabel+".service"); err != nil {
 					return err
 				}
