@@ -121,6 +121,9 @@ func (a *App) reindexBasicMemory(ctx context.Context) error {
 		return err
 	}
 	projectID = project.ExternalID
+	if _, err := a.repairBasicMemoryVectorCleanup(ctx); err != nil {
+		return fmt.Errorf("Basic Memory compatibility: %w", err)
+	}
 	args := []string{"reindex", "--project", config.ProjectName}
 	if forceFull {
 		args = append(args, "--full")
