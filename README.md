@@ -28,6 +28,7 @@ hgctl install [--repo <git-url>]
 hgctl sync [--update]
 hgctl ingest [--client all|claude|codex|copilot] [--target memory|knowledge|all] [--limit N]
 hgctl update
+hgctl mcp
 hgctl doctor
 hgctl uninstall
 hgctl version
@@ -84,17 +85,37 @@ Install creates:
 ~/hourglass-vault/   Basic Memory project (recall mirror)
 ```
 
-It also installs one scheduler, the Basic Memory project `hourglass`, and the
-`hourglass-memory` recall MCP in every installed Claude Code or Codex client, and
-prunes any stale hgctl capture hook left in their config by an older version.
-Copilot is an ingest source but does not receive this MCP registration. It
-verifies the exact MCP command, arguments, environment, project identity, and
-indexed `shared` revision. Run `hgctl doctor` until all managed checks pass.
+It also installs one sync scheduler, the Basic Memory project `hourglass`, and
+one shared Basic Memory HTTP service per user on this machine. All installed
+Claude Code and Codex clients register `hourglass-memory` at
+`http://127.0.0.1:18765/mcp`; opening another session no longer starts another
+Python server. Copilot is an ingest source but does not receive this MCP.
+Existing capture hooks from older hgctl versions are pruned.
 
-On macOS the one scheduler label is `com.x2x3studio.hgctl.sync` (a LaunchAgent);
-Ubuntu uses a user systemd timer with the same logical name. Neither needs an
-application daemon or a Go/Python runtime. The scheduler runs `hgctl sync
---update` about once a minute.
+The service label is `com.x2x3studio.hgctl.memory`: a keep-alive LaunchAgent on
+macOS, or a restarting systemd user service on Ubuntu. It binds only to loopback,
+never the LAN. Host/Origin protection rejects untrusted browser origins and
+rebinding hosts; abandoned MCP sessions expire after an hour. This requires a
+Basic Memory build with FastMCP HTTP host/origin protection (verified with Basic
+Memory 0.23.2); migration probes the protection rather than trusting a version
+string. Other machines run their own service over their own Git-backed
+mirror; this is not a central network server or a new cloud backend. Basic Memory
+keeps its existing semantic search, full-text search, and graph functionality.
+
+`hgctl mcp` migrates existing managed stdio registrations and repairs the service
+without ingesting, publishing, or reinstalling the sync scheduler. Scheduled
+sync also migrates legacy registrations after an hgctl upgrade. Existing client
+sessions must reconnect or restart to release their old stdio processes; hgctl
+never kills running client sessions. An occupied port or modified unowned entry
+is an error, not permission to replace another service. `hgctl doctor` verifies
+the service definition, supervisor, MCP handshake and recall tool listing, client
+URLs, project identity, and indexed `shared` revision. Uninstall stops and removes
+only the owned service and registrations, preserving the vault and identity.
+
+The separate sync label remains `com.x2x3studio.hgctl.sync` (a LaunchAgent on
+macOS, a user systemd timer on Ubuntu). It runs `hgctl sync --update` about once a
+minute; hgctl itself is not a resident daemon. Basic Memory remains the only
+Python runtime dependency.
 
 ## Ingest and sync
 

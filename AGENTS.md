@@ -52,8 +52,9 @@ pin that invariant rather than its implementation.
 
 ## Endpoint invariants
 
-- Use Go and the standard library. Do not add Python, a project virtualenv, a
-  server, or a resident application daemon.
+- Use Go and the standard library. Do not add Python, a project virtualenv, or a
+  resident hgctl daemon. Recall uses one OS-managed Basic Memory HTTP service per
+  user on each machine; hgctl manages that existing dependency, not a second API.
 - Support macOS with Homebrew and Ubuntu Linux.
 - Persist one random app-scoped machine UUID. Hostname is mutable metadata.
 - `~/.local/bin/hgctl` is the only scheduler command path.
@@ -162,7 +163,11 @@ Basic Memory MCP exclusively owns search, recall, and read on the endpoint.
 reranker. Install creates or adopts the Basic Memory project `hourglass`,
 reindexes its disposable local mirror after `shared` advances, and configures
 the `hourglass-memory` MCP server (read and search tools only) for every
-installed Claude Code and Codex client. Configuration must be exact, idempotent,
+installed Claude Code and Codex client. One Basic Memory service per user binds
+only to `127.0.0.1:18765`; clients share its `/mcp` streamable-HTTP endpoint.
+`hgctl mcp` repairs this integration without intake or Git publication. The
+OS supervises Basic Memory; hgctl does not proxy requests or spawn a daemon.
+Configuration must be exact, idempotent,
 and ownership safe; uninstall removes only MCP entries it created. Durable
 writes enter only through per-session ingest, reach the queue, and are distilled
 by the reflect Action - the endpoint never authors product.

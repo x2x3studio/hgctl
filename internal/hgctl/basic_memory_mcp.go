@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"sort"
+	"runtime"
 	"strings"
 
 	"github.com/x2x3studio/hgctl/internal/fsx"
@@ -17,11 +17,6 @@ import (
 )
 
 const basicMemoryMCPName = "hourglass-memory"
-
-// basicMemoryMCPEnv sets no crippling flags: recall uses Basic Memory's default
-// full-text + semantic + wikilink-graph retrieval. Read-only is enforced by the
-// client tool allowlist, not by disabling features here.
-var basicMemoryMCPEnv = map[string]string{}
 
 type mcpClient struct {
 	name       string
@@ -47,37 +42,49 @@ func (a *App) setupBasicMemoryMCP(ctx context.Context) error {
 	if state.BasicMemoryMCP == nil {
 		state.BasicMemoryMCP = make(map[string]string)
 	}
+	if err := a.installMemoryService(ctx, binary); err != nil {
+		return fmt.Errorf("shared Basic Memory service: %w", err)
+	}
+	return a.setupMemoryMCPClients(ctx, binary, state, mcpClients())
+}
+
+func (a *App) setupMemoryMCPClients(ctx context.Context, binary string, state config.State, clients []mcpClient) error {
 	var configured int
-	for _, client := range mcpClients() {
+	for _, client := range clients {
 		if !proc.Exists(client.executable) {
 			continue
 		}
-		exists, matches, err := inspectBasicMemoryMCP(ctx, client, binary)
+		exists, matches, err := inspectBasicMemoryMCP(ctx, client, memoryServiceURL)
 		if err != nil {
 			return fmt.Errorf("inspect %s Basic Memory MCP: %w", client.name, err)
 		}
 		managedPath := state.BasicMemoryMCP[client.name]
 		if exists && !matches {
-			// Adopt an entry that differs only in managed command/args/env by
-			// re-registering it rather than refusing (e.g. a hand-registered
-			// entry with different transport flags).
+			legacyTarget := managedPath
+			if legacyTarget == "" {
+				legacyTarget = binary
+			}
+			_, owned, err := inspectBasicMemoryMCP(ctx, client, legacyTarget)
+			if err != nil || !owned {
+				return fmt.Errorf("refusing to replace modified %s Basic Memory MCP entry", client.name)
+			}
 			if err := removeBasicMemoryMCP(ctx, client); err != nil {
 				return fmt.Errorf("re-register %s Basic Memory MCP: %w", client.name, err)
 			}
 			exists = false
 		}
 		if !exists {
-			if err := addBasicMemoryMCP(ctx, client, binary); err != nil {
+			if err := addBasicMemoryMCP(ctx, client, memoryServiceURL); err != nil {
 				return fmt.Errorf("configure %s Basic Memory MCP: %w", client.name, err)
 			}
-			managedPath = binary
+			managedPath = memoryServiceURL
 		}
-		exists, matches, err = inspectBasicMemoryMCP(ctx, client, binary)
+		exists, matches, err = inspectBasicMemoryMCP(ctx, client, memoryServiceURL)
 		if err != nil || !exists || !matches {
 			return fmt.Errorf("verify %s Basic Memory MCP: configuration is not active", client.name)
 		}
 		if managedPath != "" {
-			state.BasicMemoryMCP[client.name] = managedPath
+			state.BasicMemoryMCP[client.name] = memoryServiceURL
 		}
 		if err := config.SaveState(a.Paths, state); err != nil {
 			return err
@@ -90,26 +97,25 @@ func (a *App) setupBasicMemoryMCP(ctx context.Context) error {
 	return nil
 }
 
-func addBasicMemoryMCP(ctx context.Context, client mcpClient, binary string) error {
-	envKeys := make([]string, 0, len(basicMemoryMCPEnv))
-	for key := range basicMemoryMCPEnv {
-		envKeys = append(envKeys, key)
+func (a *App) repairLegacyMemoryMCP(ctx context.Context) error {
+	state, err := config.LoadState(a.Paths)
+	if err != nil {
+		return err
 	}
-	sort.Strings(envKeys)
-	var args []string
+	for _, client := range mcpClients() {
+		target := state.BasicMemoryMCP[client.name]
+		if target != "" && target != memoryServiceURL && proc.Exists(client.executable) {
+			return a.setupBasicMemoryMCP(ctx)
+		}
+	}
+	return nil
+}
+
+func addBasicMemoryMCP(ctx context.Context, client mcpClient, endpoint string) error {
+	args := []string{"mcp", "add", basicMemoryMCPName, "--url", endpoint}
 	if client.name == "claude" {
-		args = []string{"mcp", "add", basicMemoryMCPName, "--scope", "user"}
-		for _, key := range envKeys {
-			args = append(args, "-e", key+"="+basicMemoryMCPEnv[key])
-		}
-	} else {
-		args = []string{"mcp", "add"}
-		for _, key := range envKeys {
-			args = append(args, "--env", key+"="+basicMemoryMCPEnv[key])
-		}
-		args = append(args, basicMemoryMCPName)
+		args = []string{"mcp", "add", "--transport", "http", "--scope", "user", basicMemoryMCPName, endpoint}
 	}
-	args = append(args, "--", binary, "mcp", "--project", config.ProjectName)
 	_, err := proc.Run(ctx, "", client.executable, args...)
 	return err
 }
@@ -123,7 +129,8 @@ func removeBasicMemoryMCP(ctx context.Context, client mcpClient) error {
 	return err
 }
 
-func inspectBasicMemoryMCP(ctx context.Context, client mcpClient, binary string) (bool, bool, error) {
+func inspectBasicMemoryMCP(ctx context.Context, client mcpClient, target string) (bool, bool, error) {
+	httpTarget := strings.HasPrefix(target, "http://")
 	if client.name == "codex" {
 		output, err := proc.Run(ctx, "", client.executable, "mcp", "get", basicMemoryMCPName, "--json")
 		if err != nil {
@@ -136,6 +143,7 @@ func inspectBasicMemoryMCP(ctx context.Context, client mcpClient, binary string)
 			Enabled   bool `json:"enabled"`
 			Transport struct {
 				Type    string            `json:"type"`
+				URL     string            `json:"url"`
 				Command string            `json:"command"`
 				Args    []string          `json:"args"`
 				Env     map[string]string `json:"env"`
@@ -144,8 +152,11 @@ func inspectBasicMemoryMCP(ctx context.Context, client mcpClient, binary string)
 		if err := json.Unmarshal([]byte(output), &entry); err != nil {
 			return true, false, err
 		}
-		matches := entry.Enabled && entry.Transport.Type == "stdio" && entry.Transport.Command == binary &&
-			equalStrings(entry.Transport.Args, []string{"mcp", "--project", config.ProjectName}) && containsEnv(entry.Transport.Env)
+		matches := entry.Enabled && entry.Transport.Type == "stdio" && entry.Transport.Command == target &&
+			equalStrings(entry.Transport.Args, []string{"mcp", "--project", config.ProjectName})
+		if httpTarget {
+			matches = entry.Enabled && entry.Transport.Type == "streamable_http" && entry.Transport.URL == target
+		}
 		return true, matches, nil
 	}
 	output, err := proc.Run(ctx, "", client.executable, "mcp", "get", basicMemoryMCPName)
@@ -155,23 +166,19 @@ func inspectBasicMemoryMCP(ctx context.Context, client mcpClient, binary string)
 		}
 		return false, false, err
 	}
-	matches := strings.Contains(output, "Scope: User config") &&
-		strings.Contains(output, "Type: stdio") &&
-		strings.Contains(output, "Command: "+binary) &&
-		strings.Contains(output, "Args: mcp --project "+config.ProjectName)
-	for key, value := range basicMemoryMCPEnv {
-		matches = matches && strings.Contains(output, key+"="+value)
-	}
-	return true, matches, nil
-}
-
-func containsEnv(actual map[string]string) bool {
-	for key, value := range basicMemoryMCPEnv {
-		if actual[key] != value {
-			return false
+	fields := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), ":")
+		if found {
+			fields[key] = strings.TrimSpace(value)
 		}
 	}
-	return true
+	userScope := strings.HasPrefix(fields["Scope"], "User config (")
+	matches := userScope && fields["Type"] == "stdio" && fields["Command"] == target && fields["Args"] == "mcp --project "+config.ProjectName
+	if httpTarget {
+		matches = userScope && fields["Type"] == "http" && fields["URL"] == target
+	}
+	return true, matches, nil
 }
 
 func equalStrings(left, right []string) bool {
@@ -230,12 +237,22 @@ func (a *App) basicMemoryMCPDoctorChecks(ctx context.Context) []doctorCheck {
 	if err != nil {
 		return nil
 	}
-	var checks []doctorCheck
+	content, fileErr := os.ReadFile(a.memoryServicePath())
+	owned := fileErr == nil && string(content) == memoryServiceDefinition(runtime.GOOS, binary, a.Paths.Home)
+	serviceErr := probeMemoryService(ctx, memoryServiceURL)
+	if serviceErr == nil {
+		serviceErr = probeMemoryServiceProtection(ctx, memoryServiceURL)
+	}
+	note := memoryServiceURL
+	if serviceErr != nil {
+		note += ": " + fsx.Bound(serviceErr.Error(), 256)
+	}
+	checks := []doctorCheck{{"memory service", owned && a.memoryServiceLoaded(ctx) && serviceErr == nil, note}}
 	for _, client := range mcpClients() {
 		if !proc.Exists(client.executable) {
 			continue
 		}
-		exists, matches, inspectErr := inspectBasicMemoryMCP(ctx, client, binary)
+		exists, matches, inspectErr := inspectBasicMemoryMCP(ctx, client, memoryServiceURL)
 		note := basicMemoryMCPName
 		if inspectErr != nil {
 			note = fsx.Bound(inspectErr.Error(), 512)

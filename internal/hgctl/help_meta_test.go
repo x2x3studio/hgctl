@@ -20,7 +20,7 @@ func TestHelpFlagsWorkAndUsageDescribesEveryCommand(t *testing.T) {
 			t.Fatalf("%q exited %d, want 0 - a nonzero exit reads as a broken binary", arg, code)
 		}
 		text := app.Out.(*bytes.Buffer).String() + app.Err.(*bytes.Buffer).String()
-		for _, cmd := range []string{"install", "sync", "ingest", "update", "doctor", "version", "uninstall", "hook"} {
+		for _, cmd := range []string{"install", "sync", "ingest", "update", "mcp", "doctor", "version", "uninstall", "hook"} {
 			if !strings.Contains(text, cmd) {
 				t.Errorf("%q does not describe the %q command", arg, cmd)
 			}

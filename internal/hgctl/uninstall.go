@@ -25,6 +25,9 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 		_, _ = fmt.Fprintln(a.Out, "Hourglass integration removal is incomplete; the binary was preserved because the scheduler is not owned by hgctl.")
 		return err
 	}
+	if err := a.verifyMemoryServiceOwnership(); err != nil {
+		return err
+	}
 	if err := a.quiesceScheduler(ctx); err != nil {
 		_, _ = fmt.Fprintln(a.Out, "Hourglass integration removal is incomplete; the binary was preserved so the scheduler cannot break.")
 		return fmt.Errorf("stop scheduler before uninstall: %w", err)
@@ -35,8 +38,7 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 	cleanupErr := fsx.WithLockWait(ctx, a.Paths.SyncLock, func() error {
 		return fsx.WithLockWait(ctx, a.Paths.UpdateLock, func() error {
 			if err := a.removeManagedBasicMemoryMCP(ctx); err != nil {
-				errs = append(errs, err)
-				safeToRemoveBinary = false
+				return fmt.Errorf("remove client registrations before shared service cleanup: %w", err)
 			}
 			for _, item := range a.clientAdapters() {
 				present, err := managedHooksPresent(item.path, stable, item.client)
@@ -63,6 +65,9 @@ func (a *App) uninstallLocked(ctx context.Context) error {
 				}
 			}
 
+			if err := a.removeMemoryService(ctx); err != nil {
+				return fmt.Errorf("stop shared memory service before project cleanup: %w", err)
+			}
 			basicMemoryCleanup, err := a.managedBasicMemoryCleanupRequired()
 			if err != nil {
 				errs = append(errs, fmt.Errorf("inspect Basic Memory ownership: %w", err))
